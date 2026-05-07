@@ -1,0 +1,348 @@
+import json
+
+from django.conf import settings
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET, require_POST
+
+from .auth import validate_messaging_token
+from .realtime import broadcast_participant_event, broadcast_room_event
+from .signals import (
+    authorize_parent_messaging,
+    check_database,
+    check_parent_services,
+    check_redis,
+)
+from .services import (
+    create_direct_message,
+    list_room_messages,
+    list_user_rooms,
+    mark_room_delivered,
+    mark_room_read,
+    normalize_message_list_params,
+)
+
+
+def health_check(request):
+    database_status = check_database()
+    redis_status = check_redis()
+    parent_status = check_parent_services()
+    core_healthy = database_status['ok'] and redis_status['ok']
+
+    if core_healthy and parent_status['ok']:
+        status = 'ok'
+        response_status = 200
+    elif core_healthy and parent_status['any_connected']:
+        status = 'partial'
+        response_status = 200
+    else:
+        status = 'degraded'
+        response_status = 503
+
+    return JsonResponse(
+        {
+            'status': status,
+            'service': 'messenger',
+            'environment': settings.DJANGO_ENV,
+            'debug': settings.DEBUG,
+            'checks': {
+                'database': database_status,
+                'redis': redis_status,
+                'parents': parent_status,
+            },
+        },
+        status=response_status,
+    )
+
+
+def get_authorization_status(result, response_status):
+    parent_response = result.get('parent', {}).get('response')
+
+    if isinstance(parent_response, dict) and parent_response.get('allowed') is True:
+        return 'allowed'
+
+    if isinstance(parent_response, dict) and parent_response.get('allowed') is False:
+        return 'denied'
+
+    if response_status >= 500:
+        return 'degraded'
+
+    return 'error'
+
+
+def parse_json_body(request):
+    try:
+        return json.loads(request.body.decode('utf-8') or '{}'), None
+    except ValueError:
+        return None, JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Request body must be valid JSON.',
+            },
+            status=400,
+        )
+
+
+def get_authenticated_sender(request):
+    token_result, token_status = validate_messaging_token(request.headers.get('Authorization', ''))
+    if token_result['ok']:
+        return {
+            'user_id': token_result['sender_user_id'],
+            'account_number': token_result.get('account_number'),
+        }, None
+
+    return None, JsonResponse(
+        {
+            'status': 'error',
+            'service': 'messenger',
+            'message': token_result['message'],
+        },
+        status=token_status,
+    )
+
+
+def authorize_sender_for_recipient(sender, recipient_account_number):
+    parent_payload = {
+        'sender_user_id': sender['user_id'],
+        'recipient_account_number': recipient_account_number,
+    }
+    authorization_result, response_status = authorize_parent_messaging(parent_payload)
+    parent_response = authorization_result.get('parent', {}).get('response')
+
+    if isinstance(parent_response, dict) and parent_response.get('allowed') is True:
+        return parent_response, authorization_result, response_status
+
+    return None, authorization_result, response_status
+
+
+@csrf_exempt
+@require_POST
+def authorize_message(request):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    _, authorization_result, response_status = authorize_sender_for_recipient(
+        sender,
+        payload.get('recipient_account_number'),
+    )
+
+    return JsonResponse(
+        {
+            'status': get_authorization_status(authorization_result, response_status),
+            'service': 'messenger',
+            'sender': sender,
+            'authorization': authorization_result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def send_message(request):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    parent_authorization, authorization_result, authorization_status = authorize_sender_for_recipient(
+        sender,
+        payload.get('recipient_account_number'),
+    )
+    if parent_authorization is None:
+        return JsonResponse(
+            {
+                'status': get_authorization_status(authorization_result, authorization_status),
+                'service': 'messenger',
+                'sender': sender,
+                'authorization': authorization_result,
+            },
+            status=authorization_status,
+        )
+
+    message_result, message_status = create_direct_message(sender, parent_authorization, payload)
+    if message_status < 300 and message_result.get('status') == 'sent':
+        event_payload = {
+            'room': message_result['room'],
+            'message': message_result['message'],
+            'sender': sender,
+        }
+        broadcast_room_event(
+            message_result['message']['room_id'],
+            'message.sent',
+            event_payload,
+        )
+        broadcast_participant_event(
+            message_result['room']['participants'],
+            'message.sent',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': message_result['status'],
+            'service': 'messenger',
+            'sender': sender,
+            'authorization': authorization_result,
+            'result': message_result,
+        },
+        status=message_status,
+    )
+
+
+@require_GET
+def list_rooms(request):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    rooms_result, rooms_status = list_user_rooms(sender['user_id'])
+
+    return JsonResponse(
+        {
+            'status': rooms_result['status'],
+            'service': 'messenger',
+            'user': sender,
+            'result': rooms_result,
+        },
+        status=rooms_status,
+    )
+
+
+@require_GET
+def room_messages(request, room_id):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    limit, before_message_id, errors = normalize_message_list_params(request.GET)
+    if errors:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'errors': errors,
+            },
+            status=400,
+        )
+
+    messages_result, messages_status = list_room_messages(
+        user_id=sender['user_id'],
+        room_id=room_id,
+        limit=limit,
+        before_message_id=before_message_id,
+    )
+
+    return JsonResponse(
+        {
+            'status': messages_result['status'],
+            'service': 'messenger',
+            'user': sender,
+            'result': messages_result,
+        },
+        status=messages_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def read_room(request, room_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    read_result, read_status = mark_room_read(
+        user_id=sender['user_id'],
+        room_id=room_id,
+        payload=payload,
+    )
+    if read_status < 300:
+        event_payload = {
+            'room_id': read_result['room_id'],
+            'user_id': read_result['user_id'],
+            'last_read_message_id': read_result['last_read_message_id'],
+            'last_read_at': read_result['last_read_at'],
+            'read_marker_moved': read_result['read_marker_moved'],
+            'updated_messages': read_result['updated_messages'],
+            'unread_count': read_result['unread_count'],
+        }
+        broadcast_room_event(
+            room_id,
+            'message.read',
+            event_payload,
+        )
+        broadcast_participant_event(
+            read_result['room']['participants'],
+            'message.read',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': read_result['status'],
+            'service': 'messenger',
+            'user': sender,
+            'result': read_result,
+        },
+        status=read_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def deliver_room(request, room_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    delivered_result, delivered_status = mark_room_delivered(
+        user_id=sender['user_id'],
+        room_id=room_id,
+        payload=payload,
+    )
+    if delivered_status < 300:
+        event_payload = {
+            'room_id': delivered_result['room_id'],
+            'user_id': delivered_result['user_id'],
+            'last_delivered_message_id': delivered_result['last_delivered_message_id'],
+            'delivered_until': delivered_result['delivered_until'],
+            'updated_messages': delivered_result['updated_messages'],
+            'unread_count': delivered_result['unread_count'],
+        }
+        broadcast_room_event(
+            room_id,
+            'message.delivered',
+            event_payload,
+        )
+        broadcast_participant_event(
+            delivered_result['room']['participants'],
+            'message.delivered',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': delivered_result['status'],
+            'service': 'messenger',
+            'user': sender,
+            'result': delivered_result,
+        },
+        status=delivered_status,
+    )
