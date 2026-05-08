@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
@@ -26,6 +27,18 @@ def env_list(name, default=''):
     return [item.strip() for item in value.split(',') if item.strip()]
 
 
+def env_host_list(name, default=''):
+    hosts = []
+    for item in env_list(name, default):
+        parsed = urlparse(item)
+        host = parsed.netloc or parsed.path
+        host = host.split('/')[0]
+        if host:
+            hosts.append(host)
+
+    return hosts
+
+
 DJANGO_ENV = os.getenv('DJANGO_ENV', 'development')
 IS_PRODUCTION = DJANGO_ENV == 'production' or env_bool('RENDER')
 DEBUG = env_bool('DEBUG', not IS_PRODUCTION)
@@ -37,7 +50,7 @@ if not SECRET_KEY:
         raise ImproperlyConfigured('SECRET_KEY must be set in production.')
     SECRET_KEY = 'django-insecure-local-development-only-change-me'
 
-ALLOWED_HOSTS = env_list('ALLOWED_HOSTS', 'localhost,127.0.0.1')
+ALLOWED_HOSTS = env_host_list('ALLOWED_HOSTS', 'localhost,127.0.0.1')
 
 
 # Application definition
