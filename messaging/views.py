@@ -21,6 +21,7 @@ from .services import (
     mark_room_delivered,
     mark_room_read,
     normalize_message_list_params,
+    release_room_blocked_messages,
 )
 
 
@@ -452,4 +453,47 @@ def deliver_room(request, room_id):
             'result': delivered_result,
         },
         status=delivered_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def release_blocked_messages(request, room_id):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    release_result, release_status = release_room_blocked_messages(
+        user_id=sender['user_id'],
+        room_id=room_id,
+    )
+    if release_status < 300 and release_result['updated_messages'] > 0:
+        event_payload = {
+            'room_id': release_result['room_id'],
+            'user_id': release_result['user_id'],
+            'last_delivered_message_id': release_result['last_delivered_message_id'],
+            'delivered_until': release_result['delivered_until'],
+            'updated_messages': release_result['updated_messages'],
+            'released_messages': release_result['released_messages'],
+            'unread_count': release_result['unread_count'],
+        }
+        broadcast_room_event(
+            room_id,
+            'message.delivered',
+            event_payload,
+        )
+        broadcast_participant_event(
+            release_result['room']['participants'],
+            'message.delivered',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': release_result['status'],
+            'service': 'messenger',
+            'user': sender,
+            'result': release_result,
+        },
+        status=release_status,
     )

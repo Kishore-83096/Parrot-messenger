@@ -128,6 +128,7 @@ class Message(models.Model):
     client_message_id = models.CharField(max_length=120, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_SENT)
     delivery_blocked = models.BooleanField(default=False)
+    sent_while_blocked = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     edited_at = models.DateTimeField(null=True, blank=True)
@@ -155,6 +156,13 @@ class Message(models.Model):
 
         if self.reply_to_id and self.room_id and self.reply_to.room_id != self.room_id:
             raise ValidationError({'reply_to': 'Reply target must be in the same room.'})
+
+        if self.room_id and not self.room.is_direct:
+            if self.delivery_blocked:
+                raise ValidationError({'delivery_blocked': 'Delivery blocking is only supported for direct rooms.'})
+
+            if self.sent_while_blocked:
+                raise ValidationError({'sent_while_blocked': 'Blocked-send markers are only supported for direct rooms.'})
 
         if self.pk and not self.text.strip() and not self.attachments.exists():
             raise ValidationError({'text': 'Message must include text or at least one attachment.'})

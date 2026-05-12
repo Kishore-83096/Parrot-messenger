@@ -41,9 +41,10 @@ class MessageAdmin(admin.ModelAdmin):
         'reply_to',
         'status',
         'delivery_blocked',
+        'sent_while_blocked',
         'created_at',
     )
-    list_filter = ('status', 'delivery_blocked', 'created_at')
+    list_filter = ('status', 'delivery_blocked', 'sent_while_blocked', 'created_at')
     search_fields = ('=sender_user_id', '=recipient_user_id', 'client_message_id', 'text')
     inlines = [MessageAttachmentInline]
 

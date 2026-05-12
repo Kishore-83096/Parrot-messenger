@@ -265,7 +265,7 @@ def create_direct_message(sender, parent_authorization, payload):
             return {
                 'status': 'duplicate',
                 'room': serialize_room(existing_message.room),
-                'message': serialize_message(existing_message),
+                'message': serialize_message(existing_message, sender['user_id']),
                 '_delivery_blocked': existing_message.delivery_blocked,
             }, 200
 
@@ -292,6 +292,7 @@ def create_direct_message(sender, parent_authorization, payload):
                 client_message_id=normalized_payload['client_message_id'],
                 status=Message.STATUS_SENT,
                 delivery_blocked=delivery_blocked,
+                sent_while_blocked=delivery_blocked,
             )
             create_message_attachments(message, normalized_payload['attachments'])
             room.updated_at = timezone.now()
@@ -307,7 +308,7 @@ def create_direct_message(sender, parent_authorization, payload):
         'status': 'sent',
         'room_created': room_created,
         'room': serialize_room(room),
-        'message': serialize_message(message),
+        'message': serialize_message(message, sender['user_id']),
         '_delivery_blocked': message.delivery_blocked,
     }, 201
 
@@ -322,6 +323,73 @@ def get_reply_target(room, reply_to_message_id, user_id):
 def create_message_attachments(message, attachments):
     for attachment in attachments:
         MessageAttachment.objects.create(message=message, **attachment)
+
+
+def release_room_blocked_messages(user_id, room_id):
+    participant = RoomParticipant.objects.filter(
+        room_id=room_id,
+        user_id=user_id,
+        is_active=True,
+    ).select_related('room').first()
+    if not participant:
+        return {
+            'status': 'error',
+            'message': 'Room not found.',
+        }, 404
+
+    if not participant.room.is_direct:
+        return validation_error({'room': ['Blocked message release is only supported for direct rooms.']})
+
+    blocked_messages = Message.objects.filter(
+        room_id=room_id,
+        recipient_user_id=user_id,
+        delivery_blocked=True,
+        deleted_at__isnull=True,
+    ).exclude(
+        sender_user_id=user_id,
+    ).order_by('created_at', 'id')
+    blocked_message_ids = list(blocked_messages.values_list('id', flat=True))
+    if not blocked_message_ids:
+        return {
+            'status': 'released',
+            'room_id': participant.room_id,
+            'user_id': user_id,
+            'released_messages': 0,
+            'updated_messages': 0,
+            'last_delivered_message_id': None,
+            'delivered_until': timezone.now().isoformat(),
+            'unread_count': get_room_unread_count(participant.room_id, user_id),
+            'room': serialize_room(participant.room),
+        }, 200
+
+    now = timezone.now()
+    last_released_message = Message.objects.get(pk=blocked_message_ids[-1])
+
+    Message.objects.filter(id__in=blocked_message_ids).update(
+        delivery_blocked=False,
+        updated_at=now,
+    )
+    delivered_count = Message.objects.filter(
+        id__in=blocked_message_ids,
+        status=Message.STATUS_SENT,
+    ).update(
+        status=Message.STATUS_DELIVERED,
+        updated_at=now,
+    )
+
+    invalidate_room_caches(participant.room_id)
+
+    return {
+        'status': 'released',
+        'room_id': participant.room_id,
+        'user_id': user_id,
+        'released_messages': len(blocked_message_ids),
+        'updated_messages': delivered_count,
+        'last_delivered_message_id': last_released_message.id,
+        'delivered_until': last_released_message.created_at.isoformat(),
+        'unread_count': get_room_unread_count(participant.room_id, user_id),
+        'room': serialize_room(participant.room),
+    }, 200
 
 
 def list_user_rooms(user_id):
@@ -357,10 +425,10 @@ def get_room_unread_count(room_id, user_id):
         Message.objects.filter(
             room_id=room_id,
             recipient_user_id=user_id,
-            delivery_blocked=False,
             deleted_at__isnull=True,
         )
         .exclude(sender_user_id=user_id)
+        .exclude(room__room_type=Room.TYPE_DIRECT, delivery_blocked=True)
         .exclude(status=Message.STATUS_READ)
         .count()
     )
@@ -390,7 +458,7 @@ def list_room_messages(user_id, room_id, limit=20, before_message_id=None):
     has_more = len(fetched_messages) > limit
     page_messages = fetched_messages[:limit]
     serialized_messages = [
-        serialize_message(message)
+        serialize_message(message, user_id)
         for message in reversed(page_messages)
     ]
     next_before_message_id = page_messages[-1].id if has_more and page_messages else None
@@ -428,16 +496,20 @@ def mark_room_delivered(user_id, room_id, payload):
             'message': 'Room not found.',
         }, 404
 
+    received_messages = Message.objects.filter(
+        room_id=room_id,
+        recipient_user_id=user_id,
+        deleted_at__isnull=True,
+    ).exclude(
+        sender_user_id=user_id,
+    )
+    if participant.room.is_direct:
+        received_messages = received_messages.filter(delivery_blocked=False)
+
     delivered_message = None
     if normalized_payload['last_delivered_message_id']:
-        delivered_message = Message.objects.filter(
-            room_id=room_id,
+        delivered_message = received_messages.filter(
             id=normalized_payload['last_delivered_message_id'],
-            recipient_user_id=user_id,
-            delivery_blocked=False,
-            deleted_at__isnull=True,
-        ).exclude(
-            sender_user_id=user_id,
         ).first()
         if not delivered_message:
             return validation_error(
@@ -450,27 +522,13 @@ def mark_room_delivered(user_id, room_id, payload):
         delivered_until = delivered_message.created_at
     else:
         delivered_message = (
-            Message.objects.filter(
-                room_id=room_id,
-                recipient_user_id=user_id,
-                delivery_blocked=False,
-                deleted_at__isnull=True,
-            )
-            .exclude(sender_user_id=user_id)
-            .order_by('-created_at', '-id')
-            .first()
+            received_messages.order_by('-created_at', '-id').first()
         )
         delivered_until = delivered_message.created_at if delivered_message else timezone.now()
 
-    delivered_count = Message.objects.filter(
-        room_id=room_id,
-        recipient_user_id=user_id,
-        delivery_blocked=False,
-        deleted_at__isnull=True,
+    delivered_count = received_messages.filter(
         created_at__lte=delivered_until,
         status=Message.STATUS_SENT,
-    ).exclude(
-        sender_user_id=user_id,
     ).update(
         status=Message.STATUS_DELIVERED,
         updated_at=timezone.now(),
@@ -652,6 +710,7 @@ def get_visible_messages_queryset(user_id, room_id=None):
         messages = messages.filter(room_id=room_id)
 
     return messages.exclude(
+        room__room_type=Room.TYPE_DIRECT,
         recipient_user_id=user_id,
         delivery_blocked=True,
     )
@@ -677,7 +736,7 @@ def serialize_room_summary(room, current_user_id):
         for participant in room_data['participants']
         if participant['user_id'] != current_user_id
     ]
-    room_data['last_message'] = serialize_message(latest_message) if latest_message else None
+    room_data['last_message'] = serialize_message(latest_message, current_user_id) if latest_message else None
     room_data['unread_count'] = get_room_unread_count(room.id, current_user_id)
     room_data['has_unread'] = room_data['unread_count'] > 0
     room_data['my_last_read_at'] = current_participant['last_read_at'] if current_participant else None
@@ -712,8 +771,8 @@ def serialize_participant(participant):
     }
 
 
-def serialize_message(message):
-    return {
+def serialize_message(message, current_user_id=None):
+    data = {
         'id': message.id,
         'room_id': message.room_id,
         'sender_user_id': message.sender_user_id,
@@ -722,6 +781,7 @@ def serialize_message(message):
         'text': message.text,
         'client_message_id': message.client_message_id,
         'status': message.status,
+        'sent_while_blocked': is_sent_while_blocked_visible(message, current_user_id),
         'created_at': message.created_at.isoformat(),
         'updated_at': message.updated_at.isoformat(),
         'attachments': [
@@ -729,6 +789,15 @@ def serialize_message(message):
             for attachment in message.attachments.all().order_by('sort_order', 'id')
         ],
     }
+
+    return data
+
+
+def is_sent_while_blocked_visible(message, current_user_id):
+    if not current_user_id or not message.sent_while_blocked:
+        return False
+
+    return int(message.recipient_user_id or 0) == int(current_user_id)
 
 
 def serialize_attachment(attachment):

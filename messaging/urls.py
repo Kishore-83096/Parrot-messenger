@@ -6,6 +6,7 @@ from .views import (
     health_check,
     list_rooms,
     read_room,
+    release_blocked_messages,
     room_messages,
     send_message,
 )
@@ -16,6 +17,7 @@ urlpatterns = [
     path('rooms/<int:room_id>/messages/', room_messages, name='room-messages'),
     path('rooms/<int:room_id>/delivered/', deliver_room, name='room-delivered'),
     path('rooms/<int:room_id>/read/', read_room, name='room-read'),
+    path('rooms/<int:room_id>/blocked-messages/release/', release_blocked_messages, name='room-blocked-messages-release'),
     path('messages/authorize/', authorize_message, name='message-authorization'),
     path('messages/send/', send_message, name='message-send'),
 ]

@@ -5,6 +5,7 @@ from unittest.mock import patch
 import jwt
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -12,10 +13,12 @@ from .models import Message, Room, RoomParticipant
 from .cache import invalidate_room_messages_cache
 from .services import (
     create_direct_message,
+    get_room_unread_count,
     list_room_messages,
     list_user_rooms,
     mark_room_delivered,
     mark_room_read,
+    release_room_blocked_messages,
 )
 
 
@@ -383,6 +386,8 @@ class MessagingCacheTests(TestCase):
         message = Message.objects.get()
         self.assertEqual(message.status, Message.STATUS_SENT)
         self.assertTrue(message.delivery_blocked)
+        self.assertTrue(message.sent_while_blocked)
+        self.assertFalse(send_result['message']['sent_while_blocked'])
 
         sender_messages_result, sender_messages_status = list_room_messages(
             self.sender_user_id,
@@ -424,6 +429,47 @@ class MessagingCacheTests(TestCase):
         message.refresh_from_db()
         self.assertEqual(message.status, Message.STATUS_SENT)
 
+    def test_released_blocked_message_is_delivered_and_marked_for_recipient(self):
+        room = self.create_direct_room()
+
+        create_direct_message(
+            self.sender(),
+            self.parent_authorization(delivery_blocked=True),
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Blocked then released message.',
+            },
+        )
+        message = Message.objects.get()
+
+        release_result, release_status = release_room_blocked_messages(
+            self.recipient_user_id,
+            room.id,
+        )
+        self.assertEqual(release_status, 200)
+        self.assertEqual(release_result['released_messages'], 1)
+        self.assertEqual(release_result['updated_messages'], 1)
+        self.assertEqual(release_result['last_delivered_message_id'], message.id)
+
+        message.refresh_from_db()
+        self.assertFalse(message.delivery_blocked)
+        self.assertTrue(message.sent_while_blocked)
+        self.assertEqual(message.status, Message.STATUS_DELIVERED)
+
+        sender_messages_result, sender_messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+        )
+        recipient_messages_result, recipient_messages_status = list_room_messages(
+            self.recipient_user_id,
+            room.id,
+        )
+        self.assertEqual(sender_messages_status, 200)
+        self.assertEqual(recipient_messages_status, 200)
+        self.assertFalse(sender_messages_result['messages'][0]['sent_while_blocked'])
+        self.assertTrue(recipient_messages_result['messages'][0]['sent_while_blocked'])
+        self.assertEqual(recipient_messages_result['messages'][0]['status'], Message.STATUS_DELIVERED)
+
     def test_sender_blocked_recipient_message_can_still_be_delivered_and_read(self):
         room = self.create_direct_room()
 
@@ -458,6 +504,76 @@ class MessagingCacheTests(TestCase):
 
         message.refresh_from_db()
         self.assertEqual(message.status, Message.STATUS_READ)
+
+    def test_delivery_blocked_is_rejected_for_group_room_messages(self):
+        room = Room.objects.create(
+            room_type=Room.TYPE_GROUP,
+            created_by_user_id=self.sender_user_id,
+        )
+
+        with self.assertRaises(ValidationError) as error_context:
+            Message.objects.create(
+                room=room,
+                sender_user_id=self.sender_user_id,
+                recipient_user_id=self.recipient_user_id,
+                text='Group messages cannot use direct-room block delivery.',
+                delivery_blocked=True,
+            )
+
+        self.assertIn('delivery_blocked', error_context.exception.message_dict)
+
+        with self.assertRaises(ValidationError) as blocked_marker_context:
+            Message.objects.create(
+                room=room,
+                sender_user_id=self.sender_user_id,
+                recipient_user_id=self.recipient_user_id,
+                text='Group messages cannot use direct-room blocked markers.',
+                sent_while_blocked=True,
+            )
+
+        self.assertIn('sent_while_blocked', blocked_marker_context.exception.message_dict)
+
+    def test_group_room_messages_are_not_hidden_by_delivery_blocked_flag(self):
+        room = Room.objects.create(
+            room_type=Room.TYPE_GROUP,
+            created_by_user_id=self.sender_user_id,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.sender_user_id,
+            account_number=self.sender_account_number,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+        )
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Future group message.',
+        )
+        Message.objects.filter(id=message.id).update(delivery_blocked=True)
+
+        messages_result, messages_status = list_room_messages(self.recipient_user_id, room.id)
+        self.assertEqual(messages_status, 200)
+        self.assertEqual(
+            [message['text'] for message in messages_result['messages']],
+            ['Future group message.'],
+        )
+        self.assertEqual(get_room_unread_count(room.id, self.recipient_user_id), 1)
+
+        delivered_result, delivered_status = mark_room_delivered(
+            self.recipient_user_id,
+            room.id,
+            {'last_delivered_message_id': message.id},
+        )
+        self.assertEqual(delivered_status, 200)
+        self.assertEqual(delivered_result['updated_messages'], 1)
+
+        message.refresh_from_db()
+        self.assertEqual(message.status, Message.STATUS_DELIVERED)
 
     def test_mark_room_read_invalidates_room_and_message_caches(self):
         room = self.create_direct_room()
