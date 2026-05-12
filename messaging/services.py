@@ -205,6 +205,45 @@ def ensure_room_participant(room, user_id, account_number):
     return participant, created
 
 
+def get_existing_direct_room_authorization(sender, recipient_account_number):
+    if not isinstance(recipient_account_number, str) or not ACCOUNT_NUMBER_PATTERN.match(recipient_account_number):
+        return None
+
+    recipient_participant = (
+        RoomParticipant.objects.filter(
+            room__room_type=Room.TYPE_DIRECT,
+            room__participants__user_id=sender['user_id'],
+            room__participants__is_active=True,
+            account_number=recipient_account_number,
+            is_active=True,
+        )
+        .exclude(user_id=sender['user_id'])
+        .select_related('room')
+        .order_by('-room__updated_at', '-room__id', 'id')
+        .first()
+    )
+    if not recipient_participant:
+        return None
+
+    sender_participant = RoomParticipant.objects.filter(
+        room_id=recipient_participant.room_id,
+        user_id=sender['user_id'],
+        is_active=True,
+    ).first()
+    if not sender_participant:
+        return None
+
+    return {
+        'sender_user_id': sender['user_id'],
+        'sender_account_number': sender.get('account_number') or sender_participant.account_number,
+        'recipient_user_id': recipient_participant.user_id,
+        'recipient_account_number': recipient_participant.account_number,
+        'room_id': recipient_participant.room_id,
+        'room_type': recipient_participant.room.room_type,
+        'authorization_source': 'shared_room',
+    }
+
+
 def create_direct_message(sender, parent_authorization, payload):
     normalized_payload, errors = normalize_send_payload(payload)
     if errors:

@@ -15,6 +15,7 @@ from .signals import (
 )
 from .services import (
     create_direct_message,
+    get_existing_direct_room_authorization,
     list_room_messages,
     list_user_rooms,
     mark_room_delivered,
@@ -56,7 +57,11 @@ def health_check(request):
 
 
 def get_authorization_status(result, response_status):
+    messenger_response = result.get('messenger')
     parent_response = result.get('parent', {}).get('response')
+
+    if isinstance(messenger_response, dict) and messenger_response.get('allowed') is True:
+        return 'allowed'
 
     if isinstance(parent_response, dict) and parent_response.get('allowed') is True:
         return 'allowed'
@@ -116,6 +121,58 @@ def authorize_sender_for_recipient(sender, recipient_account_number):
     return None, authorization_result, response_status
 
 
+def should_allow_shared_room_fallback(authorization_result):
+    parent_response = authorization_result.get('parent', {}).get('response')
+
+    return (
+        isinstance(parent_response, dict)
+        and parent_response.get('allowed') is False
+        and parent_response.get('reason') == 'contact_not_saved'
+    )
+
+
+def build_shared_room_authorization_result(parent_authorization_result, room_authorization):
+    authorization_result = {
+        'ok': True,
+        'parent': parent_authorization_result.get('parent', {}),
+        'messenger': {
+            'allowed': True,
+            'reason': 'shared_room',
+            'room_id': room_authorization['room_id'],
+            'room_type': room_authorization['room_type'],
+            'sender_user_id': room_authorization['sender_user_id'],
+            'recipient_user_id': room_authorization['recipient_user_id'],
+            'recipient_account_number': room_authorization['recipient_account_number'],
+        },
+    }
+
+    if parent_authorization_result.get('failed_parents'):
+        authorization_result['failed_parents'] = parent_authorization_result['failed_parents']
+
+    return authorization_result
+
+
+def authorize_sender_for_message(sender, recipient_account_number):
+    parent_authorization, authorization_result, response_status = authorize_sender_for_recipient(
+        sender,
+        recipient_account_number,
+    )
+    if parent_authorization is not None:
+        return parent_authorization, authorization_result, response_status
+
+    if not should_allow_shared_room_fallback(authorization_result):
+        return None, authorization_result, response_status
+
+    room_authorization = get_existing_direct_room_authorization(sender, recipient_account_number)
+    if not room_authorization:
+        return None, authorization_result, response_status
+
+    return room_authorization, build_shared_room_authorization_result(
+        authorization_result,
+        room_authorization,
+    ), 200
+
+
 @csrf_exempt
 @require_POST
 def authorize_message(request):
@@ -127,7 +184,7 @@ def authorize_message(request):
     if error_response:
         return error_response
 
-    _, authorization_result, response_status = authorize_sender_for_recipient(
+    _, authorization_result, response_status = authorize_sender_for_message(
         sender,
         payload.get('recipient_account_number'),
     )
@@ -154,7 +211,7 @@ def send_message(request):
     if error_response:
         return error_response
 
-    parent_authorization, authorization_result, authorization_status = authorize_sender_for_recipient(
+    parent_authorization, authorization_result, authorization_status = authorize_sender_for_message(
         sender,
         payload.get('recipient_account_number'),
     )
