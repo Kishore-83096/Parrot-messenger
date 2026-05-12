@@ -9,11 +9,11 @@ CACHE_VERSION_TIMEOUT = None
 
 
 def get_room_list_cache_timeout():
-    return getattr(settings, 'MESSAGING_ROOM_LIST_CACHE_TTL_SECONDS', 30)
+    return getattr(settings, 'MESSAGING_ROOM_LIST_CACHE_TTL_SECONDS', 900)
 
 
 def get_room_messages_cache_timeout():
-    return getattr(settings, 'MESSAGING_ROOM_MESSAGES_CACHE_TTL_SECONDS', 60)
+    return getattr(settings, 'MESSAGING_ROOM_MESSAGES_CACHE_TTL_SECONDS', 900)
 
 
 def get_cache_version(version_key):
