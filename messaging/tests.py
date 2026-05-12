@@ -14,6 +14,7 @@ from .services import (
     create_direct_message,
     list_room_messages,
     list_user_rooms,
+    mark_room_delivered,
     mark_room_read,
 )
 
@@ -99,6 +100,30 @@ class MessageSendAuthorizationTests(TestCase):
             },
         }, status
 
+    def parent_allowed(self, delivery_blocked=False, sender_blocked_recipient=False):
+        return {
+            'ok': True,
+            'parent': {
+                'response': {
+                    'allowed': True,
+                    'sender_user_id': self.sender_user_id,
+                    'sender_account_number': self.sender_account_number,
+                    'recipient_user_id': self.recipient_user_id,
+                    'recipient_account_number': self.recipient_account_number,
+                    'delivery_blocked': delivery_blocked,
+                    'block_context': {
+                        'sender_blocked_recipient': sender_blocked_recipient,
+                        'recipient_blocked_sender': delivery_blocked,
+                    },
+                    'contact': {
+                        'alias_name': 'Recipient',
+                        'blocked': sender_blocked_recipient,
+                    },
+                },
+                'status_code': 200,
+            },
+        }, 200
+
     @patch('messaging.views.broadcast_participant_event')
     @patch('messaging.views.broadcast_room_event')
     @patch('messaging.views.authorize_parent_messaging')
@@ -172,24 +197,37 @@ class MessageSendAuthorizationTests(TestCase):
         self.assertEqual(Message.objects.count(), 0)
         self.assertEqual(Room.objects.count(), 0)
 
+    @patch('messaging.views.broadcast_participant_event')
+    @patch('messaging.views.broadcast_room_event')
     @patch('messaging.views.authorize_parent_messaging')
-    def test_send_keeps_blocked_denial_even_when_direct_room_is_shared(
+    def test_send_creates_sent_only_message_when_recipient_blocked_sender(
         self,
         authorize_parent_messaging,
+        broadcast_room_event,
+        broadcast_participant_event,
     ):
-        self.create_direct_room()
-        authorize_parent_messaging.return_value = self.parent_denial('recipient_blocked_sender')
+        authorize_parent_messaging.return_value = self.parent_allowed(delivery_blocked=True)
 
         response = self.post_send_message(
             {
                 'recipient_account_number': self.recipient_account_number,
-                'text': 'This should stay blocked.',
+                'text': 'This should stay sent only.',
             }
         )
 
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()['status'], 'denied')
-        self.assertEqual(Message.objects.count(), 0)
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body['status'], 'sent')
+        self.assertNotIn('delivery_blocked', body['authorization']['parent']['response'])
+
+        message = Message.objects.get()
+        self.assertEqual(message.status, Message.STATUS_SENT)
+        self.assertTrue(message.delivery_blocked)
+
+        broadcast_room_event.assert_not_called()
+        broadcast_participant_event.assert_called_once()
+        participants = broadcast_participant_event.call_args.args[0]
+        self.assertEqual([participant['user_id'] for participant in participants], [self.sender_user_id])
 
     @patch('messaging.views.authorize_parent_messaging')
     def test_send_requires_active_room_participants_for_shared_room_fallback(
@@ -238,12 +276,13 @@ class MessagingCacheTests(TestCase):
 
         return room
 
-    def parent_authorization(self):
+    def parent_authorization(self, delivery_blocked=False):
         return {
             'sender_user_id': self.sender_user_id,
             'sender_account_number': self.sender_account_number,
             'recipient_user_id': self.recipient_user_id,
             'recipient_account_number': self.recipient_account_number,
+            'delivery_blocked': delivery_blocked,
         }
 
     def sender(self):
@@ -326,6 +365,99 @@ class MessagingCacheTests(TestCase):
             [message['text'] for message in fresh_messages_result['messages']],
             ['Old message.', 'New message.'],
         )
+
+    def test_delivery_blocked_message_is_visible_only_to_sender_and_kept_sent(self):
+        room = self.create_direct_room()
+
+        send_result, send_status = create_direct_message(
+            self.sender(),
+            self.parent_authorization(delivery_blocked=True),
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Blocked inbound message.',
+            },
+        )
+        self.assertEqual(send_status, 201)
+        self.assertEqual(send_result['status'], 'sent')
+
+        message = Message.objects.get()
+        self.assertEqual(message.status, Message.STATUS_SENT)
+        self.assertTrue(message.delivery_blocked)
+
+        sender_messages_result, sender_messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+        )
+        recipient_messages_result, recipient_messages_status = list_room_messages(
+            self.recipient_user_id,
+            room.id,
+        )
+        self.assertEqual(sender_messages_status, 200)
+        self.assertEqual(recipient_messages_status, 200)
+        self.assertEqual(
+            [message['text'] for message in sender_messages_result['messages']],
+            ['Blocked inbound message.'],
+        )
+        self.assertEqual(recipient_messages_result['messages'], [])
+
+        recipient_rooms_result, recipient_rooms_status = list_user_rooms(self.recipient_user_id)
+        self.assertEqual(recipient_rooms_status, 200)
+        self.assertEqual(recipient_rooms_result['rooms'][0]['last_message'], None)
+        self.assertEqual(recipient_rooms_result['rooms'][0]['unread_count'], 0)
+
+        delivered_result, delivered_status = mark_room_delivered(
+            self.recipient_user_id,
+            room.id,
+            {},
+        )
+        self.assertEqual(delivered_status, 200)
+        self.assertEqual(delivered_result['updated_messages'], 0)
+
+        read_result, read_status = mark_room_read(
+            self.recipient_user_id,
+            room.id,
+            {},
+        )
+        self.assertEqual(read_status, 200)
+        self.assertEqual(read_result['updated_messages'], 0)
+
+        message.refresh_from_db()
+        self.assertEqual(message.status, Message.STATUS_SENT)
+
+    def test_sender_blocked_recipient_message_can_still_be_delivered_and_read(self):
+        room = self.create_direct_room()
+
+        create_direct_message(
+            self.sender(),
+            self.parent_authorization(delivery_blocked=False),
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Sender blocked recipient but sends anyway.',
+            },
+        )
+        message = Message.objects.get()
+
+        delivered_result, delivered_status = mark_room_delivered(
+            self.recipient_user_id,
+            room.id,
+            {'last_delivered_message_id': message.id},
+        )
+        self.assertEqual(delivered_status, 200)
+        self.assertEqual(delivered_result['updated_messages'], 1)
+
+        message.refresh_from_db()
+        self.assertEqual(message.status, Message.STATUS_DELIVERED)
+
+        read_result, read_status = mark_room_read(
+            self.recipient_user_id,
+            room.id,
+            {'last_read_message_id': message.id},
+        )
+        self.assertEqual(read_status, 200)
+        self.assertEqual(read_result['updated_messages'], 1)
+
+        message.refresh_from_db()
+        self.assertEqual(message.status, Message.STATUS_READ)
 
     def test_mark_room_read_invalidates_room_and_message_caches(self):
         room = self.create_direct_room()

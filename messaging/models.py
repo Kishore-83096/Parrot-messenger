@@ -127,6 +127,7 @@ class Message(models.Model):
     text = models.TextField(blank=True)
     client_message_id = models.CharField(max_length=120, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_SENT)
+    delivery_blocked = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     edited_at = models.DateTimeField(null=True, blank=True)

@@ -33,8 +33,17 @@ class RoomParticipantAdmin(admin.ModelAdmin):
 
 @admin.register(Message)
 class MessageAdmin(admin.ModelAdmin):
-    list_display = ('id', 'room', 'sender_user_id', 'recipient_user_id', 'reply_to', 'status', 'created_at')
-    list_filter = ('status', 'created_at')
+    list_display = (
+        'id',
+        'room',
+        'sender_user_id',
+        'recipient_user_id',
+        'reply_to',
+        'status',
+        'delivery_blocked',
+        'created_at',
+    )
+    list_filter = ('status', 'delivery_blocked', 'created_at')
     search_fields = ('=sender_user_id', '=recipient_user_id', 'client_message_id', 'text')
     inlines = [MessageAttachmentInline]
 

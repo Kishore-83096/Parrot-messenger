@@ -75,6 +75,38 @@ def get_authorization_status(result, response_status):
     return 'error'
 
 
+def sanitize_authorization_result(result):
+    if isinstance(result, dict):
+        return {
+            key: sanitize_authorization_result(value)
+            for key, value in result.items()
+            if key not in {'delivery_blocked', 'block_context'}
+        }
+
+    if isinstance(result, list):
+        return [sanitize_authorization_result(value) for value in result]
+
+    return result
+
+
+def build_public_message_result(message_result):
+    return {
+        key: value
+        for key, value in message_result.items()
+        if not key.startswith('_')
+    }
+
+
+def get_sender_participants(room, sender):
+    sender_user_id = int(sender['user_id'])
+
+    return [
+        participant
+        for participant in room['participants']
+        if int(participant['user_id']) == sender_user_id
+    ]
+
+
 def parse_json_body(request):
     try:
         return json.loads(request.body.decode('utf-8') or '{}'), None
@@ -132,6 +164,7 @@ def should_allow_shared_room_fallback(authorization_result):
 
 
 def build_shared_room_authorization_result(parent_authorization_result, room_authorization):
+    parent_response = parent_authorization_result.get('parent', {}).get('response')
     authorization_result = {
         'ok': True,
         'parent': parent_authorization_result.get('parent', {}),
@@ -143,6 +176,10 @@ def build_shared_room_authorization_result(parent_authorization_result, room_aut
             'sender_user_id': room_authorization['sender_user_id'],
             'recipient_user_id': room_authorization['recipient_user_id'],
             'recipient_account_number': room_authorization['recipient_account_number'],
+            'delivery_blocked': bool(
+                isinstance(parent_response, dict)
+                and parent_response.get('delivery_blocked')
+            ),
         },
     }
 
@@ -166,6 +203,13 @@ def authorize_sender_for_message(sender, recipient_account_number):
     room_authorization = get_existing_direct_room_authorization(sender, recipient_account_number)
     if not room_authorization:
         return None, authorization_result, response_status
+
+    parent_response = authorization_result.get('parent', {}).get('response')
+    if isinstance(parent_response, dict) and parent_response.get('delivery_blocked'):
+        room_authorization = {
+            **room_authorization,
+            'delivery_blocked': True,
+        }
 
     return room_authorization, build_shared_room_authorization_result(
         authorization_result,
@@ -194,7 +238,7 @@ def authorize_message(request):
             'status': get_authorization_status(authorization_result, response_status),
             'service': 'messenger',
             'sender': sender,
-            'authorization': authorization_result,
+            'authorization': sanitize_authorization_result(authorization_result),
         },
         status=response_status,
     )
@@ -221,25 +265,31 @@ def send_message(request):
                 'status': get_authorization_status(authorization_result, authorization_status),
                 'service': 'messenger',
                 'sender': sender,
-                'authorization': authorization_result,
+                'authorization': sanitize_authorization_result(authorization_result),
             },
             status=authorization_status,
         )
 
     message_result, message_status = create_direct_message(sender, parent_authorization, payload)
+    delivery_blocked = bool(message_result.get('_delivery_blocked'))
     if message_status < 300 and message_result.get('status') == 'sent':
         event_payload = {
             'room': message_result['room'],
             'message': message_result['message'],
             'sender': sender,
         }
-        broadcast_room_event(
-            message_result['message']['room_id'],
-            'message.sent',
-            event_payload,
-        )
+        if not delivery_blocked:
+            broadcast_room_event(
+                message_result['message']['room_id'],
+                'message.sent',
+                event_payload,
+            )
+            event_participants = message_result['room']['participants']
+        else:
+            event_participants = get_sender_participants(message_result['room'], sender)
+
         broadcast_participant_event(
-            message_result['room']['participants'],
+            event_participants,
             'message.sent',
             event_payload,
         )
@@ -249,8 +299,8 @@ def send_message(request):
             'status': message_result['status'],
             'service': 'messenger',
             'sender': sender,
-            'authorization': authorization_result,
-            'result': message_result,
+            'authorization': sanitize_authorization_result(authorization_result),
+            'result': build_public_message_result(message_result),
         },
         status=message_status,
     )

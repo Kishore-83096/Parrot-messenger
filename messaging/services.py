@@ -266,10 +266,12 @@ def create_direct_message(sender, parent_authorization, payload):
                 'status': 'duplicate',
                 'room': serialize_room(existing_message.room),
                 'message': serialize_message(existing_message),
+                '_delivery_blocked': existing_message.delivery_blocked,
             }, 200
 
     recipient_user_id = parent_authorization['recipient_user_id']
     recipient_account_number = parent_authorization['recipient_account_number']
+    delivery_blocked = bool(parent_authorization.get('delivery_blocked'))
 
     try:
         with transaction.atomic():
@@ -279,7 +281,7 @@ def create_direct_message(sender, parent_authorization, payload):
                 sender_account_number=sender.get('account_number') or parent_authorization.get('sender_account_number'),
                 recipient_account_number=recipient_account_number,
             )
-            reply_to = get_reply_target(room, normalized_payload['reply_to_message_id'])
+            reply_to = get_reply_target(room, normalized_payload['reply_to_message_id'], sender['user_id'])
 
             message = Message.objects.create(
                 room=room,
@@ -289,6 +291,7 @@ def create_direct_message(sender, parent_authorization, payload):
                 text=normalized_payload['text'],
                 client_message_id=normalized_payload['client_message_id'],
                 status=Message.STATUS_SENT,
+                delivery_blocked=delivery_blocked,
             )
             create_message_attachments(message, normalized_payload['attachments'])
             room.updated_at = timezone.now()
@@ -305,14 +308,15 @@ def create_direct_message(sender, parent_authorization, payload):
         'room_created': room_created,
         'room': serialize_room(room),
         'message': serialize_message(message),
+        '_delivery_blocked': message.delivery_blocked,
     }, 201
 
 
-def get_reply_target(room, reply_to_message_id):
+def get_reply_target(room, reply_to_message_id, user_id):
     if not reply_to_message_id:
         return None
 
-    return Message.objects.get(pk=reply_to_message_id, room=room, deleted_at__isnull=True)
+    return get_visible_messages_queryset(user_id, room_id=room.id).get(pk=reply_to_message_id)
 
 
 def create_message_attachments(message, attachments):
@@ -353,6 +357,7 @@ def get_room_unread_count(room_id, user_id):
         Message.objects.filter(
             room_id=room_id,
             recipient_user_id=user_id,
+            delivery_blocked=False,
             deleted_at__isnull=True,
         )
         .exclude(sender_user_id=user_id)
@@ -377,7 +382,7 @@ def list_room_messages(user_id, room_id, limit=20, before_message_id=None):
             'message': 'Room not found.',
         }, 404
 
-    messages = Message.objects.filter(room_id=room_id, deleted_at__isnull=True)
+    messages = get_visible_messages_queryset(user_id, room_id=room_id)
     if before_message_id:
         messages = messages.filter(id__lt=before_message_id)
 
@@ -429,6 +434,7 @@ def mark_room_delivered(user_id, room_id, payload):
             room_id=room_id,
             id=normalized_payload['last_delivered_message_id'],
             recipient_user_id=user_id,
+            delivery_blocked=False,
             deleted_at__isnull=True,
         ).exclude(
             sender_user_id=user_id,
@@ -447,6 +453,7 @@ def mark_room_delivered(user_id, room_id, payload):
             Message.objects.filter(
                 room_id=room_id,
                 recipient_user_id=user_id,
+                delivery_blocked=False,
                 deleted_at__isnull=True,
             )
             .exclude(sender_user_id=user_id)
@@ -458,6 +465,7 @@ def mark_room_delivered(user_id, room_id, payload):
     delivered_count = Message.objects.filter(
         room_id=room_id,
         recipient_user_id=user_id,
+        delivery_blocked=False,
         deleted_at__isnull=True,
         created_at__lte=delivered_until,
         status=Message.STATUS_SENT,
@@ -500,11 +508,10 @@ def mark_room_read(user_id, room_id, payload):
 
     read_message = None
     if normalized_payload['last_read_message_id']:
-        read_message = Message.objects.filter(
+        read_message = get_visible_messages_queryset(
+            user_id,
             room_id=room_id,
-            id=normalized_payload['last_read_message_id'],
-            deleted_at__isnull=True,
-        ).first()
+        ).filter(id=normalized_payload['last_read_message_id']).first()
         if not read_message:
             return validation_error(
                 {
@@ -516,7 +523,7 @@ def mark_room_read(user_id, room_id, payload):
         requested_read_at = read_message.created_at
     else:
         read_message = (
-            Message.objects.filter(room_id=room_id, deleted_at__isnull=True)
+            get_visible_messages_queryset(user_id, room_id=room_id)
             .order_by('-created_at', '-id')
             .first()
         )
@@ -539,6 +546,7 @@ def mark_room_read(user_id, room_id, payload):
             updated_messages = Message.objects.filter(
                 room_id=room_id,
                 recipient_user_id=user_id,
+                delivery_blocked=False,
                 deleted_at__isnull=True,
                 created_at__lte=final_read_at,
             ).exclude(
@@ -638,8 +646,23 @@ def normalize_delivered_payload(payload):
     }, None
 
 
+def get_visible_messages_queryset(user_id, room_id=None):
+    messages = Message.objects.filter(deleted_at__isnull=True)
+    if room_id is not None:
+        messages = messages.filter(room_id=room_id)
+
+    return messages.exclude(
+        recipient_user_id=user_id,
+        delivery_blocked=True,
+    )
+
+
 def serialize_room_summary(room, current_user_id):
-    latest_message = room.messages.filter(deleted_at__isnull=True).order_by('-created_at', '-id').first()
+    latest_message = (
+        get_visible_messages_queryset(current_user_id, room_id=room.id)
+        .order_by('-created_at', '-id')
+        .first()
+    )
     room_data = serialize_room(room)
     current_participant = next(
         (
