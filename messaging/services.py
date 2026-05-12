@@ -1,92 +1,22 @@
 import re
 
-from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
+from .cache import (
+    get_cached_room_messages,
+    get_cached_user_rooms,
+    invalidate_room_caches,
+    set_cached_room_messages,
+    set_cached_user_rooms,
+)
 from .models import Message, MessageAttachment, Room, RoomParticipant
 
 
 ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
 MAX_MESSAGE_TEXT_LENGTH = 5000
 MAX_ATTACHMENTS_PER_MESSAGE = 10
-CACHE_NAMESPACE = 'messaging'
-CACHE_VERSION_TIMEOUT = None
-
-
-def get_room_list_cache_timeout():
-    return getattr(settings, 'MESSAGING_ROOM_LIST_CACHE_TTL_SECONDS', 30)
-
-
-def get_room_messages_cache_timeout():
-    return getattr(settings, 'MESSAGING_ROOM_MESSAGES_CACHE_TTL_SECONDS', 60)
-
-
-def get_cache_version(version_key):
-    version = cache.get(version_key)
-    if version is None:
-        version = 1
-        cache.set(version_key, version, timeout=CACHE_VERSION_TIMEOUT)
-
-    return version
-
-
-def bump_cache_version(version_key):
-    try:
-        cache.incr(version_key)
-    except ValueError:
-        cache.set(
-            version_key,
-            get_cache_version(version_key) + 1,
-            timeout=CACHE_VERSION_TIMEOUT,
-        )
-
-
-def room_list_version_key(user_id):
-    return f'{CACHE_NAMESPACE}:rooms:user:{user_id}:version'
-
-
-def room_messages_version_key(room_id):
-    return f'{CACHE_NAMESPACE}:room:{room_id}:messages:version'
-
-
-def room_list_cache_key(user_id):
-    version = get_cache_version(room_list_version_key(user_id))
-    return f'{CACHE_NAMESPACE}:rooms:user:{user_id}:v:{version}'
-
-
-def room_messages_cache_key(user_id, room_id, limit, before_message_id):
-    version = get_cache_version(room_messages_version_key(room_id))
-    before_key = before_message_id if before_message_id is not None else 'latest'
-
-    return (
-        f'{CACHE_NAMESPACE}:room:{room_id}:messages:user:{user_id}:'
-        f'limit:{limit}:before:{before_key}:v:{version}'
-    )
-
-
-def get_active_room_user_ids(room_id):
-    return list(
-        RoomParticipant.objects.filter(room_id=room_id, is_active=True)
-        .values_list('user_id', flat=True)
-    )
-
-
-def invalidate_user_room_list_cache(user_id):
-    bump_cache_version(room_list_version_key(user_id))
-
-
-def invalidate_room_messages_cache(room_id):
-    bump_cache_version(room_messages_version_key(room_id))
-
-
-def invalidate_room_caches(room_id, user_ids=None):
-    invalidate_room_messages_cache(room_id)
-
-    for user_id in user_ids or get_active_room_user_ids(room_id):
-        invalidate_user_room_list_cache(user_id)
 
 
 def validation_error(errors):
@@ -391,8 +321,7 @@ def create_message_attachments(message, attachments):
 
 
 def list_user_rooms(user_id):
-    cache_key = room_list_cache_key(user_id)
-    cached_result = cache.get(cache_key)
+    cached_result = get_cached_user_rooms(user_id)
     if cached_result is not None:
         return cached_result, 200
 
@@ -414,7 +343,7 @@ def list_user_rooms(user_id):
         'unread_rooms_count': sum(1 for room in rooms if room['has_unread']),
         'rooms': rooms,
     }
-    cache.set(cache_key, result, timeout=get_room_list_cache_timeout())
+    set_cached_user_rooms(user_id, result)
 
     return result, 200
 
@@ -432,9 +361,8 @@ def get_room_unread_count(room_id, user_id):
     )
 
 
-def list_room_messages(user_id, room_id, limit=50, before_message_id=None):
-    cache_key = room_messages_cache_key(user_id, room_id, limit, before_message_id)
-    cached_result = cache.get(cache_key)
+def list_room_messages(user_id, room_id, limit=20, before_message_id=None):
+    cached_result = get_cached_room_messages(user_id, room_id, limit, before_message_id)
     if cached_result is not None:
         return cached_result, 200
 
@@ -453,11 +381,14 @@ def list_room_messages(user_id, room_id, limit=50, before_message_id=None):
     if before_message_id:
         messages = messages.filter(id__lt=before_message_id)
 
-    messages = messages.order_by('-created_at', '-id')[:limit]
+    fetched_messages = list(messages.order_by('-created_at', '-id')[: limit + 1])
+    has_more = len(fetched_messages) > limit
+    page_messages = fetched_messages[:limit]
     serialized_messages = [
         serialize_message(message)
-        for message in reversed(list(messages))
+        for message in reversed(page_messages)
     ]
+    next_before_message_id = page_messages[-1].id if has_more and page_messages else None
 
     result = {
         'status': 'ok',
@@ -467,9 +398,11 @@ def list_room_messages(user_id, room_id, limit=50, before_message_id=None):
             'limit': limit,
             'before_message_id': before_message_id,
             'count': len(serialized_messages),
+            'has_more': has_more,
+            'next_before_message_id': next_before_message_id,
         },
     }
-    cache.set(cache_key, result, timeout=get_room_messages_cache_timeout())
+    set_cached_room_messages(user_id, room_id, limit, before_message_id, result)
 
     return result, 200
 
@@ -635,14 +568,14 @@ def mark_room_read(user_id, room_id, payload):
 
 def normalize_message_list_params(params):
     errors = {}
-    limit = params.get('limit', 50)
+    limit = params.get('limit', 20)
     before_message_id = params.get('before_message_id')
 
     try:
         limit = int(limit)
     except (TypeError, ValueError):
         errors['limit'] = ['Limit must be a number.']
-        limit = 50
+        limit = 20
 
     if limit < 1 or limit > 100:
         errors['limit'] = ['Limit must be between 1 and 100.']

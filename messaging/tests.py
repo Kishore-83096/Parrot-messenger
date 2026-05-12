@@ -9,9 +9,9 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from .models import Message, Room, RoomParticipant
+from .cache import invalidate_room_messages_cache
 from .services import (
     create_direct_message,
-    invalidate_room_messages_cache,
     list_room_messages,
     list_user_rooms,
     mark_room_read,
@@ -361,3 +361,31 @@ class MessagingCacheTests(TestCase):
         self.assertEqual(fresh_messages_status, 200)
         self.assertEqual(fresh_rooms_result['rooms'][0]['unread_count'], 0)
         self.assertEqual(fresh_messages_result['messages'][0]['status'], Message.STATUS_READ)
+
+    def test_list_room_messages_defaults_to_twenty_messages_per_page(self):
+        room = self.create_direct_room()
+        for index in range(25):
+            Message.objects.create(
+                room=room,
+                sender_user_id=self.sender_user_id,
+                recipient_user_id=self.recipient_user_id,
+                text=f'Message {index + 1}',
+            )
+
+        first_page_result, first_page_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+        )
+        self.assertEqual(first_page_status, 200)
+        self.assertEqual(len(first_page_result['messages']), 20)
+        self.assertTrue(first_page_result['pagination']['has_more'])
+        self.assertIsNotNone(first_page_result['pagination']['next_before_message_id'])
+
+        second_page_result, second_page_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+            before_message_id=first_page_result['pagination']['next_before_message_id'],
+        )
+        self.assertEqual(second_page_status, 200)
+        self.assertEqual(len(second_page_result['messages']), 5)
+        self.assertFalse(second_page_result['pagination']['has_more'])
