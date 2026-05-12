@@ -147,6 +147,29 @@ else:
     }
 
 
+# Cache
+
+if REDIS_URL:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_URL,
+            'KEY_PREFIX': 'messenger',
+        },
+    }
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'messenger-local-cache',
+            'KEY_PREFIX': 'messenger',
+        },
+    }
+
+MESSAGING_ROOM_LIST_CACHE_TTL_SECONDS = int(os.getenv('MESSAGING_ROOM_LIST_CACHE_TTL_SECONDS', '30'))
+MESSAGING_ROOM_MESSAGES_CACHE_TTL_SECONDS = int(os.getenv('MESSAGING_ROOM_MESSAGES_CACHE_TTL_SECONDS', '60'))
+
+
 # Browser and service integration
 
 CORS_ALLOWED_ORIGINS = env_list(
