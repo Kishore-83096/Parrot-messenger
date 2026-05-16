@@ -332,7 +332,7 @@ def room_messages(request, room_id):
     if error_response:
         return error_response
 
-    limit, before_message_id, errors = normalize_message_list_params(request.GET)
+    limit, before_message_id, around_message_id, errors = normalize_message_list_params(request.GET)
     if errors:
         return JsonResponse(
             {
@@ -348,6 +348,7 @@ def room_messages(request, room_id):
         room_id=room_id,
         limit=limit,
         before_message_id=before_message_id,
+        around_message_id=around_message_id,
     )
 
     return JsonResponse(

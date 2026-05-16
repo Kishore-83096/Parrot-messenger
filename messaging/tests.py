@@ -130,6 +130,76 @@ class MessageSendAuthorizationTests(TestCase):
     @patch('messaging.views.broadcast_participant_event')
     @patch('messaging.views.broadcast_room_event')
     @patch('messaging.views.authorize_parent_messaging')
+    def test_send_accepts_reply_target_and_broadcasts_reply_preview(
+        self,
+        authorize_parent_messaging,
+        broadcast_room_event,
+        broadcast_participant_event,
+    ):
+        room = self.create_direct_room()
+        original_message = Message.objects.create(
+            room=room,
+            sender_user_id=self.recipient_user_id,
+            recipient_user_id=self.sender_user_id,
+            text='Earlier message.',
+        )
+        authorize_parent_messaging.return_value = self.parent_allowed()
+
+        response = self.post_send_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Replying to that.',
+                'reply_to_message_id': original_message.id,
+                'client_message_id': 'reply-message-1',
+            }
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        reply_message = Message.objects.order_by('-id').first()
+        self.assertEqual(reply_message.reply_to_id, original_message.id)
+        self.assertEqual(body['result']['message']['reply_to_message_id'], original_message.id)
+        self.assertEqual(body['result']['message']['reply_to']['text'], 'Earlier message.')
+
+        broadcast_room_event.assert_called_once()
+        event_payload = broadcast_room_event.call_args.args[2]
+        self.assertEqual(event_payload['message']['reply_to']['id'], original_message.id)
+        broadcast_participant_event.assert_called_once()
+
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_send_rejects_reply_target_outside_room(
+        self,
+        authorize_parent_messaging,
+    ):
+        self.create_direct_room()
+        other_room = Room.objects.create(
+            room_type=Room.TYPE_DIRECT,
+            created_by_user_id=99,
+        )
+        Message.objects.create(
+            room=other_room,
+            sender_user_id=99,
+            recipient_user_id=self.sender_user_id,
+            text='Different room message.',
+        )
+        authorize_parent_messaging.return_value = self.parent_allowed()
+
+        response = self.post_send_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'This reply target is invalid.',
+                'reply_to_message_id': Message.objects.get(room=other_room).id,
+            }
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body['status'], 'error')
+        self.assertIn('reply_to_message_id', body['result']['errors'])
+
+    @patch('messaging.views.broadcast_participant_event')
+    @patch('messaging.views.broadcast_room_event')
+    @patch('messaging.views.authorize_parent_messaging')
     def test_send_allows_unsaved_contact_when_existing_direct_room_is_shared(
         self,
         authorize_parent_messaging,
@@ -637,3 +707,70 @@ class MessagingCacheTests(TestCase):
         self.assertEqual(second_page_status, 200)
         self.assertEqual(len(second_page_result['messages']), 5)
         self.assertFalse(second_page_result['pagination']['has_more'])
+
+    def test_list_room_messages_includes_reply_preview_for_unloaded_target(self):
+        room = self.create_direct_room()
+        original_message = Message.objects.create(
+            room=room,
+            sender_user_id=self.recipient_user_id,
+            recipient_user_id=self.sender_user_id,
+            text='Original reply target.',
+        )
+        for index in range(10):
+            Message.objects.create(
+                room=room,
+                sender_user_id=self.sender_user_id,
+                recipient_user_id=self.recipient_user_id,
+                text=f'Filler message {index + 1}',
+            )
+        Message.objects.create(
+            room=room,
+            reply_to=original_message,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Reply on latest page.',
+        )
+
+        messages_result, messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+            limit=5,
+        )
+
+        self.assertEqual(messages_status, 200)
+        self.assertNotIn(
+            original_message.id,
+            [message['id'] for message in messages_result['messages']],
+        )
+        reply_message = messages_result['messages'][-1]
+        self.assertEqual(reply_message['text'], 'Reply on latest page.')
+        self.assertEqual(reply_message['reply_to_message_id'], original_message.id)
+        self.assertEqual(reply_message['reply_to']['text'], 'Original reply target.')
+
+    def test_list_room_messages_around_message_returns_target_page(self):
+        room = self.create_direct_room()
+        target_message = None
+        for index in range(15):
+            message = Message.objects.create(
+                room=room,
+                sender_user_id=self.sender_user_id,
+                recipient_user_id=self.recipient_user_id,
+                text=f'Message {index + 1}',
+            )
+            if index == 3:
+                target_message = message
+
+        messages_result, messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+            limit=5,
+            around_message_id=target_message.id,
+        )
+
+        self.assertEqual(messages_status, 200)
+        self.assertEqual(messages_result['pagination']['target_message_id'], target_message.id)
+        self.assertIn(
+            target_message.id,
+            [message['id'] for message in messages_result['messages']],
+        )
+        self.assertTrue(messages_result['pagination']['has_newer'])

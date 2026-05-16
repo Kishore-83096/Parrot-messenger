@@ -49,13 +49,14 @@ def room_list_cache_key(user_id):
     return f'{CACHE_NAMESPACE}:rooms:user:{user_id}:v:{version}'
 
 
-def room_messages_cache_key(user_id, room_id, limit, before_message_id):
+def room_messages_cache_key(user_id, room_id, limit, before_message_id, around_message_id=None):
     version = get_cache_version(room_messages_version_key(room_id))
     before_key = before_message_id if before_message_id is not None else 'latest'
+    around_key = around_message_id if around_message_id is not None else 'none'
 
     return (
         f'{CACHE_NAMESPACE}:room:{room_id}:messages:user:{user_id}:'
-        f'limit:{limit}:before:{before_key}:v:{version}'
+        f'limit:{limit}:before:{before_key}:around:{around_key}:v:{version}'
     )
 
 
@@ -71,13 +72,13 @@ def set_cached_user_rooms(user_id, result):
     )
 
 
-def get_cached_room_messages(user_id, room_id, limit, before_message_id):
-    return cache.get(room_messages_cache_key(user_id, room_id, limit, before_message_id))
+def get_cached_room_messages(user_id, room_id, limit, before_message_id, around_message_id=None):
+    return cache.get(room_messages_cache_key(user_id, room_id, limit, before_message_id, around_message_id))
 
 
-def set_cached_room_messages(user_id, room_id, limit, before_message_id, result):
+def set_cached_room_messages(user_id, room_id, limit, before_message_id, result, around_message_id=None):
     cache.set(
-        room_messages_cache_key(user_id, room_id, limit, before_message_id),
+        room_messages_cache_key(user_id, room_id, limit, before_message_id, around_message_id),
         result,
         timeout=get_room_messages_cache_timeout(),
     )

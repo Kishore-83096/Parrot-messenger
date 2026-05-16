@@ -434,8 +434,14 @@ def get_room_unread_count(room_id, user_id):
     )
 
 
-def list_room_messages(user_id, room_id, limit=20, before_message_id=None):
-    cached_result = get_cached_room_messages(user_id, room_id, limit, before_message_id)
+def list_room_messages(user_id, room_id, limit=20, before_message_id=None, around_message_id=None):
+    cached_result = get_cached_room_messages(
+        user_id,
+        room_id,
+        limit,
+        before_message_id,
+        around_message_id,
+    )
     if cached_result is not None:
         return cached_result, 200
 
@@ -450,7 +456,27 @@ def list_room_messages(user_id, room_id, limit=20, before_message_id=None):
             'message': 'Room not found.',
         }, 404
 
-    messages = get_visible_messages_queryset(user_id, room_id=room_id)
+    messages = get_visible_messages_queryset(user_id, room_id=room_id).select_related('reply_to')
+    if around_message_id:
+        result, status = list_room_messages_around_target(
+            user_id=user_id,
+            room=participant.room,
+            messages=messages,
+            limit=limit,
+            around_message_id=around_message_id,
+        )
+        if status < 300:
+            set_cached_room_messages(
+                user_id,
+                room_id,
+                limit,
+                before_message_id,
+                result,
+                around_message_id,
+            )
+
+        return result, status
+
     if before_message_id:
         messages = messages.filter(id__lt=before_message_id)
 
@@ -478,6 +504,60 @@ def list_room_messages(user_id, room_id, limit=20, before_message_id=None):
     set_cached_room_messages(user_id, room_id, limit, before_message_id, result)
 
     return result, 200
+
+
+def list_room_messages_around_target(user_id, room, messages, limit, around_message_id):
+    target_message = messages.filter(id=around_message_id).first()
+    if not target_message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    older_limit = max((limit - 1) // 2, 0)
+    newer_limit = max(limit - older_limit - 1, 0)
+    older_messages = list(
+        messages.filter(id__lt=target_message.id).order_by('-created_at', '-id')[:older_limit]
+    )
+    newer_messages = list(
+        messages.filter(id__gt=target_message.id).order_by('created_at', 'id')[:newer_limit]
+    )
+    page_messages = sorted(
+        [*older_messages, target_message, *newer_messages],
+        key=lambda message: (message.created_at, message.id),
+    )
+    oldest_message = page_messages[0] if page_messages else None
+    newest_message = page_messages[-1] if page_messages else None
+    has_more_older = (
+        messages.filter(id__lt=oldest_message.id).exists()
+        if oldest_message
+        else False
+    )
+    has_more_newer = (
+        messages.filter(id__gt=newest_message.id).exists()
+        if newest_message
+        else False
+    )
+
+    return {
+        'status': 'ok',
+        'room': serialize_room(room),
+        'messages': [
+            serialize_message(message, user_id)
+            for message in page_messages
+        ],
+        'pagination': {
+            'limit': limit,
+            'before_message_id': None,
+            'around_message_id': around_message_id,
+            'target_message_id': target_message.id,
+            'count': len(page_messages),
+            'has_more': has_more_older,
+            'next_before_message_id': oldest_message.id if has_more_older and oldest_message else None,
+            'has_newer': has_more_newer,
+            'next_after_message_id': newest_message.id if has_more_newer and newest_message else None,
+        },
+    }, 200
 
 
 def mark_room_delivered(user_id, room_id, payload):
@@ -636,6 +716,7 @@ def normalize_message_list_params(params):
     errors = {}
     limit = params.get('limit', 20)
     before_message_id = params.get('before_message_id')
+    around_message_id = params.get('around_message_id')
 
     try:
         limit = int(limit)
@@ -654,10 +735,21 @@ def normalize_message_list_params(params):
         except (TypeError, ValueError):
             errors['before_message_id'] = ['before_message_id must be a message id.']
 
-    if errors:
-        return None, None, errors
+    if around_message_id in ('', None):
+        around_message_id = None
+    else:
+        try:
+            around_message_id = int(around_message_id)
+        except (TypeError, ValueError):
+            errors['around_message_id'] = ['around_message_id must be a message id.']
 
-    return limit, before_message_id, None
+    if before_message_id and around_message_id:
+        errors['message'] = ['Use either before_message_id or around_message_id, not both.']
+
+    if errors:
+        return None, None, None, errors
+
+    return limit, before_message_id, around_message_id, None
 
 
 def normalize_read_payload(payload):
@@ -778,6 +870,7 @@ def serialize_message(message, current_user_id=None):
         'sender_user_id': message.sender_user_id,
         'recipient_user_id': message.recipient_user_id,
         'reply_to_message_id': message.reply_to_id,
+        'reply_to': serialize_reply_preview(message.reply_to, current_user_id) if message.reply_to_id else None,
         'text': message.text,
         'client_message_id': message.client_message_id,
         'status': message.status,
@@ -791,6 +884,28 @@ def serialize_message(message, current_user_id=None):
     }
 
     return data
+
+
+def serialize_reply_preview(message, current_user_id=None):
+    if not message or message.deleted_at:
+        return None
+
+    if (
+        current_user_id
+        and message.delivery_blocked
+        and int(message.recipient_user_id or 0) == int(current_user_id)
+    ):
+        return None
+
+    return {
+        'id': message.id,
+        'room_id': message.room_id,
+        'sender_user_id': message.sender_user_id,
+        'recipient_user_id': message.recipient_user_id,
+        'text': message.text,
+        'attachment_count': message.attachments.count(),
+        'created_at': message.created_at.isoformat(),
+    }
 
 
 def is_sent_while_blocked_visible(message, current_user_id):
