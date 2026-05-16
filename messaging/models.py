@@ -199,6 +199,10 @@ class MessageAttachment(models.Model):
     width = models.PositiveIntegerField(null=True, blank=True)
     height = models.PositiveIntegerField(null=True, blank=True)
     duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    cloudinary_public_id = models.CharField(max_length=512, blank=True)
+    cloudinary_asset_id = models.CharField(max_length=255, blank=True)
+    cloudinary_resource_type = models.CharField(max_length=40, blank=True)
+    cloudinary_folder = models.CharField(max_length=255, blank=True)
     sort_order = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 

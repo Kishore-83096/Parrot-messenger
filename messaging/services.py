@@ -1,5 +1,11 @@
+import mimetypes
 import re
+from pathlib import Path
 
+from cloudinary import config as cloudinary_config
+from cloudinary import uploader as cloudinary_uploader
+from cloudinary.exceptions import Error as CloudinaryError
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
@@ -17,6 +23,37 @@ from .models import Message, MessageAttachment, Room, RoomParticipant
 ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
 MAX_MESSAGE_TEXT_LENGTH = 5000
 MAX_ATTACHMENTS_PER_MESSAGE = 10
+MAIN_CLOUDINARY_FOLDER = 'MAIN'
+IMAGE_EXTENSIONS = {'.avif', '.gif', '.heic', '.jpeg', '.jpg', '.png', '.webp'}
+PDF_EXTENSIONS = {'.pdf'}
+VIDEO_EXTENSIONS = {'.avi', '.m4v', '.mov', '.mp4', '.mpeg', '.mpg', '.webm'}
+AUDIO_EXTENSIONS = {'.aac', '.flac', '.m4a', '.mp3', '.ogg', '.wav', '.webm'}
+DOCUMENT_EXTENSIONS = {
+    '.csv',
+    '.doc',
+    '.docx',
+    '.json',
+    '.md',
+    '.ppt',
+    '.pptx',
+    '.rtf',
+    '.txt',
+    '.xls',
+    '.xlsx',
+}
+BLOCKED_UPLOAD_EXTENSIONS = {
+    '.bat',
+    '.cmd',
+    '.com',
+    '.dll',
+    '.exe',
+    '.js',
+    '.msi',
+    '.ps1',
+    '.scr',
+    '.sh',
+    '.vbs',
+}
 
 
 def validation_error(errors):
@@ -127,11 +164,168 @@ def normalize_attachments(value):
                 'width': normalize_optional_positive_int(attachment.get('width')),
                 'height': normalize_optional_positive_int(attachment.get('height')),
                 'duration_seconds': normalize_optional_positive_int(attachment.get('duration_seconds')),
+                'cloudinary_public_id': normalize_string(attachment.get('cloudinary_public_id')),
+                'cloudinary_asset_id': normalize_string(attachment.get('cloudinary_asset_id')),
+                'cloudinary_resource_type': normalize_string(attachment.get('cloudinary_resource_type')),
+                'cloudinary_folder': normalize_string(attachment.get('cloudinary_folder')),
                 'sort_order': normalize_optional_positive_int(attachment.get('sort_order')) or index,
             }
         )
 
     return attachments, errors or None
+
+
+def upload_message_files(uploaded_files):
+    uploaded_files = list(uploaded_files or [])
+    if not uploaded_files:
+        return [], None
+
+    if len(uploaded_files) > MAX_ATTACHMENTS_PER_MESSAGE:
+        return [], [f'Cannot attach more than {MAX_ATTACHMENTS_PER_MESSAGE} files to one message.']
+
+    if not getattr(settings, 'CLOUDINARY_URL', ''):
+        return [], ['Cloudinary is not configured for media uploads.']
+
+    cloudinary_config(cloudinary_url=settings.CLOUDINARY_URL, secure=True)
+
+    attachments = []
+    errors = []
+
+    for index, uploaded_file in enumerate(uploaded_files):
+        normalized_file, file_errors = normalize_uploaded_message_file(uploaded_file, index)
+        if file_errors:
+            errors.append({index: file_errors})
+            continue
+
+        try:
+            if hasattr(uploaded_file, 'seek'):
+                uploaded_file.seek(0)
+            upload_result = cloudinary_uploader.upload(
+                uploaded_file,
+                folder=normalized_file['cloudinary_folder'],
+                resource_type=normalized_file['cloudinary_resource_type'],
+                use_filename=True,
+                unique_filename=True,
+                overwrite=False,
+            )
+        except CloudinaryError as error:
+            errors.append({index: str(error) or 'Unable to upload attachment.'})
+            continue
+
+        attachments.append(
+            build_uploaded_attachment(upload_result, normalized_file, index)
+        )
+
+    if errors:
+        cleanup_uploaded_attachments(attachments)
+        return [], errors
+
+    return attachments, None
+
+
+def normalize_uploaded_message_file(uploaded_file, index):
+    file_name = Path(uploaded_file.name or f'attachment-{index + 1}').name
+    extension = Path(file_name).suffix.lower()
+    mime_type = (
+        getattr(uploaded_file, 'content_type', '') or
+        mimetypes.guess_type(file_name)[0] or
+        'application/octet-stream'
+    )
+    max_size = getattr(settings, 'MESSAGING_MAX_UPLOAD_FILE_SIZE_BYTES', 25 * 1024 * 1024)
+    file_size = int(getattr(uploaded_file, 'size', 0) or 0)
+    errors = {}
+
+    if extension in BLOCKED_UPLOAD_EXTENSIONS:
+        errors['file_name'] = 'This file type is not allowed.'
+
+    if file_size <= 0:
+        errors['file_size_bytes'] = 'Attachment file is empty.'
+    elif file_size > max_size:
+        errors['file_size_bytes'] = f'Attachment cannot exceed {max_size // (1024 * 1024)} MB.'
+
+    file_type, resource_type, folder_suffix = get_upload_file_routing(mime_type, extension)
+    if not file_type:
+        errors['file_type'] = 'Unsupported attachment file type.'
+
+    if errors:
+        return None, errors
+
+    root_folder = getattr(settings, 'CLOUDINARY_MAIN_FOLDER', MAIN_CLOUDINARY_FOLDER).strip('/') or MAIN_CLOUDINARY_FOLDER
+
+    return {
+        'file_name': file_name,
+        'mime_type': mime_type,
+        'file_size_bytes': file_size,
+        'file_type': file_type,
+        'cloudinary_resource_type': resource_type,
+        'cloudinary_folder': f'{root_folder}/{folder_suffix}',
+    }, None
+
+
+def get_upload_file_routing(mime_type, extension):
+    if mime_type.startswith('image/') or extension in IMAGE_EXTENSIONS:
+        return MessageAttachment.TYPE_IMAGE, 'image', 'pics'
+
+    if mime_type == 'application/pdf' or extension in PDF_EXTENSIONS:
+        return MessageAttachment.TYPE_DOCUMENT, 'raw', 'pdfs'
+
+    if mime_type.startswith('video/') or extension in VIDEO_EXTENSIONS:
+        return MessageAttachment.TYPE_VIDEO, 'video', 'videos'
+
+    if mime_type.startswith('audio/') or extension in AUDIO_EXTENSIONS:
+        return MessageAttachment.TYPE_AUDIO, 'video', 'audio'
+
+    if extension in DOCUMENT_EXTENSIONS or mime_type in {
+        'application/json',
+        'application/msword',
+        'application/rtf',
+        'application/vnd.ms-excel',
+        'application/vnd.ms-powerpoint',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'text/csv',
+        'text/markdown',
+        'text/plain',
+    }:
+        return MessageAttachment.TYPE_DOCUMENT, 'raw', 'docs'
+
+    return None, None, None
+
+
+def build_uploaded_attachment(upload_result, normalized_file, index):
+    resource_type = upload_result.get('resource_type') or normalized_file['cloudinary_resource_type']
+    duration = upload_result.get('duration')
+
+    return {
+        'file_type': normalized_file['file_type'],
+        'file_url': upload_result.get('secure_url') or upload_result.get('url') or '',
+        'thumbnail_url': upload_result.get('secure_url', '') if normalized_file['file_type'] == MessageAttachment.TYPE_IMAGE else '',
+        'file_name': normalized_file['file_name'],
+        'mime_type': normalized_file['mime_type'],
+        'file_size_bytes': upload_result.get('bytes') or normalized_file['file_size_bytes'],
+        'width': normalize_optional_positive_int(upload_result.get('width')),
+        'height': normalize_optional_positive_int(upload_result.get('height')),
+        'duration_seconds': normalize_optional_positive_int(round(duration)) if duration else None,
+        'cloudinary_public_id': upload_result.get('public_id', ''),
+        'cloudinary_asset_id': upload_result.get('asset_id', ''),
+        'cloudinary_resource_type': resource_type,
+        'cloudinary_folder': normalized_file['cloudinary_folder'],
+        'sort_order': index,
+    }
+
+
+def cleanup_uploaded_attachments(attachments):
+    for attachment in attachments or []:
+        public_id = attachment.get('cloudinary_public_id')
+        resource_type = attachment.get('cloudinary_resource_type') or 'raw'
+        if not public_id:
+            continue
+
+        try:
+            cloudinary_uploader.destroy(public_id, resource_type=resource_type)
+        except CloudinaryError:
+            pass
 
 
 def normalize_string(value):

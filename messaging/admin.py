@@ -13,7 +13,17 @@ class RoomParticipantInline(admin.TabularInline):
 class MessageAttachmentInline(admin.TabularInline):
     model = MessageAttachment
     extra = 0
-    fields = ('file_type', 'file_url', 'thumbnail_url', 'file_name', 'mime_type', 'sort_order')
+    fields = (
+        'file_type',
+        'file_url',
+        'thumbnail_url',
+        'file_name',
+        'mime_type',
+        'cloudinary_public_id',
+        'cloudinary_resource_type',
+        'cloudinary_folder',
+        'sort_order',
+    )
 
 
 @admin.register(Room)
@@ -51,6 +61,23 @@ class MessageAdmin(admin.ModelAdmin):
 
 @admin.register(MessageAttachment)
 class MessageAttachmentAdmin(admin.ModelAdmin):
-    list_display = ('id', 'message', 'file_type', 'file_name', 'mime_type', 'sort_order', 'created_at')
-    list_filter = ('file_type', 'created_at')
-    search_fields = ('file_url', 'thumbnail_url', 'file_name', 'mime_type')
+    list_display = (
+        'id',
+        'message',
+        'file_type',
+        'file_name',
+        'mime_type',
+        'cloudinary_resource_type',
+        'cloudinary_folder',
+        'sort_order',
+        'created_at',
+    )
+    list_filter = ('file_type', 'cloudinary_resource_type', 'cloudinary_folder', 'created_at')
+    search_fields = (
+        'file_url',
+        'thumbnail_url',
+        'file_name',
+        'mime_type',
+        'cloudinary_public_id',
+        'cloudinary_asset_id',
+    )

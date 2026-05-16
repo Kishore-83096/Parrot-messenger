@@ -6,6 +6,7 @@ import jwt
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -26,6 +27,8 @@ TEST_JWT_SETTINGS = {
     'MESSAGING_JWT_SECRET': 'test-messenger-secret-at-least-32-bytes',
     'MESSAGING_JWT_ISSUER': 'parrot-parent',
     'MESSAGING_JWT_AUDIENCE': 'parrot-messenger',
+    'CLOUDINARY_URL': 'cloudinary://test-key:test-secret@test-cloud',
+    'CLOUDINARY_MAIN_FOLDER': 'MAIN',
 }
 
 
@@ -79,6 +82,13 @@ class MessageSendAuthorizationTests(TestCase):
             '/messages/send/',
             data=json.dumps(payload),
             content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+    def post_send_media_message(self, payload):
+        return self.client.post(
+            '/messages/send/',
+            data=payload,
             HTTP_AUTHORIZATION=self.auth_header(),
         )
 
@@ -196,6 +206,101 @@ class MessageSendAuthorizationTests(TestCase):
         body = response.json()
         self.assertEqual(body['status'], 'error')
         self.assertIn('reply_to_message_id', body['result']['errors'])
+
+    @patch('messaging.views.broadcast_participant_event')
+    @patch('messaging.views.broadcast_room_event')
+    @patch('messaging.views.authorize_parent_messaging')
+    @patch('messaging.services.cloudinary_uploader.upload')
+    def test_send_uploads_multiple_media_files_to_cloudinary(
+        self,
+        cloudinary_upload,
+        authorize_parent_messaging,
+        broadcast_room_event,
+        broadcast_participant_event,
+    ):
+        authorize_parent_messaging.return_value = self.parent_allowed()
+        cloudinary_upload.side_effect = [
+            {
+                'secure_url': 'https://res.cloudinary.com/demo/image/upload/main-pic.jpg',
+                'public_id': 'MAIN/pics/main-pic',
+                'asset_id': 'asset-pic',
+                'resource_type': 'image',
+                'bytes': 7,
+                'width': 32,
+                'height': 32,
+            },
+            {
+                'secure_url': 'https://res.cloudinary.com/demo/raw/upload/main-file.pdf',
+                'public_id': 'MAIN/pdfs/main-file',
+                'asset_id': 'asset-pdf',
+                'resource_type': 'raw',
+                'bytes': 11,
+            },
+        ]
+        image_file = SimpleUploadedFile(
+            'photo.jpg',
+            b'image-bytes',
+            content_type='image/jpeg',
+        )
+        pdf_file = SimpleUploadedFile(
+            'report.pdf',
+            b'%PDF-bytes',
+            content_type='application/pdf',
+        )
+
+        response = self.post_send_media_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Files attached.',
+                'client_message_id': 'media-message-1',
+                'attachments': [image_file, pdf_file],
+            }
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        attachments = body['result']['message']['attachments']
+        self.assertEqual(len(attachments), 2)
+        self.assertEqual(attachments[0]['file_type'], 'image')
+        self.assertEqual(attachments[1]['file_type'], 'document')
+
+        saved_attachments = list(Message.objects.get().attachments.order_by('sort_order'))
+        self.assertEqual(saved_attachments[0].cloudinary_public_id, 'MAIN/pics/main-pic')
+        self.assertEqual(saved_attachments[0].cloudinary_folder, 'MAIN/pics')
+        self.assertEqual(saved_attachments[1].cloudinary_public_id, 'MAIN/pdfs/main-file')
+        self.assertEqual(saved_attachments[1].cloudinary_folder, 'MAIN/pdfs')
+
+        self.assertEqual(cloudinary_upload.call_args_list[0].kwargs['folder'], 'MAIN/pics')
+        self.assertEqual(cloudinary_upload.call_args_list[1].kwargs['folder'], 'MAIN/pdfs')
+        broadcast_room_event.assert_called_once()
+        broadcast_participant_event.assert_called_once()
+
+    @patch('messaging.views.authorize_parent_messaging')
+    @patch('messaging.services.cloudinary_uploader.upload')
+    def test_send_media_message_rejects_unsupported_file_type(
+        self,
+        cloudinary_upload,
+        authorize_parent_messaging,
+    ):
+        authorize_parent_messaging.return_value = self.parent_allowed()
+
+        response = self.post_send_media_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': '',
+                'attachments': [
+                    SimpleUploadedFile(
+                        'run.exe',
+                        b'not-safe',
+                        content_type='application/octet-stream',
+                    ),
+                ],
+            }
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Message.objects.count(), 0)
+        cloudinary_upload.assert_not_called()
 
     @patch('messaging.views.broadcast_participant_event')
     @patch('messaging.views.broadcast_room_event')

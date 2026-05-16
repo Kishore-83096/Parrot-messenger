@@ -14,6 +14,7 @@ from .signals import (
     check_redis,
 )
 from .services import (
+    cleanup_uploaded_attachments,
     create_direct_message,
     get_existing_direct_room_authorization,
     list_room_messages,
@@ -22,6 +23,7 @@ from .services import (
     mark_room_read,
     normalize_message_list_params,
     release_room_blocked_messages,
+    upload_message_files,
 )
 
 
@@ -120,6 +122,22 @@ def parse_json_body(request):
             },
             status=400,
         )
+
+
+def parse_send_message_body(request):
+    content_type = (request.content_type or '').split(';', 1)[0].strip().lower()
+
+    if content_type == 'multipart/form-data':
+        payload = request.POST.dict()
+        uploaded_files = [
+            *request.FILES.getlist('attachments'),
+            *request.FILES.getlist('files'),
+            *request.FILES.getlist('media'),
+        ]
+        return payload, uploaded_files, None
+
+    payload, error_response = parse_json_body(request)
+    return payload, [], error_response
 
 
 def get_authenticated_sender(request):
@@ -248,7 +266,7 @@ def authorize_message(request):
 @csrf_exempt
 @require_POST
 def send_message(request):
-    payload, error_response = parse_json_body(request)
+    payload, uploaded_files, error_response = parse_send_message_body(request)
     if error_response:
         return error_response
 
@@ -271,7 +289,41 @@ def send_message(request):
             status=authorization_status,
         )
 
+    uploaded_attachments, attachment_errors = upload_message_files(uploaded_files)
+    if attachment_errors:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'sender': sender,
+                'authorization': sanitize_authorization_result(authorization_result),
+                'result': {
+                    'status': 'error',
+                    'errors': {
+                        'attachments': attachment_errors,
+                    },
+                },
+            },
+            status=400,
+        )
+
+    if uploaded_attachments:
+        payload = {
+            **payload,
+            'attachments': [
+                *(
+                    payload.get('attachments')
+                    if isinstance(payload.get('attachments'), list)
+                    else []
+                ),
+                *uploaded_attachments,
+            ],
+        }
+
     message_result, message_status = create_direct_message(sender, parent_authorization, payload)
+    if message_status >= 300:
+        cleanup_uploaded_attachments(uploaded_attachments)
+
     delivery_blocked = bool(message_result.get('_delivery_blocked'))
     if message_status < 300 and message_result.get('status') == 'sent':
         event_payload = {
