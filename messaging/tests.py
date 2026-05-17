@@ -333,6 +333,17 @@ class CryptoDeviceKeyTests(TestCase):
             self.key_backup_payload()['encrypted_private_key'],
         )
 
+    def test_get_crypto_key_backup_without_backup(self):
+        response = self.client.get(
+            '/crypto/key-backup/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(body['result']['exists'])
+        self.assertIsNone(body['result']['backup'])
+
     def test_save_crypto_key_backup_rejects_invalid_payload(self):
         payload = self.key_backup_payload()
         payload['nonce'] = test_base64_bytes(b'n', 8)
