@@ -11,6 +11,7 @@ from .e2ee.devices import (
     list_user_device_keys,
     register_user_device_key,
 )
+from .e2ee.files import upload_encrypted_file
 from .realtime import broadcast_participant_event, broadcast_room_event
 from .signals import (
     authorize_parent_messaging,
@@ -340,6 +341,27 @@ def recipient_crypto_devices(request, recipient_account_number):
             'service': 'messenger',
             'sender': sender,
             'authorization': sanitize_authorization_result(authorization_result),
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def upload_crypto_file(request):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    uploaded_file = request.FILES.get('file')
+    result, response_status = upload_encrypted_file(uploaded_file)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
             'result': result,
         },
         status=response_status,

@@ -11,6 +11,7 @@ from .views import (
     release_blocked_messages,
     room_messages,
     send_message,
+    upload_crypto_file,
     user_crypto_devices,
 )
 
@@ -22,6 +23,7 @@ urlpatterns = [
     path('rooms/<int:room_id>/read/', read_room, name='room-read'),
     path('rooms/<int:room_id>/blocked-messages/release/', release_blocked_messages, name='room-blocked-messages-release'),
     path('crypto/devices/', register_crypto_device, name='crypto-device-register'),
+    path('crypto/files/', upload_crypto_file, name='crypto-file-upload'),
     path('crypto/users/<int:user_id>/devices/', user_crypto_devices, name='crypto-user-devices'),
     path('crypto/recipients/<str:recipient_account_number>/devices/', recipient_crypto_devices, name='crypto-recipient-devices'),
     path('messages/authorize/', authorize_message, name='message-authorization'),

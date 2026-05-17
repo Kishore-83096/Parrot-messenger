@@ -11,7 +11,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from .models import Message, Room, RoomParticipant, UserDeviceKey
+from .models import Message, MessageAttachment, Room, RoomParticipant, UserDeviceKey
 from .cache import invalidate_room_messages_cache
 from .services import (
     create_direct_message,
@@ -240,6 +240,49 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+    @patch('messaging.e2ee.files.cloudinary_uploader.upload')
+    def test_upload_encrypted_attachment_blob(self, cloudinary_upload):
+        cloudinary_upload.return_value = {
+            'secure_url': 'https://res.cloudinary.com/demo/raw/upload/encrypted.bin',
+            'bytes': 27,
+            'public_id': 'MAIN/e2ee/encrypted',
+            'resource_type': 'raw',
+        }
+
+        response = self.client.post(
+            '/crypto/files/',
+            data={
+                'file': SimpleUploadedFile(
+                    'encrypted.bin',
+                    b'encrypted-ciphertext',
+                    content_type='application/octet-stream',
+                ),
+            },
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['status'], 'ok')
+        self.assertEqual(
+            body['result']['file']['encrypted_file_url'],
+            'https://res.cloudinary.com/demo/raw/upload/encrypted.bin',
+        )
+        self.assertNotIn('file_name', body['result']['file'])
+        self.assertEqual(MessageAttachment.objects.count(), 0)
+        self.assertEqual(cloudinary_upload.call_args.kwargs['folder'], 'MAIN/e2ee')
+        self.assertEqual(cloudinary_upload.call_args.kwargs['resource_type'], 'raw')
+        self.assertIs(cloudinary_upload.call_args.kwargs['use_filename'], False)
+
+    def test_upload_encrypted_attachment_requires_file(self):
+        response = self.client.post(
+            '/crypto/files/',
+            data={},
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 400)
 
 
 @override_settings(**TEST_JWT_SETTINGS)
