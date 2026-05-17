@@ -6,6 +6,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from .auth import validate_messaging_token
+from .e2ee.backups import get_user_key_backup, save_user_key_backup
 from .e2ee.devices import (
     list_accessible_user_device_keys,
     list_user_device_keys,
@@ -356,6 +357,41 @@ def upload_crypto_file(request):
 
     uploaded_file = request.FILES.get('file')
     result, response_status = upload_encrypted_file(uploaded_file)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+def crypto_key_backup(request):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    if request.method == 'GET':
+        result, response_status = get_user_key_backup(sender['user_id'])
+    elif request.method == 'POST':
+        payload, error_response = parse_json_body(request)
+        if error_response:
+            return error_response
+
+        result, response_status = save_user_key_backup(sender['user_id'], payload)
+    else:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Method not allowed.',
+            },
+            status=405,
+        )
 
     return JsonResponse(
         {

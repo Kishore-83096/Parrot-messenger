@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     authorize_message,
+    crypto_key_backup,
     deliver_room,
     health_check,
     list_rooms,
@@ -24,6 +25,7 @@ urlpatterns = [
     path('rooms/<int:room_id>/blocked-messages/release/', release_blocked_messages, name='room-blocked-messages-release'),
     path('crypto/devices/', register_crypto_device, name='crypto-device-register'),
     path('crypto/files/', upload_crypto_file, name='crypto-file-upload'),
+    path('crypto/key-backup/', crypto_key_backup, name='crypto-key-backup'),
     path('crypto/users/<int:user_id>/devices/', user_crypto_devices, name='crypto-user-devices'),
     path('crypto/recipients/<str:recipient_account_number>/devices/', recipient_crypto_devices, name='crypto-recipient-devices'),
     path('messages/authorize/', authorize_message, name='message-authorization'),

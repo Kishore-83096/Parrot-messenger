@@ -11,7 +11,14 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from .models import Message, MessageAttachment, Room, RoomParticipant, UserDeviceKey
+from .models import (
+    Message,
+    MessageAttachment,
+    Room,
+    RoomParticipant,
+    UserDeviceKey,
+    UserE2EEKeyBackup,
+)
 from .cache import invalidate_room_messages_cache
 from .services import (
     create_direct_message,
@@ -35,6 +42,10 @@ TEST_JWT_SETTINGS = {
 
 def test_public_key(byte_value=b'a'):
     return base64.b64encode(byte_value * 32).decode('ascii')
+
+
+def test_base64_bytes(byte_value=b'c', length=32):
+    return base64.b64encode(byte_value * length).decode('ascii')
 
 
 @override_settings(**TEST_JWT_SETTINGS)
@@ -118,6 +129,16 @@ class CryptoDeviceKeyTests(TestCase):
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(user_id=user_id),
         )
+
+    def key_backup_payload(self):
+        return {
+            'public_key': test_public_key(),
+            'encrypted_private_key': test_base64_bytes(b'p', 48),
+            'salt': test_base64_bytes(b's', 16),
+            'nonce': test_base64_bytes(b'n', 24),
+            'kdf_algorithm': 'PBKDF2-SHA256',
+            'kdf_iterations': 600000,
+        }
 
     def test_register_crypto_device_key(self):
         response = self.post_device_key(
@@ -283,6 +304,49 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+
+    def test_save_and_get_crypto_key_backup(self):
+        response = self.client.post(
+            '/crypto/key-backup/',
+            data=json.dumps(self.key_backup_payload()),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['status'], 'ok')
+        self.assertTrue(body['result']['exists'])
+        self.assertEqual(UserE2EEKeyBackup.objects.count(), 1)
+        self.assertEqual(UserE2EEKeyBackup.objects.get().user_id, self.sender_user_id)
+
+        get_response = self.client.get(
+            '/crypto/key-backup/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        get_body = get_response.json()
+
+        self.assertEqual(get_response.status_code, 200)
+        self.assertTrue(get_body['result']['exists'])
+        self.assertEqual(
+            get_body['result']['backup']['encrypted_private_key'],
+            self.key_backup_payload()['encrypted_private_key'],
+        )
+
+    def test_save_crypto_key_backup_rejects_invalid_payload(self):
+        payload = self.key_backup_payload()
+        payload['nonce'] = test_base64_bytes(b'n', 8)
+
+        response = self.client.post(
+            '/crypto/key-backup/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('nonce', body['result']['errors'])
 
 
 @override_settings(**TEST_JWT_SETTINGS)

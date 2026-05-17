@@ -124,6 +124,27 @@ class UserDeviceKey(models.Model):
         return f'device key {self.device_id} for user {self.user_id}'
 
 
+class UserE2EEKeyBackup(models.Model):
+    user_id = models.PositiveBigIntegerField(unique=True, db_index=True)
+    public_key = models.TextField()
+    encrypted_private_key = models.TextField()
+    salt = models.TextField()
+    nonce = models.TextField()
+    kdf_algorithm = models.CharField(max_length=40, default='PBKDF2-SHA256')
+    kdf_iterations = models.PositiveIntegerField(default=600000)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['user_id', 'updated_at']),
+        ]
+        ordering = ['-updated_at', '-id']
+
+    def __str__(self):
+        return f'E2EE key backup for user {self.user_id}'
+
+
 class Message(models.Model):
     STATUS_SENT = 'sent'
     STATUS_DELIVERED = 'delivered'

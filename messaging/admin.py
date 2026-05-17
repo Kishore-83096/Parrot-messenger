@@ -1,6 +1,13 @@
 from django.contrib import admin
 
-from .models import Message, MessageAttachment, Room, RoomParticipant, UserDeviceKey
+from .models import (
+    Message,
+    MessageAttachment,
+    Room,
+    RoomParticipant,
+    UserDeviceKey,
+    UserE2EEKeyBackup,
+)
 
 
 class RoomParticipantInline(admin.TabularInline):
@@ -46,6 +53,13 @@ class UserDeviceKeyAdmin(admin.ModelAdmin):
     list_display = ('id', 'user_id', 'device_id', 'created_at', 'last_seen_at')
     search_fields = ('=user_id', 'device_id', 'public_key')
     readonly_fields = ('created_at', 'last_seen_at')
+
+
+@admin.register(UserE2EEKeyBackup)
+class UserE2EEKeyBackupAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user_id', 'kdf_algorithm', 'kdf_iterations', 'created_at', 'updated_at')
+    search_fields = ('=user_id', 'public_key')
+    readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(Message)
