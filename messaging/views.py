@@ -6,6 +6,11 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from .auth import validate_messaging_token
+from .e2ee.devices import (
+    list_accessible_user_device_keys,
+    list_user_device_keys,
+    register_user_device_key,
+)
 from .realtime import broadcast_participant_event, broadcast_room_event
 from .signals import (
     authorize_parent_messaging,
@@ -17,14 +22,11 @@ from .services import (
     cleanup_uploaded_attachments,
     create_direct_message,
     get_existing_direct_room_authorization,
-    list_accessible_user_device_keys,
     list_room_messages,
-    list_user_device_keys,
     list_user_rooms,
     mark_room_delivered,
     mark_room_read,
     normalize_message_list_params,
-    register_user_device_key,
     release_room_blocked_messages,
     upload_message_files,
 )
