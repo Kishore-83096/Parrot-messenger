@@ -144,6 +144,7 @@ class CryptoDeviceKeyTests(TestCase):
         response = self.post_device_key(
             {
                 'device_id': 'browser-device-1',
+                'device_name': 'Chrome on Windows',
                 'public_key': test_public_key(),
             }
         )
@@ -152,8 +153,54 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(body['result']['device']['device_id'], 'browser-device-1')
+        self.assertEqual(body['result']['device']['device_name'], 'Chrome on Windows')
+        self.assertTrue(body['result']['device']['is_default'])
         self.assertEqual(UserDeviceKey.objects.count(), 1)
         self.assertEqual(UserDeviceKey.objects.get().user_id, self.sender_user_id)
+        self.assertEqual(UserDeviceKey.objects.get().device_name, 'Chrome on Windows')
+        self.assertTrue(UserDeviceKey.objects.get().is_default)
+
+    def test_register_second_crypto_device_key_is_not_default(self):
+        self.post_device_key(
+            {
+                'device_id': 'browser-device-1',
+                'public_key': test_public_key(b'a'),
+            }
+        )
+        response = self.post_device_key(
+            {
+                'device_id': 'browser-device-2',
+                'public_key': test_public_key(b'b'),
+            }
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(body['result']['device']['is_default'])
+        self.assertTrue(
+            UserDeviceKey.objects.get(device_id='browser-device-1').is_default
+        )
+
+    def test_register_crypto_device_key_does_not_choose_default_when_devices_have_no_default(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-1',
+            public_key=test_public_key(b'a'),
+        )
+
+        response = self.post_device_key(
+            {
+                'device_id': 'browser-device-1',
+                'device_name': 'Firefox on Linux',
+                'public_key': test_public_key(b'b'),
+            }
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['result']['device']['device_name'], 'Firefox on Linux')
+        self.assertFalse(body['result']['device']['is_default'])
+        self.assertFalse(UserDeviceKey.objects.get(device_id='browser-device-1').is_default)
 
     def test_register_crypto_device_key_replaces_same_device(self):
         self.post_device_key(
@@ -185,11 +232,200 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('public_key', body['result']['errors'])
 
+    def test_default_device_can_revoke_own_crypto_device_key(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-1/revoke/',
+            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['status'], 'ok')
+        self.assertTrue(body['result']['revoked'])
+        self.assertFalse(
+            UserDeviceKey.objects.filter(
+                user_id=self.sender_user_id,
+                device_id='browser-device-1',
+            ).exists()
+        )
+
+    def test_non_default_device_cannot_revoke_crypto_device_key(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-default/revoke/',
+            data=json.dumps({'acting_device_id': 'browser-device-1'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(
+            UserDeviceKey.objects.filter(
+                user_id=self.sender_user_id,
+                device_id='browser-device-default',
+            ).exists()
+        )
+
+    def test_current_device_can_revoke_itself(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-default/revoke/',
+            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            UserDeviceKey.objects.filter(
+                user_id=self.sender_user_id,
+                device_id='browser-device-default',
+            ).exists()
+        )
+
+    def test_revoke_crypto_device_key_requires_owner(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        UserDeviceKey.objects.create(
+            user_id=99,
+            device_id='browser-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-1/revoke/',
+            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(
+            UserDeviceKey.objects.filter(
+                user_id=99,
+                device_id='browser-device-1',
+            ).exists()
+        )
+
+    def test_default_device_can_select_new_default_device(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-2',
+            public_key=test_public_key(b'b'),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-2/default/',
+            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['status'], 'ok')
+        self.assertTrue(body['result']['device']['is_default'])
+        self.assertFalse(
+            UserDeviceKey.objects.get(device_id='browser-device-default').is_default
+        )
+        self.assertTrue(
+            UserDeviceKey.objects.get(device_id='browser-device-2').is_default
+        )
+
+    def test_non_default_device_cannot_select_new_default_device(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-2',
+            public_key=test_public_key(b'b'),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-default/default/',
+            data=json.dumps({'acting_device_id': 'browser-device-2'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(
+            UserDeviceKey.objects.get(device_id='browser-device-default').is_default
+        )
+        self.assertFalse(
+            UserDeviceKey.objects.get(device_id='browser-device-2').is_default
+        )
+
+    def test_device_can_select_default_when_no_default_exists(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-1/default/',
+            data=json.dumps({'acting_device_id': 'browser-device-1'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            UserDeviceKey.objects.get(device_id='browser-device-1').is_default
+        )
+
     def test_list_own_crypto_device_keys(self):
         UserDeviceKey.objects.create(
             user_id=self.sender_user_id,
             device_id='browser-device-1',
             public_key=test_public_key(),
+            is_default=True,
         )
         response = self.client.get(
             f'/crypto/users/{self.sender_user_id}/devices/',
@@ -200,6 +436,7 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body['result']['user_id'], self.sender_user_id)
         self.assertEqual(body['result']['devices'][0]['device_id'], 'browser-device-1')
+        self.assertTrue(body['result']['devices'][0]['is_default'])
 
     def test_list_shared_room_crypto_device_keys(self):
         self.create_direct_room()

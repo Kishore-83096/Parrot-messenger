@@ -11,9 +11,11 @@ from .e2ee.devices import (
     list_accessible_user_device_keys,
     list_user_device_keys,
     register_user_device_key,
+    revoke_user_device_key,
+    set_default_user_device_key,
 )
 from .e2ee.files import upload_encrypted_file
-from .realtime import broadcast_participant_event, broadcast_room_event
+from .realtime import broadcast_participant_event, broadcast_room_event, broadcast_user_event
 from .signals import (
     authorize_parent_messaging,
     check_database,
@@ -282,6 +284,80 @@ def register_crypto_device(request):
         return error_response
 
     result, response_status = register_user_device_key(sender['user_id'], payload)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def revoke_crypto_device(request, device_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = revoke_user_device_key(
+        sender['user_id'],
+        device_id,
+        payload.get('acting_device_id'),
+    )
+    if response_status < 300 and result.get('revoked'):
+        broadcast_user_event(
+            sender['user_id'],
+            'device.revoked',
+            {
+                'device_id': result['device_id'],
+                'revoked_by_device_id': payload.get('acting_device_id'),
+            },
+        )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def set_default_crypto_device(request, device_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = set_default_user_device_key(
+        sender['user_id'],
+        device_id,
+        payload.get('acting_device_id'),
+    )
+    if response_status < 300 and result.get('device'):
+        broadcast_user_event(
+            sender['user_id'],
+            'device.default_changed',
+            {
+                'device': result['device'],
+                'changed_by_device_id': payload.get('acting_device_id'),
+            },
+        )
 
     return JsonResponse(
         {

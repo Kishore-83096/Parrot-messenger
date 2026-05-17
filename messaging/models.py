@@ -107,16 +107,24 @@ class RoomParticipant(models.Model):
 class UserDeviceKey(models.Model):
     user_id = models.PositiveBigIntegerField(db_index=True)
     device_id = models.CharField(max_length=120)
+    device_name = models.CharField(max_length=120, blank=True)
     public_key = models.TextField()
+    is_default = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     last_seen_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=['user_id', 'device_id'], name='uq_user_device_key'),
+            models.UniqueConstraint(
+                fields=['user_id'],
+                condition=Q(is_default=True),
+                name='uq_user_default_device_key',
+            ),
         ]
         indexes = [
             models.Index(fields=['user_id', 'last_seen_at']),
+            models.Index(fields=['user_id', 'is_default']),
         ]
         ordering = ['-last_seen_at', '-id']
 
