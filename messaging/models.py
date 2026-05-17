@@ -104,6 +104,26 @@ class RoomParticipant(models.Model):
         return f'user {self.user_id} in room {self.room_id}'
 
 
+class UserDeviceKey(models.Model):
+    user_id = models.PositiveBigIntegerField(db_index=True)
+    device_id = models.CharField(max_length=120)
+    public_key = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['user_id', 'device_id'], name='uq_user_device_key'),
+        ]
+        indexes = [
+            models.Index(fields=['user_id', 'last_seen_at']),
+        ]
+        ordering = ['-last_seen_at', '-id']
+
+    def __str__(self):
+        return f'device key {self.device_id} for user {self.user_id}'
+
+
 class Message(models.Model):
     STATUS_SENT = 'sent'
     STATUS_DELIVERED = 'delivered'

@@ -17,11 +17,14 @@ from .services import (
     cleanup_uploaded_attachments,
     create_direct_message,
     get_existing_direct_room_authorization,
+    list_accessible_user_device_keys,
     list_room_messages,
+    list_user_device_keys,
     list_user_rooms,
     mark_room_delivered,
     mark_room_read,
     normalize_message_list_params,
+    register_user_device_key,
     release_room_blocked_messages,
     upload_message_files,
 )
@@ -258,6 +261,84 @@ def authorize_message(request):
             'service': 'messenger',
             'sender': sender,
             'authorization': sanitize_authorization_result(authorization_result),
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def register_crypto_device(request):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = register_user_device_key(sender['user_id'], payload)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@require_GET
+def user_crypto_devices(request, user_id):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = list_accessible_user_device_keys(sender['user_id'], user_id)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@require_GET
+def recipient_crypto_devices(request, recipient_account_number):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    parent_authorization, authorization_result, authorization_status = authorize_sender_for_message(
+        sender,
+        recipient_account_number,
+    )
+    if parent_authorization is None:
+        return JsonResponse(
+            {
+                'status': get_authorization_status(authorization_result, authorization_status),
+                'service': 'messenger',
+                'sender': sender,
+                'authorization': sanitize_authorization_result(authorization_result),
+            },
+            status=authorization_status,
+        )
+
+    result, response_status = list_user_device_keys(parent_authorization['recipient_user_id'])
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'authorization': sanitize_authorization_result(authorization_result),
+            'result': result,
         },
         status=response_status,
     )

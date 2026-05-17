@@ -1,3 +1,4 @@
+import base64
 import json
 from datetime import timedelta
 from unittest.mock import patch
@@ -10,7 +11,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from .models import Message, Room, RoomParticipant
+from .models import Message, Room, RoomParticipant, UserDeviceKey
 from .cache import invalidate_room_messages_cache
 from .services import (
     create_direct_message,
@@ -30,6 +31,215 @@ TEST_JWT_SETTINGS = {
     'CLOUDINARY_URL': 'cloudinary://test-key:test-secret@test-cloud',
     'CLOUDINARY_MAIN_FOLDER': 'MAIN',
 }
+
+
+def test_public_key(byte_value=b'a'):
+    return base64.b64encode(byte_value * 32).decode('ascii')
+
+
+@override_settings(**TEST_JWT_SETTINGS)
+class CryptoDeviceKeyTests(TestCase):
+    sender_user_id = 1
+    recipient_user_id = 2
+    sender_account_number = '7000000001'
+    recipient_account_number = '7000000002'
+
+    def auth_header(self, user_id=None, account_number=None):
+        now = timezone.now()
+        token = jwt.encode(
+            {
+                'sub': str(user_id or self.sender_user_id),
+                'user_id': user_id or self.sender_user_id,
+                'account_number': account_number or self.sender_account_number,
+                'iss': settings.MESSAGING_JWT_ISSUER,
+                'aud': settings.MESSAGING_JWT_AUDIENCE,
+                'iat': now,
+                'exp': now + timedelta(minutes=5),
+            },
+            settings.MESSAGING_JWT_SECRET,
+            algorithm='HS256',
+        )
+
+        return f'Bearer {token}'
+
+    def create_direct_room(self):
+        room = Room.objects.create(
+            room_type=Room.TYPE_DIRECT,
+            created_by_user_id=self.sender_user_id,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.sender_user_id,
+            account_number=self.sender_account_number,
+            is_active=True,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+            is_active=True,
+        )
+
+        return room
+
+    def parent_allowed(self):
+        return {
+            'ok': True,
+            'parent': {
+                'response': {
+                    'allowed': True,
+                    'sender_user_id': self.sender_user_id,
+                    'sender_account_number': self.sender_account_number,
+                    'recipient_user_id': self.recipient_user_id,
+                    'recipient_account_number': self.recipient_account_number,
+                    'delivery_blocked': False,
+                },
+                'status_code': 200,
+            },
+        }, 200
+
+    def parent_denial(self):
+        return {
+            'ok': False,
+            'parent': {
+                'response': {
+                    'allowed': False,
+                    'reason': 'contact_not_saved',
+                    'message': 'contact_not_saved',
+                },
+                'status_code': 403,
+            },
+        }, 403
+
+    def post_device_key(self, payload, user_id=None):
+        return self.client.post(
+            '/crypto/devices/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(user_id=user_id),
+        )
+
+    def test_register_crypto_device_key(self):
+        response = self.post_device_key(
+            {
+                'device_id': 'browser-device-1',
+                'public_key': test_public_key(),
+            }
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['status'], 'ok')
+        self.assertEqual(body['result']['device']['device_id'], 'browser-device-1')
+        self.assertEqual(UserDeviceKey.objects.count(), 1)
+        self.assertEqual(UserDeviceKey.objects.get().user_id, self.sender_user_id)
+
+    def test_register_crypto_device_key_replaces_same_device(self):
+        self.post_device_key(
+            {
+                'device_id': 'browser-device-1',
+                'public_key': test_public_key(b'a'),
+            }
+        )
+        response = self.post_device_key(
+            {
+                'device_id': 'browser-device-1',
+                'public_key': test_public_key(b'b'),
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(UserDeviceKey.objects.count(), 1)
+        self.assertEqual(UserDeviceKey.objects.get().public_key, test_public_key(b'b'))
+
+    def test_register_crypto_device_key_rejects_invalid_public_key(self):
+        response = self.post_device_key(
+            {
+                'device_id': 'browser-device-1',
+                'public_key': base64.b64encode(b'too-short').decode('ascii'),
+            }
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('public_key', body['result']['errors'])
+
+    def test_list_own_crypto_device_keys(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-1',
+            public_key=test_public_key(),
+        )
+        response = self.client.get(
+            f'/crypto/users/{self.sender_user_id}/devices/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['result']['user_id'], self.sender_user_id)
+        self.assertEqual(body['result']['devices'][0]['device_id'], 'browser-device-1')
+
+    def test_list_shared_room_crypto_device_keys(self):
+        self.create_direct_room()
+        UserDeviceKey.objects.create(
+            user_id=self.recipient_user_id,
+            device_id='recipient-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.get(
+            f'/crypto/users/{self.recipient_user_id}/devices/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['result']['devices'][0]['device_id'], 'recipient-device-1')
+
+    def test_list_unrelated_crypto_device_keys_returns_not_found(self):
+        UserDeviceKey.objects.create(
+            user_id=99,
+            device_id='other-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.get(
+            '/crypto/users/99/devices/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_list_authorized_recipient_crypto_device_keys(self, authorize_parent_messaging):
+        authorize_parent_messaging.return_value = self.parent_allowed()
+        UserDeviceKey.objects.create(
+            user_id=self.recipient_user_id,
+            device_id='recipient-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.get(
+            f'/crypto/recipients/{self.recipient_account_number}/devices/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['result']['user_id'], self.recipient_user_id)
+        self.assertEqual(body['result']['devices'][0]['device_id'], 'recipient-device-1')
+
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_list_recipient_crypto_device_keys_requires_authorization(self, authorize_parent_messaging):
+        authorize_parent_messaging.return_value = self.parent_denial()
+
+        response = self.client.get(
+            f'/crypto/recipients/{self.recipient_account_number}/devices/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 403)
 
 
 @override_settings(**TEST_JWT_SETTINGS)

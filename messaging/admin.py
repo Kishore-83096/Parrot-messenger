@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Message, MessageAttachment, Room, RoomParticipant
+from .models import Message, MessageAttachment, Room, RoomParticipant, UserDeviceKey
 
 
 class RoomParticipantInline(admin.TabularInline):
@@ -39,6 +39,13 @@ class RoomParticipantAdmin(admin.ModelAdmin):
     list_display = ('id', 'room', 'user_id', 'account_number', 'role', 'is_active', 'joined_at')
     list_filter = ('role', 'is_active', 'joined_at')
     search_fields = ('=user_id', 'account_number', 'display_name')
+
+
+@admin.register(UserDeviceKey)
+class UserDeviceKeyAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user_id', 'device_id', 'created_at', 'last_seen_at')
+    search_fields = ('=user_id', 'device_id', 'public_key')
+    readonly_fields = ('created_at', 'last_seen_at')
 
 
 @admin.register(Message)
