@@ -55,6 +55,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
                 'type': 'typing.snapshot',
                 'room_id': self.room_id,
                 'typing_user_ids': active_typing_user_ids,
+                'expires_in': self.get_typing_timeout(),
             }
         )
 
@@ -110,10 +111,13 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
                     'room_id': self.room_id,
                     'user_id': self.user_id,
                     'account_number': self.account_number,
-                    'expires_in': getattr(settings, 'MESSAGING_TYPING_TTL_SECONDS', 7),
+                    'expires_in': self.get_typing_timeout(),
                 },
             },
         )
+
+    def get_typing_timeout(self):
+        return getattr(settings, 'MESSAGING_TYPING_TTL_SECONDS', 7)
 
     def authenticate(self):
         authorization_header = self.get_authorization_header()
@@ -157,7 +161,7 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
         cache.set(
             get_typing_cache_key(self.room_id, self.user_id),
             True,
-            timeout=getattr(settings, 'MESSAGING_TYPING_TTL_SECONDS', 7),
+            timeout=self.get_typing_timeout(),
         )
 
     @database_sync_to_async

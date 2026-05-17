@@ -244,7 +244,7 @@ class CryptoDeviceKeyTests(TestCase):
     @patch('messaging.e2ee.files.cloudinary_uploader.upload')
     def test_upload_encrypted_attachment_blob(self, cloudinary_upload):
         cloudinary_upload.return_value = {
-            'secure_url': 'https://res.cloudinary.com/demo/raw/upload/encrypted.bin',
+            'secure_url': 'https://res.cloudinary.com/demo/raw/upload/encrypted.txt',
             'bytes': 27,
             'public_id': 'MAIN/e2ee/encrypted',
             'resource_type': 'raw',
@@ -254,7 +254,7 @@ class CryptoDeviceKeyTests(TestCase):
             '/crypto/files/',
             data={
                 'file': SimpleUploadedFile(
-                    'encrypted.bin',
+                    'encrypted.txt',
                     b'encrypted-ciphertext',
                     content_type='application/octet-stream',
                 ),
@@ -267,7 +267,7 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(
             body['result']['file']['encrypted_file_url'],
-            'https://res.cloudinary.com/demo/raw/upload/encrypted.bin',
+            'https://res.cloudinary.com/demo/raw/upload/encrypted.txt',
         )
         self.assertNotIn('file_name', body['result']['file'])
         self.assertEqual(MessageAttachment.objects.count(), 0)
