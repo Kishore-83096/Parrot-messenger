@@ -156,10 +156,20 @@ def set_default_user_device_key(user_id, device_id, acting_device_id):
             }, 403
 
         default_device = user_devices.filter(is_default=True).first()
-        if default_device and default_device.device_id != normalized_acting_device_id:
+        is_acting_default = (
+            default_device
+            and default_device.device_id == normalized_acting_device_id
+        )
+        is_recovered_default_key = (
+            default_device
+            and target_device.device_id == normalized_acting_device_id
+            and default_device.public_key == acting_device.public_key
+        )
+
+        if default_device and not (is_acting_default or is_recovered_default_key):
             return {
                 'status': 'error',
-                'message': 'Only the default device can change the default linked device.',
+                'message': 'Only the default device or a recovered default key can change the default linked device.',
             }, 403
 
         if not default_device and normalized_device_id != normalized_acting_device_id:

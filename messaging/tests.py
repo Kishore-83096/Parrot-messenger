@@ -401,6 +401,74 @@ class CryptoDeviceKeyTests(TestCase):
             UserDeviceKey.objects.get(device_id='browser-device-2').is_default
         )
 
+    def test_recovered_default_key_can_select_itself_as_default(self):
+        recovered_public_key = test_public_key(b'd')
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=recovered_public_key,
+            is_default=True,
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-recovered',
+            public_key=recovered_public_key,
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-recovered/default/',
+            data=json.dumps({'acting_device_id': 'browser-device-recovered'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body['status'], 'ok')
+        self.assertFalse(
+            UserDeviceKey.objects.get(device_id='browser-device-default').is_default
+        )
+        self.assertTrue(
+            UserDeviceKey.objects.get(device_id='browser-device-recovered').is_default
+        )
+
+    def test_recovered_default_key_cannot_select_another_device_as_default(self):
+        recovered_public_key = test_public_key(b'd')
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-default',
+            public_key=recovered_public_key,
+            is_default=True,
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-recovered',
+            public_key=recovered_public_key,
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-2',
+            public_key=test_public_key(b'b'),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-2/default/',
+            data=json.dumps({'acting_device_id': 'browser-device-recovered'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(
+            UserDeviceKey.objects.get(device_id='browser-device-default').is_default
+        )
+        self.assertFalse(
+            UserDeviceKey.objects.get(device_id='browser-device-recovered').is_default
+        )
+        self.assertFalse(
+            UserDeviceKey.objects.get(device_id='browser-device-2').is_default
+        )
+
     def test_device_can_select_default_when_no_default_exists(self):
         UserDeviceKey.objects.create(
             user_id=self.sender_user_id,
