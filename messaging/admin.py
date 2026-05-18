@@ -50,9 +50,9 @@ class RoomParticipantAdmin(admin.ModelAdmin):
 
 @admin.register(UserDeviceKey)
 class UserDeviceKeyAdmin(admin.ModelAdmin):
-    list_display = ('id', 'user_id', 'device_name', 'device_id', 'is_default', 'created_at', 'last_seen_at')
-    list_filter = ('is_default', 'created_at', 'last_seen_at')
-    search_fields = ('=user_id', 'device_name', 'device_id', 'public_key')
+    list_display = ('id', 'user_id', 'device_name', 'device_id', 'status', 'is_default', 'created_at', 'last_seen_at')
+    list_filter = ('status', 'is_default', 'created_at', 'last_seen_at')
+    search_fields = ('=user_id', 'device_name', 'device_id', 'public_key', 'encryption_public_key', 'management_public_key')
     readonly_fields = ('created_at', 'last_seen_at')
 
 

@@ -1,9 +1,13 @@
 import base64
 import json
+import time
+import uuid
 from datetime import timedelta
 from unittest.mock import patch
 
 import jwt
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
@@ -20,6 +24,7 @@ from .models import (
     UserE2EEKeyBackup,
 )
 from .cache import invalidate_room_messages_cache
+from .e2ee.devices.service import build_action_message
 from .services import (
     create_direct_message,
     get_room_unread_count,
@@ -130,6 +135,61 @@ class CryptoDeviceKeyTests(TestCase):
             HTTP_AUTHORIZATION=self.auth_header(user_id=user_id),
         )
 
+    def create_management_private_key(self):
+        return Ed25519PrivateKey.generate()
+
+    def management_public_key(self, private_key):
+        return base64.b64encode(
+            private_key.public_key().public_bytes(
+                encoding=Encoding.Raw,
+                format=PublicFormat.Raw,
+            )
+        ).decode('ascii')
+
+    def signed_payload(self, action, acting_device_id, target_device_id, private_key):
+        timestamp = int(time.time())
+        nonce = f'test-{uuid.uuid4()}'
+        message = build_action_message(
+            self.sender_user_id,
+            action,
+            acting_device_id,
+            target_device_id,
+            timestamp,
+            nonce,
+        )
+        signature = private_key.sign(message)
+
+        return {
+            'acting_device_id': acting_device_id,
+            'action_timestamp': timestamp,
+            'action_nonce': nonce,
+            'action_signature': base64.b64encode(signature).decode('ascii'),
+        }
+
+    def registration_payload(self, device_id, public_key=None, device_name=''):
+        private_key = self.create_management_private_key()
+
+        return {
+            'device_id': device_id,
+            'device_name': device_name,
+            'public_key': public_key or test_public_key(),
+            'management_public_key': self.management_public_key(private_key),
+        }
+
+    def create_device(self, device_id, public_key=None, is_default=False, user_id=None):
+        private_key = self.create_management_private_key()
+        encryption_public_key = public_key or test_public_key()
+        UserDeviceKey.objects.create(
+            user_id=user_id or self.sender_user_id,
+            device_id=device_id,
+            public_key=encryption_public_key,
+            encryption_public_key=encryption_public_key,
+            management_public_key=self.management_public_key(private_key),
+            is_default=is_default,
+        )
+
+        return private_key
+
     def key_backup_payload(self):
         return {
             'public_key': test_public_key(),
@@ -140,13 +200,24 @@ class CryptoDeviceKeyTests(TestCase):
             'kdf_iterations': 600000,
         }
 
+    def signed_key_backup_payload(self, private_key, device_id, payload=None):
+        return {
+            **(payload or self.key_backup_payload()),
+            **self.signed_payload(
+                'recovery.backup.save',
+                device_id,
+                'key-backup',
+                private_key,
+            ),
+        }
+
     def test_register_crypto_device_key(self):
         response = self.post_device_key(
-            {
-                'device_id': 'browser-device-1',
-                'device_name': 'Chrome on Windows',
-                'public_key': test_public_key(),
-            }
+            self.registration_payload(
+                'browser-device-1',
+                public_key=test_public_key(),
+                device_name='Chrome on Windows',
+            )
         )
         body = response.json()
 
@@ -162,16 +233,10 @@ class CryptoDeviceKeyTests(TestCase):
 
     def test_register_second_crypto_device_key_is_not_default(self):
         self.post_device_key(
-            {
-                'device_id': 'browser-device-1',
-                'public_key': test_public_key(b'a'),
-            }
+            self.registration_payload('browser-device-1', public_key=test_public_key(b'a'))
         )
         response = self.post_device_key(
-            {
-                'device_id': 'browser-device-2',
-                'public_key': test_public_key(b'b'),
-            }
+            self.registration_payload('browser-device-2', public_key=test_public_key(b'b'))
         )
         body = response.json()
 
@@ -182,18 +247,14 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
     def test_register_crypto_device_key_does_not_choose_default_when_devices_have_no_default(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-1',
-            public_key=test_public_key(b'a'),
-        )
+        self.create_device('browser-device-1', public_key=test_public_key(b'a'))
 
         response = self.post_device_key(
-            {
-                'device_id': 'browser-device-1',
-                'device_name': 'Firefox on Linux',
-                'public_key': test_public_key(b'b'),
-            }
+            self.registration_payload(
+                'browser-device-1',
+                public_key=test_public_key(b'b'),
+                device_name='Firefox on Linux',
+            )
         )
         body = response.json()
 
@@ -204,16 +265,10 @@ class CryptoDeviceKeyTests(TestCase):
 
     def test_register_crypto_device_key_replaces_same_device(self):
         self.post_device_key(
-            {
-                'device_id': 'browser-device-1',
-                'public_key': test_public_key(b'a'),
-            }
+            self.registration_payload('browser-device-1', public_key=test_public_key(b'a'))
         )
         response = self.post_device_key(
-            {
-                'device_id': 'browser-device-1',
-                'public_key': test_public_key(b'b'),
-            }
+            self.registration_payload('browser-device-1', public_key=test_public_key(b'b'))
         )
 
         self.assertEqual(response.status_code, 200)
@@ -225,29 +280,32 @@ class CryptoDeviceKeyTests(TestCase):
             {
                 'device_id': 'browser-device-1',
                 'public_key': base64.b64encode(b'too-short').decode('ascii'),
+                'management_public_key': test_base64_bytes(b'm', 32),
             }
         )
         body = response.json()
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn('public_key', body['result']['errors'])
+        self.assertIn('encryption_public_key', body['result']['errors'])
 
     def test_default_device_can_revoke_own_crypto_device_key(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-default',
+        default_private_key = self.create_device(
+            'browser-device-default',
             public_key=test_public_key(b'd'),
             is_default=True,
         )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-1',
-            public_key=test_public_key(),
-        )
+        self.create_device('browser-device-1', public_key=test_public_key())
 
         response = self.client.post(
             '/crypto/devices/browser-device-1/revoke/',
-            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.revoke',
+                    'browser-device-default',
+                    'browser-device-1',
+                    default_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -256,29 +314,33 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body['status'], 'ok')
         self.assertTrue(body['result']['revoked'])
-        self.assertFalse(
-            UserDeviceKey.objects.filter(
-                user_id=self.sender_user_id,
-                device_id='browser-device-1',
-            ).exists()
+        revoked_device = UserDeviceKey.objects.get(
+            user_id=self.sender_user_id,
+            device_id='browser-device-1',
         )
+        self.assertEqual(revoked_device.status, UserDeviceKey.STATUS_REVOKED)
 
     def test_non_default_device_cannot_revoke_crypto_device_key(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-default',
+        self.create_device(
+            'browser-device-default',
             public_key=test_public_key(b'd'),
             is_default=True,
         )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-1',
+        non_default_private_key = self.create_device(
+            'browser-device-1',
             public_key=test_public_key(),
         )
 
         response = self.client.post(
             '/crypto/devices/browser-device-default/revoke/',
-            data=json.dumps({'acting_device_id': 'browser-device-1'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.revoke',
+                    'browser-device-1',
+                    'browser-device-default',
+                    non_default_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -292,44 +354,52 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
     def test_current_device_can_revoke_itself(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-default',
+        default_private_key = self.create_device(
+            'browser-device-default',
             public_key=test_public_key(b'd'),
             is_default=True,
         )
 
         response = self.client.post(
             '/crypto/devices/browser-device-default/revoke/',
-            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.revoke',
+                    'browser-device-default',
+                    'browser-device-default',
+                    default_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(
-            UserDeviceKey.objects.filter(
-                user_id=self.sender_user_id,
-                device_id='browser-device-default',
-            ).exists()
-        )
-
-    def test_revoke_crypto_device_key_requires_owner(self):
-        UserDeviceKey.objects.create(
+        revoked_device = UserDeviceKey.objects.get(
             user_id=self.sender_user_id,
             device_id='browser-device-default',
+        )
+        self.assertEqual(revoked_device.status, UserDeviceKey.STATUS_REVOKED)
+        self.assertFalse(revoked_device.is_default)
+
+    def test_revoke_crypto_device_key_requires_owner(self):
+        default_private_key = self.create_device(
+            'browser-device-default',
             public_key=test_public_key(b'd'),
             is_default=True,
         )
-        UserDeviceKey.objects.create(
-            user_id=99,
-            device_id='browser-device-1',
-            public_key=test_public_key(),
-        )
+        self.create_device('browser-device-1', public_key=test_public_key(), user_id=99)
 
         response = self.client.post(
             '/crypto/devices/browser-device-1/revoke/',
-            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.revoke',
+                    'browser-device-default',
+                    'browser-device-1',
+                    default_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -343,21 +413,23 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
     def test_default_device_can_select_new_default_device(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-default',
+        default_private_key = self.create_device(
+            'browser-device-default',
             public_key=test_public_key(b'd'),
             is_default=True,
         )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-2',
-            public_key=test_public_key(b'b'),
-        )
+        self.create_device('browser-device-2', public_key=test_public_key(b'b'))
 
         response = self.client.post(
             '/crypto/devices/browser-device-2/default/',
-            data=json.dumps({'acting_device_id': 'browser-device-default'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.default',
+                    'browser-device-default',
+                    'browser-device-2',
+                    default_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -374,21 +446,23 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
     def test_non_default_device_cannot_select_new_default_device(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-default',
+        self.create_device(
+            'browser-device-default',
             public_key=test_public_key(b'd'),
             is_default=True,
         )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-2',
-            public_key=test_public_key(b'b'),
-        )
+        non_default_private_key = self.create_device('browser-device-2', public_key=test_public_key(b'b'))
 
         response = self.client.post(
             '/crypto/devices/browser-device-default/default/',
-            data=json.dumps({'acting_device_id': 'browser-device-2'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.default',
+                    'browser-device-2',
+                    'browser-device-default',
+                    non_default_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -401,59 +475,63 @@ class CryptoDeviceKeyTests(TestCase):
             UserDeviceKey.objects.get(device_id='browser-device-2').is_default
         )
 
-    def test_recovered_default_key_can_select_itself_as_default(self):
+    def test_recovered_non_default_key_cannot_select_itself_as_default(self):
         recovered_public_key = test_public_key(b'd')
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-default',
+        self.create_device(
+            'browser-device-default',
             public_key=recovered_public_key,
             is_default=True,
         )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-recovered',
+        recovered_private_key = self.create_device(
+            'browser-device-recovered',
             public_key=recovered_public_key,
         )
 
         response = self.client.post(
             '/crypto/devices/browser-device-recovered/default/',
-            data=json.dumps({'acting_device_id': 'browser-device-recovered'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.default',
+                    'browser-device-recovered',
+                    'browser-device-recovered',
+                    recovered_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
-        body = response.json()
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(body['status'], 'ok')
-        self.assertFalse(
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(
             UserDeviceKey.objects.get(device_id='browser-device-default').is_default
         )
-        self.assertTrue(
+        self.assertFalse(
             UserDeviceKey.objects.get(device_id='browser-device-recovered').is_default
         )
 
     def test_recovered_default_key_cannot_select_another_device_as_default(self):
         recovered_public_key = test_public_key(b'd')
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-default',
+        self.create_device(
+            'browser-device-default',
             public_key=recovered_public_key,
             is_default=True,
         )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-recovered',
+        recovered_private_key = self.create_device(
+            'browser-device-recovered',
             public_key=recovered_public_key,
         )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-2',
-            public_key=test_public_key(b'b'),
-        )
+        self.create_device('browser-device-2', public_key=test_public_key(b'b'))
 
         response = self.client.post(
             '/crypto/devices/browser-device-2/default/',
-            data=json.dumps({'acting_device_id': 'browser-device-recovered'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.default',
+                    'browser-device-recovered',
+                    'browser-device-2',
+                    recovered_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -470,15 +548,18 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
     def test_device_can_select_default_when_no_default_exists(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-1',
-            public_key=test_public_key(),
-        )
+        device_private_key = self.create_device('browser-device-1', public_key=test_public_key())
 
         response = self.client.post(
             '/crypto/devices/browser-device-1/default/',
-            data=json.dumps({'acting_device_id': 'browser-device-1'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.default',
+                    'browser-device-1',
+                    'browser-device-1',
+                    device_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -489,20 +570,19 @@ class CryptoDeviceKeyTests(TestCase):
         )
 
     def test_device_cannot_select_other_default_when_no_default_exists(self):
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-1',
-            public_key=test_public_key(),
-        )
-        UserDeviceKey.objects.create(
-            user_id=self.sender_user_id,
-            device_id='browser-device-2',
-            public_key=test_public_key(b'b'),
-        )
+        device_private_key = self.create_device('browser-device-1', public_key=test_public_key())
+        self.create_device('browser-device-2', public_key=test_public_key(b'b'))
 
         response = self.client.post(
             '/crypto/devices/browser-device-2/default/',
-            data=json.dumps({'acting_device_id': 'browser-device-1'}),
+            data=json.dumps(
+                self.signed_payload(
+                    'device.default',
+                    'browser-device-1',
+                    'browser-device-2',
+                    device_private_key,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -638,9 +718,19 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_save_and_get_crypto_key_backup(self):
+        default_private_key = self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
         response = self.client.post(
             '/crypto/key-backup/',
-            data=json.dumps(self.key_backup_payload()),
+            data=json.dumps(
+                self.signed_key_backup_payload(
+                    default_private_key,
+                    'browser-device-default',
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -677,12 +767,23 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertIsNone(body['result']['backup'])
 
     def test_save_crypto_key_backup_rejects_invalid_payload(self):
+        default_private_key = self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
         payload = self.key_backup_payload()
         payload['nonce'] = test_base64_bytes(b'n', 8)
 
         response = self.client.post(
             '/crypto/key-backup/',
-            data=json.dumps(payload),
+            data=json.dumps(
+                self.signed_key_backup_payload(
+                    default_private_key,
+                    'browser-device-default',
+                    payload,
+                )
+            ),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
@@ -690,6 +791,32 @@ class CryptoDeviceKeyTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('nonce', body['result']['errors'])
+
+    def test_non_default_device_cannot_save_crypto_key_backup(self):
+        self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        non_default_private_key = self.create_device(
+            'browser-device-2',
+            public_key=test_public_key(b'b'),
+        )
+
+        response = self.client.post(
+            '/crypto/key-backup/',
+            data=json.dumps(
+                self.signed_key_backup_payload(
+                    non_default_private_key,
+                    'browser-device-2',
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(UserE2EEKeyBackup.objects.count(), 0)
 
 
 @override_settings(**TEST_JWT_SETTINGS)

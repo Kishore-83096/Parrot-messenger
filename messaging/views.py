@@ -11,6 +11,7 @@ from .e2ee.devices import (
     list_accessible_user_device_keys,
     list_user_device_keys,
     register_user_device_key,
+    require_default_device_signature,
     revoke_user_device_key,
     set_default_user_device_key,
 )
@@ -310,7 +311,7 @@ def revoke_crypto_device(request, device_id):
     result, response_status = revoke_user_device_key(
         sender['user_id'],
         device_id,
-        payload.get('acting_device_id'),
+        payload,
     )
     if response_status < 300 and result.get('revoked'):
         broadcast_user_event(
@@ -347,7 +348,7 @@ def set_default_crypto_device(request, device_id):
     result, response_status = set_default_user_device_key(
         sender['user_id'],
         device_id,
-        payload.get('acting_device_id'),
+        payload,
     )
     if response_status < 300 and result.get('device'):
         broadcast_user_event(
@@ -457,6 +458,23 @@ def crypto_key_backup(request):
         payload, error_response = parse_json_body(request)
         if error_response:
             return error_response
+
+        signature_result, signature_status = require_default_device_signature(
+            sender['user_id'],
+            payload,
+            'recovery.backup.save',
+            'key-backup',
+        )
+        if signature_status >= 300:
+            return JsonResponse(
+                {
+                    'status': signature_result.get('status', 'error'),
+                    'service': 'messenger',
+                    'sender': sender,
+                    'result': signature_result,
+                },
+                status=signature_status,
+            )
 
         result, response_status = save_user_key_backup(sender['user_id'], payload)
     else:

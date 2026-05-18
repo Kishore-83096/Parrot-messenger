@@ -105,11 +105,21 @@ class RoomParticipant(models.Model):
 
 
 class UserDeviceKey(models.Model):
+    STATUS_ACTIVE = 'active'
+    STATUS_REVOKED = 'revoked'
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, 'Active'),
+        (STATUS_REVOKED, 'Revoked'),
+    ]
+
     user_id = models.PositiveBigIntegerField(db_index=True)
     device_id = models.CharField(max_length=120)
     device_name = models.CharField(max_length=120, blank=True)
     public_key = models.TextField()
+    encryption_public_key = models.TextField(blank=True)
+    management_public_key = models.TextField(blank=True)
     is_default = models.BooleanField(default=False)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
     created_at = models.DateTimeField(auto_now_add=True)
     last_seen_at = models.DateTimeField(auto_now=True)
 
@@ -125,6 +135,7 @@ class UserDeviceKey(models.Model):
         indexes = [
             models.Index(fields=['user_id', 'last_seen_at']),
             models.Index(fields=['user_id', 'is_default']),
+            models.Index(fields=['user_id', 'status']),
         ]
         ordering = ['-last_seen_at', '-id']
 
