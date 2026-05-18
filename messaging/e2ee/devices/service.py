@@ -428,13 +428,25 @@ def revoke_user_device_key(user_id, device_id, payload):
                 'message': 'Only the default device can revoke linked devices.',
             }, 403
 
-        target_device.is_default = False
-        target_device.status = UserDeviceKey.STATUS_REVOKED
-        target_device.save(update_fields=['is_default', 'status', 'last_seen_at'])
+        if is_self_revoke and target_device.is_default:
+            return {
+                'status': 'ok',
+                'revoked': False,
+                'deleted': False,
+                'retained_default': True,
+                'local_device_should_clear': False,
+                'device_id': normalized_device_id,
+                'device': serialize_device_key(target_device),
+            }, 200
+
+        target_device.delete()
 
     return {
         'status': 'ok',
         'revoked': True,
+        'deleted': True,
+        'retained_default': False,
+        'local_device_should_clear': is_self_revoke,
         'device_id': normalized_device_id,
     }, 200
 

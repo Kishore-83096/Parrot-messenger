@@ -288,7 +288,7 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('encryption_public_key', body['result']['errors'])
 
-    def test_default_device_can_revoke_own_crypto_device_key(self):
+    def test_default_device_can_delete_other_crypto_device_key(self):
         default_private_key = self.create_device(
             'browser-device-default',
             public_key=test_public_key(b'd'),
@@ -314,11 +314,13 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body['status'], 'ok')
         self.assertTrue(body['result']['revoked'])
-        revoked_device = UserDeviceKey.objects.get(
-            user_id=self.sender_user_id,
-            device_id='browser-device-1',
+        self.assertTrue(body['result']['deleted'])
+        self.assertFalse(
+            UserDeviceKey.objects.filter(
+                user_id=self.sender_user_id,
+                device_id='browser-device-1',
+            ).exists()
         )
-        self.assertEqual(revoked_device.status, UserDeviceKey.STATUS_REVOKED)
 
     def test_non_default_device_cannot_revoke_crypto_device_key(self):
         self.create_device(
@@ -353,7 +355,7 @@ class CryptoDeviceKeyTests(TestCase):
             ).exists()
         )
 
-    def test_current_device_can_revoke_itself(self):
+    def test_current_default_device_logout_retains_device_key(self):
         default_private_key = self.create_device(
             'browser-device-default',
             public_key=test_public_key(b'd'),
@@ -373,14 +375,54 @@ class CryptoDeviceKeyTests(TestCase):
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
         )
+        body = response.json()
 
         self.assertEqual(response.status_code, 200)
-        revoked_device = UserDeviceKey.objects.get(
+        self.assertFalse(body['result']['revoked'])
+        self.assertTrue(body['result']['retained_default'])
+        retained_device = UserDeviceKey.objects.get(
             user_id=self.sender_user_id,
             device_id='browser-device-default',
         )
-        self.assertEqual(revoked_device.status, UserDeviceKey.STATUS_REVOKED)
-        self.assertFalse(revoked_device.is_default)
+        self.assertEqual(retained_device.status, UserDeviceKey.STATUS_ACTIVE)
+        self.assertTrue(retained_device.is_default)
+
+    def test_current_non_default_device_logout_deletes_device_key(self):
+        self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        non_default_private_key = self.create_device(
+            'browser-device-1',
+            public_key=test_public_key(),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-1/revoke/',
+            data=json.dumps(
+                self.signed_payload(
+                    'device.revoke',
+                    'browser-device-1',
+                    'browser-device-1',
+                    non_default_private_key,
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body['result']['revoked'])
+        self.assertTrue(body['result']['deleted'])
+        self.assertTrue(body['result']['local_device_should_clear'])
+        self.assertFalse(
+            UserDeviceKey.objects.filter(
+                user_id=self.sender_user_id,
+                device_id='browser-device-1',
+            ).exists()
+        )
 
     def test_revoke_crypto_device_key_requires_owner(self):
         default_private_key = self.create_device(

@@ -280,13 +280,44 @@ Rules:
 
 ### `POST /crypto/devices/<device_id>/revoke/`
 
-Revokes a linked device. Requires a signed device action.
+Revokes or logs out a linked device. Requires a signed device action.
 
 Rules:
 
-- the default device may revoke other non-default devices
-- any active device may revoke itself
-- revoked devices are marked `status=revoked` and no longer listed
+- the default device may delete other non-default device rows
+- a non-default device may delete its own device row during logout
+- a default device logout is retained: Messenger returns `retained_default=true` and does not delete the default row
+- deleted devices are no longer returned by device-list APIs
+
+Non-default logout response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "revoked": true,
+    "deleted": true,
+    "retained_default": false,
+    "local_device_should_clear": true,
+    "device_id": "non-default-device-id"
+  }
+}
+```
+
+Default-device logout response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "revoked": false,
+    "deleted": false,
+    "retained_default": true,
+    "local_device_should_clear": false,
+    "device_id": "default-device-id"
+  }
+}
+```
 
 ### `POST /crypto/files/`
 
@@ -440,4 +471,3 @@ venv\Scripts\python.exe manage.py makemigrations --check --dry-run
 - Keep `MESSAGING_JWT_SECRET` and `INTERNAL_SERVICE_TOKEN` out of source control.
 - Run migrations before deploying code that changes models.
 - Messenger stores encrypted payloads and public keys, not the user's recovery key or message private keys.
-
