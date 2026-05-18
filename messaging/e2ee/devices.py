@@ -80,8 +80,6 @@ def register_user_device_key(user_id, payload):
 
     with transaction.atomic():
         user_devices = UserDeviceKey.objects.select_for_update().filter(user_id=user_id)
-        has_any_device = user_devices.exists()
-        has_default_device = user_devices.filter(is_default=True).exists()
         device_key = user_devices.filter(device_id=normalized_payload['device_id']).first()
 
         if device_key:
@@ -94,7 +92,7 @@ def register_user_device_key(user_id, payload):
                 device_id=normalized_payload['device_id'],
                 device_name=normalized_payload['device_name'],
                 public_key=normalized_payload['public_key'],
-                is_default=not has_any_device and not has_default_device,
+                is_default=False,
             )
 
     return {
@@ -162,6 +160,12 @@ def set_default_user_device_key(user_id, device_id, acting_device_id):
             return {
                 'status': 'error',
                 'message': 'Only the default device can change the default linked device.',
+            }, 403
+
+        if not default_device and normalized_device_id != normalized_acting_device_id:
+            return {
+                'status': 'error',
+                'message': 'Only this linked device can become default when no default device exists.',
             }, 403
 
         user_devices.update(is_default=False)

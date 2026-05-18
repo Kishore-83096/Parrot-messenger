@@ -154,11 +154,11 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(body['result']['device']['device_id'], 'browser-device-1')
         self.assertEqual(body['result']['device']['device_name'], 'Chrome on Windows')
-        self.assertTrue(body['result']['device']['is_default'])
+        self.assertFalse(body['result']['device']['is_default'])
         self.assertEqual(UserDeviceKey.objects.count(), 1)
         self.assertEqual(UserDeviceKey.objects.get().user_id, self.sender_user_id)
         self.assertEqual(UserDeviceKey.objects.get().device_name, 'Chrome on Windows')
-        self.assertTrue(UserDeviceKey.objects.get().is_default)
+        self.assertFalse(UserDeviceKey.objects.get().is_default)
 
     def test_register_second_crypto_device_key_is_not_default(self):
         self.post_device_key(
@@ -177,7 +177,7 @@ class CryptoDeviceKeyTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(body['result']['device']['is_default'])
-        self.assertTrue(
+        self.assertFalse(
             UserDeviceKey.objects.get(device_id='browser-device-1').is_default
         )
 
@@ -418,6 +418,33 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(
             UserDeviceKey.objects.get(device_id='browser-device-1').is_default
+        )
+
+    def test_device_cannot_select_other_default_when_no_default_exists(self):
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-1',
+            public_key=test_public_key(),
+        )
+        UserDeviceKey.objects.create(
+            user_id=self.sender_user_id,
+            device_id='browser-device-2',
+            public_key=test_public_key(b'b'),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/browser-device-2/default/',
+            data=json.dumps({'acting_device_id': 'browser-device-1'}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(
+            UserDeviceKey.objects.get(device_id='browser-device-1').is_default
+        )
+        self.assertFalse(
+            UserDeviceKey.objects.get(device_id='browser-device-2').is_default
         )
 
     def test_list_own_crypto_device_keys(self):
