@@ -755,6 +755,37 @@ class CryptoDeviceKeyTests(TestCase):
             self.key_backup_payload()['encrypted_private_key'],
         )
 
+    @patch('messaging.views.broadcast_user_event')
+    def test_save_crypto_key_backup_broadcasts_recovery_key_update(self, broadcast_user_event):
+        default_private_key = self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+
+        response = self.client.post(
+            '/crypto/key-backup/',
+            data=json.dumps(
+                self.signed_key_backup_payload(
+                    default_private_key,
+                    'browser-device-default',
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        body = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        broadcast_user_event.assert_called_once_with(
+            self.sender_user_id,
+            'recovery.key_updated',
+            {
+                'backup_updated_at': body['result']['backup']['updated_at'],
+                'updated_by_device_id': 'browser-device-default',
+            },
+        )
+
     def test_get_crypto_key_backup_without_backup(self):
         response = self.client.get(
             '/crypto/key-backup/',

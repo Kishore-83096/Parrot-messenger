@@ -477,6 +477,15 @@ def crypto_key_backup(request):
             )
 
         result, response_status = save_user_key_backup(sender['user_id'], payload)
+        if response_status < 300 and result.get('backup'):
+            broadcast_user_event(
+                sender['user_id'],
+                'recovery.key_updated',
+                {
+                    'backup_updated_at': result['backup']['updated_at'],
+                    'updated_by_device_id': payload.get('acting_device_id'),
+                },
+            )
     else:
         return JsonResponse(
             {
