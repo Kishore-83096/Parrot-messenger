@@ -100,7 +100,7 @@ def create_encrypted_file_upload_intents(sender, parent_authorization, payload):
     upload_intents = []
 
     for index, attachment in enumerate(normalized_payload['attachments']):
-        public_id_param = uuid.uuid4().hex
+        public_id_param = f'{uuid.uuid4().hex}.txt'
         cloudinary_public_id = f'{folder}/{public_id_param}'
         signature_params = {
             'folder': folder,

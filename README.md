@@ -414,7 +414,7 @@ Response:
         "resource_type": "raw",
         "parameters": {
           "folder": "MAIN/e2ee/user-1",
-          "public_id": "server-generated-id",
+          "public_id": "server-generated-id.txt",
           "timestamp": 1710000000,
           "overwrite": "false",
           "unique_filename": "false",
