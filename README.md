@@ -264,19 +264,36 @@ Success:
 
 Lists active device public keys for the authenticated user or a user sharing a room with the authenticated user.
 
+When the authenticated user lists their own devices, the response also includes `default_password_configured`.
+
 ### `GET /crypto/recipients/<recipient_account_number>/devices/`
 
 Authorizes the recipient with Parent and returns active recipient device public keys for encryption.
 
 ### `POST /crypto/devices/<device_id>/default/`
 
-Makes a linked device default. Requires a signed device action.
+Makes a linked device default. Requires a signed device action and the default-device password.
+
+Request:
+
+```json
+{
+  "acting_device_id": "current-device-id",
+  "action_timestamp": 1710000000,
+  "action_nonce": "client-generated-nonce",
+  "action_signature": "<base64 Ed25519 signature>",
+  "default_password": "user-entered password"
+}
+```
 
 Rules:
 
-- if no default exists, a device may only make itself default
-- if a default exists, only the current default device can change the default
-- recovered/non-default devices cannot promote themselves while another default exists
+- if no default exists, a device may only make itself default and the supplied password creates the default-device password hash
+- if a default exists and no password hash exists yet, only the current default device can create it
+- the current default device can make another active device default after password verification
+- a non-default device can make only itself default after password verification
+- a non-default device cannot make another device default
+- failed password verification is rate-limited per acting device
 
 ### `POST /crypto/devices/<device_id>/revoke/`
 

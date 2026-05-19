@@ -143,6 +143,22 @@ class UserDeviceKey(models.Model):
         return f'device key {self.device_id} for user {self.user_id}'
 
 
+class UserDeviceDefaultCredential(models.Model):
+    user_id = models.PositiveBigIntegerField(unique=True, db_index=True)
+    password_hash = models.CharField(max_length=256)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['user_id', 'updated_at']),
+        ]
+        ordering = ['-updated_at', '-id']
+
+    def __str__(self):
+        return f'default device credential for user {self.user_id}'
+
+
 class UserE2EEKeyBackup(models.Model):
     user_id = models.PositiveBigIntegerField(unique=True, db_index=True)
     public_key = models.TextField()

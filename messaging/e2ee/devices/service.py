@@ -5,10 +5,11 @@ import time
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from django.contrib.auth.hashers import check_password, make_password
 from django.core.cache import cache
 from django.db import transaction
 
-from ...models import RoomParticipant, UserDeviceKey
+from ...models import RoomParticipant, UserDeviceDefaultCredential, UserDeviceKey
 
 
 DEVICE_ID_PATTERN = re.compile(r'^[A-Za-z0-9._:-]{1,120}$')
@@ -18,6 +19,9 @@ ED25519_PUBLIC_KEY_BYTES = 32
 ED25519_SIGNATURE_BYTES = 64
 ACTION_SIGNATURE_MAX_AGE_SECONDS = 5 * 60
 ACTION_SIGNATURE_VERSION = 'parrot-device-action-v1'
+DEFAULT_DEVICE_PASSWORD_MIN_LENGTH = 8
+DEFAULT_DEVICE_PASSWORD_ATTEMPT_LIMIT = 5
+DEFAULT_DEVICE_PASSWORD_ATTEMPT_WINDOW_SECONDS = 10 * 60
 
 
 def validation_error(errors):
@@ -97,6 +101,50 @@ def normalize_device_key_payload(payload):
     }, None
 
 
+def normalize_default_device_password(payload):
+    password_value = payload.get('default_password')
+    password = '' if password_value is None else str(password_value)
+
+    if not password or not password.strip():
+        return None, {
+            'default_password': ['Default device password is required.'],
+        }
+
+    if len(password) < DEFAULT_DEVICE_PASSWORD_MIN_LENGTH:
+        return None, {
+            'default_password': [
+                f'Default device password must be at least {DEFAULT_DEVICE_PASSWORD_MIN_LENGTH} characters.',
+            ],
+        }
+
+    return password, None
+
+
+def get_default_device_password_attempt_key(user_id, acting_device_id):
+    return f'default-device-password-attempts:{user_id}:{acting_device_id}'
+
+
+def get_default_device_password_attempts(user_id, acting_device_id):
+    return int(cache.get(get_default_device_password_attempt_key(user_id, acting_device_id)) or 0)
+
+
+def record_default_device_password_failure(user_id, acting_device_id):
+    attempt_key = get_default_device_password_attempt_key(user_id, acting_device_id)
+
+    if cache.add(attempt_key, 1, timeout=DEFAULT_DEVICE_PASSWORD_ATTEMPT_WINDOW_SECONDS):
+        return 1
+
+    try:
+        return int(cache.incr(attempt_key))
+    except ValueError:
+        cache.set(attempt_key, 1, timeout=DEFAULT_DEVICE_PASSWORD_ATTEMPT_WINDOW_SECONDS)
+        return 1
+
+
+def clear_default_device_password_failures(user_id, acting_device_id):
+    cache.delete(get_default_device_password_attempt_key(user_id, acting_device_id))
+
+
 def register_user_device_key(user_id, payload):
     normalized_payload, errors = normalize_device_key_payload(payload)
     if errors:
@@ -147,24 +195,34 @@ def list_accessible_user_device_keys(requesting_user_id, target_user_id):
             'message': 'Device keys not found.',
         }, 404
 
-    return list_user_device_keys(target_user_id)
+    return list_user_device_keys(
+        target_user_id,
+        include_default_password_status=int(requesting_user_id) == int(target_user_id),
+    )
 
 
-def list_user_device_keys(target_user_id):
+def list_user_device_keys(target_user_id, include_default_password_status=False):
     device_keys = (
         UserDeviceKey.objects
         .filter(user_id=target_user_id, status=UserDeviceKey.STATUS_ACTIVE)
         .order_by('-last_seen_at', '-id')
     )
 
-    return {
+    result = {
         'status': 'ok',
         'user_id': target_user_id,
         'devices': [
             serialize_device_key(device_key)
             for device_key in device_keys
         ],
-    }, 200
+    }
+
+    if include_default_password_status:
+        result['default_password_configured'] = UserDeviceDefaultCredential.objects.filter(
+            user_id=target_user_id,
+        ).exists()
+
+    return result, 200
 
 
 def build_action_message(user_id, action, acting_device_id, target_device_id, timestamp, nonce):
@@ -352,10 +410,69 @@ def set_default_user_device_key(user_id, device_id, payload):
             return signature_result, response_status
 
         default_device = user_devices.filter(is_default=True).first()
-        if default_device and default_device.device_id != normalized_acting_device_id:
+        default_password, password_errors = normalize_default_device_password(payload)
+        if password_errors:
+            return validation_error(password_errors)
+
+        default_credential = (
+            UserDeviceDefaultCredential.objects
+            .select_for_update()
+            .filter(user_id=user_id)
+            .first()
+        )
+        if default_credential:
+            if (
+                get_default_device_password_attempts(user_id, normalized_acting_device_id)
+                >= DEFAULT_DEVICE_PASSWORD_ATTEMPT_LIMIT
+            ):
+                return {
+                    'status': 'error',
+                    'message': 'Too many default device password attempts. Try again later.',
+                }, 429
+
+            if not check_password(default_password, default_credential.password_hash):
+                failed_attempts = record_default_device_password_failure(
+                    user_id,
+                    normalized_acting_device_id,
+                )
+                if failed_attempts >= DEFAULT_DEVICE_PASSWORD_ATTEMPT_LIMIT:
+                    return {
+                        'status': 'error',
+                        'message': 'Too many default device password attempts. Try again later.',
+                    }, 429
+
+                return {
+                    'status': 'error',
+                    'message': 'Default device password is incorrect.',
+                }, 403
+
+            clear_default_device_password_failures(user_id, normalized_acting_device_id)
+        else:
+            if default_device and default_device.device_id != normalized_acting_device_id:
+                return {
+                    'status': 'error',
+                    'message': 'Only the current default device can create the default device password.',
+                }, 403
+
+            if not default_device and normalized_device_id != normalized_acting_device_id:
+                return {
+                    'status': 'error',
+                    'message': 'Only this linked device can become default when no default device exists.',
+                }, 403
+
+            UserDeviceDefaultCredential.objects.create(
+                user_id=user_id,
+                password_hash=make_password(default_password),
+            )
+
+        if (
+            default_device
+            and normalized_device_id != normalized_acting_device_id
+            and default_device.device_id != normalized_acting_device_id
+        ):
             return {
                 'status': 'error',
-                'message': 'Only the default device can change the default linked device.',
+                'message': 'Only the current default device can make another device default.',
             }, 403
 
         if not default_device and normalized_device_id != normalized_acting_device_id:
@@ -371,6 +488,7 @@ def set_default_user_device_key(user_id, device_id, payload):
     return {
         'status': 'ok',
         'device': serialize_device_key(target_device),
+        'default_password_configured': True,
     }, 200
 
 
