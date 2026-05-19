@@ -2,6 +2,8 @@ from django.urls import path
 
 from .views import (
     authorize_message,
+    complete_crypto_file_upload_intent,
+    create_crypto_file_upload_intents,
     crypto_key_backup,
     deliver_room,
     health_check,
@@ -31,6 +33,8 @@ urlpatterns = [
     path('crypto/devices/default-password/', update_default_crypto_device_password, name='crypto-device-default-password-update'),
     path('crypto/devices/<str:device_id>/revoke/', revoke_crypto_device, name='crypto-device-revoke'),
     path('crypto/files/', upload_crypto_file, name='crypto-file-upload'),
+    path('crypto/files/upload-intents/', create_crypto_file_upload_intents, name='crypto-file-upload-intent-create'),
+    path('crypto/files/upload-intents/<uuid:upload_intent_id>/complete/', complete_crypto_file_upload_intent, name='crypto-file-upload-intent-complete'),
     path('crypto/key-backup/', crypto_key_backup, name='crypto-key-backup'),
     path('crypto/users/<int:user_id>/devices/', user_crypto_devices, name='crypto-user-devices'),
     path('crypto/recipients/<str:recipient_account_number>/devices/', recipient_crypto_devices, name='crypto-recipient-devices'),

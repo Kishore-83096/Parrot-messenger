@@ -8,6 +8,8 @@ from unittest.mock import patch
 import jwt
 from asgiref.sync import sync_to_async
 from channels.testing import WebsocketCommunicator
+from cloudinary import config as cloudinary_config
+from cloudinary.utils import api_sign_request
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from django.conf import settings
@@ -23,6 +25,7 @@ from messenger_service.asgi import application
 from .models import (
     Message,
     MessageAttachment,
+    MessageEncryptedUploadIntent,
     Room,
     RoomParticipant,
     UserDeviceDefaultCredential,
@@ -1371,6 +1374,55 @@ class MessageSendAuthorizationTests(TestCase):
             HTTP_AUTHORIZATION=self.auth_header(),
         )
 
+    def post_upload_intents(self, payload):
+        return self.client.post(
+            '/crypto/files/upload-intents/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+    def post_complete_upload_intent(self, upload_intent_id, payload):
+        return self.client.post(
+            f'/crypto/files/upload-intents/{upload_intent_id}/complete/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+    def cloudinary_response_signature(self, public_id, version):
+        cloudinary_config(cloudinary_url=settings.CLOUDINARY_URL, secure=True)
+        return api_sign_request(
+            {
+                'public_id': public_id,
+                'version': str(version),
+            },
+            'test-secret',
+            signature_version=1,
+        )
+
+    def create_completed_upload_intent(self, client_message_id='direct-upload-message-1'):
+        return MessageEncryptedUploadIntent.objects.create(
+            sender_user_id=self.sender_user_id,
+            sender_account_number=self.sender_account_number,
+            recipient_user_id=self.recipient_user_id,
+            recipient_account_number=self.recipient_account_number,
+            client_message_id=client_message_id,
+            attachment_client_id='attachment-1',
+            original_file_name='photo.jpg',
+            original_mime_type='image/jpeg',
+            original_file_size_bytes=20,
+            encrypted_file_size_bytes=36,
+            cloudinary_public_id=f'MAIN/e2ee/user-{self.sender_user_id}/encrypted-photo',
+            cloudinary_resource_type='raw',
+            cloudinary_folder=f'MAIN/e2ee/user-{self.sender_user_id}',
+            secure_url='https://res.cloudinary.com/test-cloud/raw/upload/v123/MAIN/e2ee/user-1/encrypted-photo',
+            status=MessageEncryptedUploadIntent.STATUS_COMPLETED,
+            signature_timestamp=int(time.time()),
+            expires_at=timezone.now() + timedelta(minutes=5),
+            completed_at=timezone.now(),
+        )
+
     def parent_denial(self, reason='contact_not_saved', status=403):
         return {
             'ok': False,
@@ -1545,6 +1597,146 @@ class MessageSendAuthorizationTests(TestCase):
         self.assertEqual(cloudinary_upload.call_args_list[1].kwargs['folder'], 'MAIN/pdfs')
         broadcast_room_event.assert_called_once()
         broadcast_participant_event.assert_called_once()
+
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_create_encrypted_upload_intent_requires_authorized_message(
+        self,
+        authorize_parent_messaging,
+    ):
+        authorize_parent_messaging.return_value = self.parent_denial()
+
+        response = self.post_upload_intents(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'client_message_id': 'denied-upload-message-1',
+                'attachments': [
+                    {
+                        'id': 'attachment-1',
+                        'file_name': 'photo.jpg',
+                        'mime_type': 'image/jpeg',
+                        'file_size_bytes': 20,
+                        'encrypted_file_size_bytes': 36,
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(MessageEncryptedUploadIntent.objects.count(), 0)
+
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_create_and_complete_encrypted_upload_intent(
+        self,
+        authorize_parent_messaging,
+    ):
+        authorize_parent_messaging.return_value = self.parent_allowed()
+
+        create_response = self.post_upload_intents(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'client_message_id': 'direct-upload-message-1',
+                'attachments': [
+                    {
+                        'id': 'attachment-1',
+                        'file_name': 'photo.jpg',
+                        'mime_type': 'image/jpeg',
+                        'file_size_bytes': 20,
+                        'encrypted_file_size_bytes': 36,
+                    },
+                ],
+            }
+        )
+        create_body = create_response.json()
+
+        self.assertEqual(create_response.status_code, 201)
+        upload_intent = create_body['result']['upload_intents'][0]
+        self.assertEqual(upload_intent['api_key'], 'test-key')
+        self.assertNotIn('api_secret', upload_intent)
+        self.assertEqual(upload_intent['resource_type'], 'raw')
+        self.assertEqual(upload_intent['parameters']['folder'], f'MAIN/e2ee/user-{self.sender_user_id}')
+        self.assertEqual(MessageEncryptedUploadIntent.objects.count(), 1)
+
+        intent = MessageEncryptedUploadIntent.objects.get()
+        version = '123'
+        complete_response = self.post_complete_upload_intent(
+            intent.id,
+            {
+                'public_id': intent.cloudinary_public_id,
+                'resource_type': 'raw',
+                'bytes': 36,
+                'asset_id': 'asset-direct-upload',
+                'version': version,
+                'signature': self.cloudinary_response_signature(
+                    intent.cloudinary_public_id,
+                    version,
+                ),
+            },
+        )
+        complete_body = complete_response.json()
+
+        self.assertEqual(complete_response.status_code, 200)
+        self.assertEqual(complete_body['status'], 'ok')
+        self.assertEqual(
+            complete_body['result']['file']['encrypted_file_url'],
+            f'https://res.cloudinary.com/test-cloud/raw/upload/v{version}/{intent.cloudinary_public_id}',
+        )
+        intent.refresh_from_db()
+        self.assertEqual(intent.status, MessageEncryptedUploadIntent.STATUS_COMPLETED)
+        self.assertEqual(intent.cloudinary_asset_id, 'asset-direct-upload')
+
+    @patch('messaging.views.broadcast_participant_event')
+    @patch('messaging.views.broadcast_room_event')
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_send_consumes_completed_encrypted_upload_intent(
+        self,
+        authorize_parent_messaging,
+        broadcast_room_event,
+        broadcast_participant_event,
+    ):
+        authorize_parent_messaging.return_value = self.parent_allowed()
+        intent = self.create_completed_upload_intent(
+            client_message_id='direct-upload-message-2',
+        )
+
+        response = self.post_send_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Encrypted message envelope with attachment.',
+                'client_message_id': 'direct-upload-message-2',
+                'encrypted_upload_intent_ids': [str(intent.id)],
+            }
+        )
+
+        self.assertEqual(response.status_code, 201)
+        intent.refresh_from_db()
+        self.assertEqual(intent.status, MessageEncryptedUploadIntent.STATUS_CONSUMED)
+        self.assertIsNotNone(intent.consumed_at)
+        broadcast_room_event.assert_called_once()
+        broadcast_participant_event.assert_called_once()
+
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_send_rejects_uncompleted_encrypted_upload_intent(
+        self,
+        authorize_parent_messaging,
+    ):
+        authorize_parent_messaging.return_value = self.parent_allowed()
+        intent = self.create_completed_upload_intent(
+            client_message_id='direct-upload-message-3',
+        )
+        intent.status = MessageEncryptedUploadIntent.STATUS_ISSUED
+        intent.save(update_fields=['status', 'updated_at'])
+
+        response = self.post_send_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Encrypted message envelope with attachment.',
+                'client_message_id': 'direct-upload-message-3',
+                'encrypted_upload_intent_ids': [str(intent.id)],
+            }
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Message.objects.count(), 0)
 
     @patch('messaging.views.authorize_parent_messaging')
     @patch('messaging.services.cloudinary_uploader.upload')

@@ -1,3 +1,5 @@
+import uuid
+
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q
@@ -301,3 +303,52 @@ class MessageAttachment(models.Model):
 
     def __str__(self):
         return f'{self.file_type} attachment #{self.pk or "new"}'
+
+
+class MessageEncryptedUploadIntent(models.Model):
+    STATUS_ISSUED = 'issued'
+    STATUS_COMPLETED = 'completed'
+    STATUS_CONSUMED = 'consumed'
+    STATUS_EXPIRED = 'expired'
+    STATUS_CHOICES = [
+        (STATUS_ISSUED, 'Issued'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_CONSUMED, 'Consumed'),
+        (STATUS_EXPIRED, 'Expired'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sender_user_id = models.PositiveBigIntegerField(db_index=True)
+    sender_account_number = models.CharField(max_length=10, blank=True)
+    recipient_user_id = models.PositiveBigIntegerField(db_index=True)
+    recipient_account_number = models.CharField(max_length=10, db_index=True)
+    client_message_id = models.CharField(max_length=120, db_index=True)
+    attachment_client_id = models.CharField(max_length=255, blank=True)
+    attachment_index = models.PositiveIntegerField(default=0)
+    original_file_name = models.CharField(max_length=255, blank=True)
+    original_mime_type = models.CharField(max_length=120, blank=True)
+    original_file_size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
+    encrypted_file_size_bytes = models.PositiveBigIntegerField()
+    cloudinary_public_id = models.CharField(max_length=512, unique=True)
+    cloudinary_asset_id = models.CharField(max_length=255, blank=True)
+    cloudinary_resource_type = models.CharField(max_length=40, default='raw')
+    cloudinary_folder = models.CharField(max_length=255)
+    secure_url = models.URLField(max_length=1000, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ISSUED)
+    signature_timestamp = models.PositiveBigIntegerField()
+    expires_at = models.DateTimeField(db_index=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['sender_user_id', 'client_message_id', 'status']),
+            models.Index(fields=['recipient_user_id', 'status']),
+            models.Index(fields=['status', 'expires_at']),
+        ]
+        ordering = ['created_at', 'id']
+
+    def __str__(self):
+        return f'encrypted upload intent {self.id} for user {self.sender_user_id}'

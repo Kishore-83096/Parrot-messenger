@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     Message,
     MessageAttachment,
+    MessageEncryptedUploadIntent,
     Room,
     RoomParticipant,
     UserDeviceKey,
@@ -103,3 +104,27 @@ class MessageAttachmentAdmin(admin.ModelAdmin):
         'cloudinary_public_id',
         'cloudinary_asset_id',
     )
+
+
+@admin.register(MessageEncryptedUploadIntent)
+class MessageEncryptedUploadIntentAdmin(admin.ModelAdmin):
+    list_display = (
+        'id',
+        'sender_user_id',
+        'recipient_user_id',
+        'client_message_id',
+        'status',
+        'encrypted_file_size_bytes',
+        'expires_at',
+        'created_at',
+    )
+    list_filter = ('status', 'cloudinary_resource_type', 'created_at', 'expires_at')
+    search_fields = (
+        '=sender_user_id',
+        '=recipient_user_id',
+        'recipient_account_number',
+        'client_message_id',
+        'cloudinary_public_id',
+        'cloudinary_asset_id',
+    )
+    readonly_fields = ('created_at', 'updated_at', 'completed_at', 'consumed_at')

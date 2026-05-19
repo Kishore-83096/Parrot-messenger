@@ -223,13 +223,16 @@ JSON request:
   "recipient_account_number": "7XXXXXXXXX",
   "text": "{\"type\":\"e2ee.message\",...}",
   "client_message_id": "client-generated-id",
-  "reply_to_message_id": 12
+  "reply_to_message_id": 12,
+  "encrypted_upload_intent_ids": ["uuid-from-completed-upload-intent"]
 }
 ```
 
-Multipart request uses `attachments`, `files`, or `media` fields. React encrypts message text and attachments before calling this endpoint.
+Multipart request uses `attachments`, `files`, or `media` fields for legacy backend-uploaded media. React encrypts message text and E2EE attachments before calling this endpoint.
 
 `client_message_id` is unique per sender. If the same sender repeats a non-empty `client_message_id`, Messenger returns the existing message instead of creating a duplicate. React uses this with its local FIFO send queue.
+
+When E2EE attachments are uploaded directly to Cloudinary, Messenger requires the completed upload intent ids on the message send. Each intent must belong to the authenticated sender, recipient, and `client_message_id`, must be completed, and must not be expired or consumed.
 
 ### `POST /crypto/devices/`
 
@@ -364,7 +367,7 @@ Default-device logout response:
 
 ### `POST /crypto/files/`
 
-Uploads an encrypted attachment blob.
+Legacy endpoint that uploads an encrypted attachment blob through Messenger.
 
 Multipart request:
 
@@ -373,6 +376,65 @@ file=<encrypted blob>
 ```
 
 Response includes an encrypted file URL and Cloudinary metadata.
+
+### `POST /crypto/files/upload-intents/`
+
+Creates short-lived signed Cloudinary upload intents for encrypted attachment blobs. Messenger authorizes the sender and recipient before issuing signatures.
+
+Request:
+
+```json
+{
+  "recipient_account_number": "7XXXXXXXXX",
+  "client_message_id": "client-generated-id",
+  "attachments": [
+    {
+      "id": "client-attachment-id",
+      "file_name": "photo.jpg",
+      "mime_type": "image/jpeg",
+      "file_size_bytes": 12345,
+      "encrypted_file_size_bytes": 12361,
+      "sort_order": 0
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "upload_intents": [
+      {
+        "id": "upload-intent-uuid",
+        "upload_url": "https://api.cloudinary.com/v1_1/<cloud>/raw/upload",
+        "api_key": "<cloudinary api key>",
+        "resource_type": "raw",
+        "parameters": {
+          "folder": "MAIN/e2ee/user-1",
+          "public_id": "server-generated-id",
+          "timestamp": 1710000000,
+          "overwrite": "false",
+          "unique_filename": "false",
+          "use_filename": "false",
+          "api_key": "<cloudinary api key>",
+          "signature": "<server-generated signature>"
+        }
+      }
+    ]
+  }
+}
+```
+
+The response never includes the Cloudinary API secret.
+
+### `POST /crypto/files/upload-intents/<upload_intent_id>/complete/`
+
+Completes a direct Cloudinary upload. Messenger verifies the Cloudinary response signature, public id, resource type, and uploaded byte count before marking the intent complete.
+
+Request body is the Cloudinary upload response JSON. Success returns the finalized encrypted file URL and metadata for the frontend E2EE attachment payload.
 
 ### `GET /crypto/key-backup/`
 

@@ -16,7 +16,13 @@ from .e2ee.devices import (
     set_default_user_device_key,
     update_default_device_password,
 )
-from .e2ee.files import upload_encrypted_file
+from .e2ee.files import (
+    complete_encrypted_file_upload_intent,
+    consume_completed_encrypted_upload_intents,
+    create_encrypted_file_upload_intents,
+    upload_encrypted_file,
+    validate_completed_encrypted_upload_intents,
+)
 from .realtime import broadcast_participant_event, broadcast_room_event, broadcast_user_event
 from .signals import (
     authorize_parent_messaging,
@@ -28,6 +34,7 @@ from .services import (
     cleanup_uploaded_attachments,
     create_direct_message,
     get_existing_direct_room_authorization,
+    has_existing_sender_client_message,
     list_room_messages,
     list_user_rooms,
     mark_room_delivered,
@@ -475,6 +482,78 @@ def upload_crypto_file(request):
 
 
 @csrf_exempt
+@require_POST
+def create_crypto_file_upload_intents(request):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    parent_authorization, authorization_result, authorization_status = authorize_sender_for_message(
+        sender,
+        payload.get('recipient_account_number'),
+    )
+    if parent_authorization is None:
+        return JsonResponse(
+            {
+                'status': get_authorization_status(authorization_result, authorization_status),
+                'service': 'messenger',
+                'sender': sender,
+                'authorization': sanitize_authorization_result(authorization_result),
+            },
+            status=authorization_status,
+        )
+
+    result, response_status = create_encrypted_file_upload_intents(
+        sender,
+        parent_authorization,
+        payload,
+    )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'authorization': sanitize_authorization_result(authorization_result),
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def complete_crypto_file_upload_intent(request, upload_intent_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = complete_encrypted_file_upload_intent(
+        sender,
+        upload_intent_id,
+        payload,
+    )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
 def crypto_key_backup(request):
     sender, error_response = get_authenticated_sender(request)
     if error_response:
@@ -592,9 +671,39 @@ def send_message(request):
             ],
         }
 
+    encrypted_upload_intents = []
+    if not has_existing_sender_client_message(
+        sender['user_id'],
+        payload.get('client_message_id'),
+    ):
+        encrypted_upload_intents, upload_intent_errors = validate_completed_encrypted_upload_intents(
+            sender,
+            parent_authorization,
+            payload,
+        )
+        if upload_intent_errors:
+            cleanup_uploaded_attachments(uploaded_attachments)
+            return JsonResponse(
+                {
+                    'status': 'error',
+                    'service': 'messenger',
+                    'sender': sender,
+                    'authorization': sanitize_authorization_result(authorization_result),
+                    'result': {
+                        'status': 'error',
+                        'errors': {
+                            'encrypted_upload_intent_ids': upload_intent_errors,
+                        },
+                    },
+                },
+                status=400,
+            )
+
     message_result, message_status = create_direct_message(sender, parent_authorization, payload)
     if message_status >= 300:
         cleanup_uploaded_attachments(uploaded_attachments)
+    elif message_result.get('status') == 'sent':
+        consume_completed_encrypted_upload_intents(encrypted_upload_intents)
 
     delivery_blocked = bool(message_result.get('_delivery_blocked'))
     if message_status < 300 and message_result.get('status') == 'sent':

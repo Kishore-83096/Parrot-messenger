@@ -455,6 +455,17 @@ def get_existing_direct_room_authorization(sender, recipient_account_number):
     }
 
 
+def has_existing_sender_client_message(sender_user_id, client_message_id):
+    client_message_id = normalize_string(client_message_id)
+    if not client_message_id:
+        return False
+
+    return Message.objects.filter(
+        sender_user_id=sender_user_id,
+        client_message_id=client_message_id,
+    ).exists()
+
+
 def create_direct_message(sender, parent_authorization, payload):
     normalized_payload, errors = normalize_send_payload(payload)
     if errors:
