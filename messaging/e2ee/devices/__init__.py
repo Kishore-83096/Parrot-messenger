@@ -5,6 +5,7 @@ from .service import (
     require_default_device_signature,
     revoke_user_device_key,
     set_default_user_device_key,
+    update_default_device_password,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     'require_default_device_signature',
     'revoke_user_device_key',
     'set_default_user_device_key',
+    'update_default_device_password',
 ]

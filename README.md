@@ -229,6 +229,8 @@ JSON request:
 
 Multipart request uses `attachments`, `files`, or `media` fields. React encrypts message text and attachments before calling this endpoint.
 
+`client_message_id` is unique per sender. If the same sender repeats a non-empty `client_message_id`, Messenger returns the existing message instead of creating a duplicate. React uses this with its local FIFO send queue.
+
 ### `POST /crypto/devices/`
 
 Registers or updates the current browser/device E2EE keys.
@@ -294,6 +296,30 @@ Rules:
 - a non-default device can make only itself default after password verification
 - a non-default device cannot make another device default
 - failed password verification is rate-limited per acting device
+
+### `POST /crypto/devices/default-password/`
+
+Updates the default-device password. Requires a signed `device.default_password.update` action from the current default device, the current password, and a new password.
+
+Request:
+
+```json
+{
+  "acting_device_id": "current-default-device-id",
+  "action_timestamp": 1710000000,
+  "action_nonce": "client-generated-nonce",
+  "action_signature": "<base64 Ed25519 signature>",
+  "current_default_password": "current password",
+  "new_default_password": "new password"
+}
+```
+
+Rules:
+
+- only the current default device can update this password
+- the current password must verify against Messenger's stored hash
+- the new password must be different
+- failed current-password verification is rate-limited per acting device
 
 ### `POST /crypto/devices/<device_id>/revoke/`
 
@@ -406,6 +432,7 @@ Supported actions:
 | Action | Target | Purpose |
 |---|---|---|
 | `device.default` | target device id | change default linked device |
+| `device.default_password.update` | `default-password` | update default-device password |
 | `device.revoke` | target device id | revoke/logout device |
 | `recovery.backup.save` | `key-backup` | save recovery backup |
 
@@ -422,6 +449,8 @@ WebSockets authenticate with the Messenger JWT as a query parameter:
 ws://127.0.0.1:8000/ws/inbox/?token=<messaging_token>
 ws://127.0.0.1:8000/ws/rooms/<room_id>/?token=<messaging_token>
 ```
+
+The backend broadcasts the same room/message status events to room groups and participant inbox groups. React uses the room socket for the active conversation and the inbox socket as a fallback path for room-message and status updates.
 
 ### Inbox Socket
 

@@ -6,14 +6,19 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import jwt
+from asgiref.sync import sync_to_async
+from channels.testing import WebsocketCommunicator
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from django.conf import settings
+from django.contrib.auth.hashers import check_password
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
+
+from messenger_service.asgi import application
 
 from .models import (
     Message,
@@ -26,6 +31,7 @@ from .models import (
 )
 from .cache import invalidate_room_messages_cache
 from .e2ee.devices.service import build_action_message
+from .realtime import broadcast_room_event, broadcast_user_event
 from .services import (
     create_direct_message,
     get_room_unread_count,
@@ -43,6 +49,12 @@ TEST_JWT_SETTINGS = {
     'MESSAGING_JWT_AUDIENCE': 'parrot-messenger',
     'CLOUDINARY_URL': 'cloudinary://test-key:test-secret@test-cloud',
     'CLOUDINARY_MAIN_FOLDER': 'MAIN',
+    'CACHES': {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'parrot-messenger-tests',
+        },
+    },
 }
 
 
@@ -185,6 +197,24 @@ class CryptoDeviceKeyTests(TestCase):
                 private_key,
             ),
             'default_password': default_password,
+        }
+
+    def signed_update_default_password_payload(
+        self,
+        acting_device_id,
+        private_key,
+        current_password='default-device-password',
+        new_password='updated-default-password',
+    ):
+        return {
+            **self.signed_payload(
+                'device.default_password.update',
+                acting_device_id,
+                'default-password',
+                private_key,
+            ),
+            'current_default_password': current_password,
+            'new_default_password': new_password,
         }
 
     def registration_payload(self, device_id, public_key=None, device_name=''):
@@ -695,6 +725,122 @@ class CryptoDeviceKeyTests(TestCase):
         self.assertFalse(
             UserDeviceKey.objects.get(device_id='browser-device-2').is_default
         )
+
+    def test_default_device_can_update_default_password(self):
+        default_private_key = self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        self.client.post(
+            '/crypto/devices/browser-device-default/default/',
+            data=json.dumps(
+                self.signed_default_payload(
+                    'browser-device-default',
+                    'browser-device-default',
+                    default_private_key,
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/default-password/',
+            data=json.dumps(
+                self.signed_update_default_password_payload(
+                    'browser-device-default',
+                    default_private_key,
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        credential = UserDeviceDefaultCredential.objects.get(
+            user_id=self.sender_user_id,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(check_password('updated-default-password', credential.password_hash))
+
+    def test_non_default_device_cannot_update_default_password(self):
+        default_private_key = self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        self.client.post(
+            '/crypto/devices/browser-device-default/default/',
+            data=json.dumps(
+                self.signed_default_payload(
+                    'browser-device-default',
+                    'browser-device-default',
+                    default_private_key,
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        non_default_private_key = self.create_device(
+            'browser-device-2',
+            public_key=test_public_key(b'b'),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/default-password/',
+            data=json.dumps(
+                self.signed_update_default_password_payload(
+                    'browser-device-2',
+                    non_default_private_key,
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        credential = UserDeviceDefaultCredential.objects.get(
+            user_id=self.sender_user_id,
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(check_password('default-device-password', credential.password_hash))
+
+    def test_update_default_password_rejects_wrong_current_password(self):
+        default_private_key = self.create_device(
+            'browser-device-default',
+            public_key=test_public_key(b'd'),
+            is_default=True,
+        )
+        self.client.post(
+            '/crypto/devices/browser-device-default/default/',
+            data=json.dumps(
+                self.signed_default_payload(
+                    'browser-device-default',
+                    'browser-device-default',
+                    default_private_key,
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        response = self.client.post(
+            '/crypto/devices/default-password/',
+            data=json.dumps(
+                self.signed_update_default_password_payload(
+                    'browser-device-default',
+                    default_private_key,
+                    current_password='wrong-default-password',
+                )
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        credential = UserDeviceDefaultCredential.objects.get(
+            user_id=self.sender_user_id,
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(check_password('default-device-password', credential.password_hash))
 
     def test_set_default_requires_default_password(self):
         device_private_key = self.create_device('browser-device-1', public_key=test_public_key())
@@ -1550,6 +1696,122 @@ class MessageSendAuthorizationTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()['status'], 'denied')
         self.assertEqual(Message.objects.count(), 0)
+
+@override_settings(
+    **TEST_JWT_SETTINGS,
+    CHANNEL_LAYERS={
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    },
+)
+class WebSocketRealtimeTests(TransactionTestCase):
+    sender_user_id = 1
+    recipient_user_id = 2
+    sender_account_number = '7000000001'
+    recipient_account_number = '7000000002'
+
+    def auth_token(self, user_id=None, account_number=None):
+        now = timezone.now()
+        return jwt.encode(
+            {
+                'sub': str(user_id or self.sender_user_id),
+                'user_id': user_id or self.sender_user_id,
+                'account_number': account_number or self.sender_account_number,
+                'iss': settings.MESSAGING_JWT_ISSUER,
+                'aud': settings.MESSAGING_JWT_AUDIENCE,
+                'iat': now,
+                'exp': now + timedelta(minutes=5),
+            },
+            settings.MESSAGING_JWT_SECRET,
+            algorithm='HS256',
+        )
+
+    def create_direct_room(self):
+        room = Room.objects.create(
+            room_type=Room.TYPE_DIRECT,
+            created_by_user_id=self.sender_user_id,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.sender_user_id,
+            account_number=self.sender_account_number,
+            is_active=True,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+            is_active=True,
+        )
+
+        return room
+
+    async def test_room_websocket_receives_room_broadcasts(self):
+        room = await sync_to_async(self.create_direct_room)()
+        token = self.auth_token()
+        communicator = WebsocketCommunicator(
+            application,
+            f'/ws/rooms/{room.id}/?token={token}',
+        )
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+        self.assertEqual(
+            (await communicator.receive_json_from(timeout=5))['type'],
+            'connection.accepted',
+        )
+        self.assertEqual(
+            (await communicator.receive_json_from(timeout=5))['type'],
+            'typing.snapshot',
+        )
+
+        await sync_to_async(broadcast_room_event)(
+            room.id,
+            'message.sent',
+            {
+                'room': {'id': room.id},
+                'message': {'id': 1, 'room_id': room.id},
+            },
+        )
+
+        event = await communicator.receive_json_from(timeout=1)
+        self.assertEqual(event['type'], 'message.sent')
+        self.assertEqual(event['message']['room_id'], room.id)
+        await communicator.disconnect()
+
+    async def test_inbox_websocket_receives_user_broadcasts(self):
+        token = self.auth_token()
+        communicator = WebsocketCommunicator(
+            application,
+            f'/ws/inbox/?token={token}',
+        )
+
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+        self.assertEqual(
+            (await communicator.receive_json_from(timeout=5))['type'],
+            'connection.accepted',
+        )
+        self.assertEqual(
+            (await communicator.receive_json_from(timeout=5))['type'],
+            'presence.snapshot',
+        )
+
+        await sync_to_async(broadcast_user_event)(
+            self.sender_user_id,
+            'message.delivered',
+            {
+                'room_id': 10,
+                'user_id': self.recipient_user_id,
+                'last_delivered_message_id': 99,
+            },
+        )
+
+        event = await communicator.receive_json_from(timeout=1)
+        self.assertEqual(event['type'], 'message.delivered')
+        self.assertEqual(event['last_delivered_message_id'], 99)
+        await communicator.disconnect()
 
 
 class MessagingCacheTests(TestCase):

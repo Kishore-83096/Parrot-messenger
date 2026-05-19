@@ -14,6 +14,7 @@ from .e2ee.devices import (
     require_default_device_signature,
     revoke_user_device_key,
     set_default_user_device_key,
+    update_default_device_password,
 )
 from .e2ee.files import upload_encrypted_file
 from .realtime import broadcast_participant_event, broadcast_room_event, broadcast_user_event
@@ -359,6 +360,33 @@ def set_default_crypto_device(request, device_id):
                 'changed_by_device_id': payload.get('acting_device_id'),
             },
         )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def update_default_crypto_device_password(request):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = update_default_device_password(
+        sender['user_id'],
+        payload,
+    )
 
     return JsonResponse(
         {

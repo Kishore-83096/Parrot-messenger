@@ -101,23 +101,31 @@ def normalize_device_key_payload(payload):
     }, None
 
 
-def normalize_default_device_password(payload):
-    password_value = payload.get('default_password')
+def normalize_default_device_password_field(
+    payload,
+    field_name='default_password',
+    label='Default device password',
+):
+    password_value = payload.get(field_name)
     password = '' if password_value is None else str(password_value)
 
     if not password or not password.strip():
         return None, {
-            'default_password': ['Default device password is required.'],
+            field_name: [f'{label} is required.'],
         }
 
     if len(password) < DEFAULT_DEVICE_PASSWORD_MIN_LENGTH:
         return None, {
-            'default_password': [
-                f'Default device password must be at least {DEFAULT_DEVICE_PASSWORD_MIN_LENGTH} characters.',
+            field_name: [
+                f'{label} must be at least {DEFAULT_DEVICE_PASSWORD_MIN_LENGTH} characters.',
             ],
         }
 
     return password, None
+
+
+def normalize_default_device_password(payload):
+    return normalize_default_device_password_field(payload)
 
 
 def get_default_device_password_attempt_key(user_id, acting_device_id):
@@ -488,6 +496,120 @@ def set_default_user_device_key(user_id, device_id, payload):
     return {
         'status': 'ok',
         'device': serialize_device_key(target_device),
+        'default_password_configured': True,
+    }, 200
+
+
+def update_default_device_password(user_id, payload):
+    if not isinstance(payload, dict):
+        return validation_error({'body': ['Request body must be a JSON object.']})
+
+    normalized_acting_device_id, acting_errors = normalize_device_id(
+        payload.get('acting_device_id'),
+        'acting_device_id',
+    )
+    if acting_errors:
+        return validation_error(acting_errors)
+
+    current_password, current_password_errors = normalize_default_device_password_field(
+        payload,
+        'current_default_password',
+        'Current default device password',
+    )
+    new_password, new_password_errors = normalize_default_device_password_field(
+        payload,
+        'new_default_password',
+        'New default device password',
+    )
+    errors = {}
+    if current_password_errors:
+        errors.update(current_password_errors)
+    if new_password_errors:
+        errors.update(new_password_errors)
+    if errors:
+        return validation_error(errors)
+
+    if current_password == new_password:
+        return validation_error(
+            {
+                'new_default_password': [
+                    'New default device password must be different from the current password.',
+                ],
+            },
+        )
+
+    with transaction.atomic():
+        user_devices = UserDeviceKey.objects.select_for_update().filter(
+            user_id=user_id,
+            status=UserDeviceKey.STATUS_ACTIVE,
+        )
+        acting_device = user_devices.filter(device_id=normalized_acting_device_id).first()
+
+        if not acting_device:
+            return {
+                'status': 'error',
+                'message': 'Acting device is not linked to this account.',
+            }, 403
+
+        signature_result, response_status = verify_device_action_signature(
+            user_id,
+            acting_device,
+            payload,
+            'device.default_password.update',
+            'default-password',
+        )
+        if response_status >= 300:
+            return signature_result, response_status
+
+        if not acting_device.is_default:
+            return {
+                'status': 'error',
+                'message': 'Only the current default device can update the default device password.',
+            }, 403
+
+        default_credential = (
+            UserDeviceDefaultCredential.objects
+            .select_for_update()
+            .filter(user_id=user_id)
+            .first()
+        )
+        if not default_credential:
+            return {
+                'status': 'error',
+                'message': 'Default device password is not configured.',
+            }, 404
+
+        if (
+            get_default_device_password_attempts(user_id, normalized_acting_device_id)
+            >= DEFAULT_DEVICE_PASSWORD_ATTEMPT_LIMIT
+        ):
+            return {
+                'status': 'error',
+                'message': 'Too many default device password attempts. Try again later.',
+            }, 429
+
+        if not check_password(current_password, default_credential.password_hash):
+            failed_attempts = record_default_device_password_failure(
+                user_id,
+                normalized_acting_device_id,
+            )
+            if failed_attempts >= DEFAULT_DEVICE_PASSWORD_ATTEMPT_LIMIT:
+                return {
+                    'status': 'error',
+                    'message': 'Too many default device password attempts. Try again later.',
+                }, 429
+
+            return {
+                'status': 'error',
+                'message': 'Current default device password is incorrect.',
+            }, 403
+
+        default_credential.password_hash = make_password(new_password)
+        default_credential.save(update_fields=['password_hash', 'updated_at'])
+        clear_default_device_password_failures(user_id, normalized_acting_device_id)
+
+    return {
+        'status': 'ok',
         'default_password_configured': True,
     }, 200
 

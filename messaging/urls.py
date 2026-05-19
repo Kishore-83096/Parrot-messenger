@@ -14,6 +14,7 @@ from .views import (
     room_messages,
     send_message,
     set_default_crypto_device,
+    update_default_crypto_device_password,
     upload_crypto_file,
     user_crypto_devices,
 )
@@ -27,6 +28,7 @@ urlpatterns = [
     path('rooms/<int:room_id>/blocked-messages/release/', release_blocked_messages, name='room-blocked-messages-release'),
     path('crypto/devices/', register_crypto_device, name='crypto-device-register'),
     path('crypto/devices/<str:device_id>/default/', set_default_crypto_device, name='crypto-device-default'),
+    path('crypto/devices/default-password/', update_default_crypto_device_password, name='crypto-device-default-password-update'),
     path('crypto/devices/<str:device_id>/revoke/', revoke_crypto_device, name='crypto-device-revoke'),
     path('crypto/files/', upload_crypto_file, name='crypto-file-upload'),
     path('crypto/key-backup/', crypto_key_backup, name='crypto-key-backup'),
