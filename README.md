@@ -1,6 +1,6 @@
 # Parrot Messenger Service
 
-The Messenger service is the Django backend for rooms, messages, encrypted attachments, encrypted media upload intents, E2EE device keys, recovery-key backups, presence, and WebSocket events.
+The Messenger service is the Django backend for rooms, messages, message reactions, encrypted attachments, encrypted media upload intents, E2EE device keys, recovery-key backups, presence, and WebSocket events.
 
 Messenger does not own user accounts. It trusts short-lived Messenger JWTs issued by the Parent service and calls Parent's internal authorization API before allowing sends.
 
@@ -235,6 +235,58 @@ Multipart request uses `attachments`, `files`, or `media` fields for legacy back
 When E2EE attachments are uploaded directly to Cloudinary, Messenger requires the completed upload intent ids on the message send. Each intent must belong to the authenticated sender, recipient, and `client_message_id`, must be completed, and must not be expired or consumed.
 
 Encrypted voice notes and encrypted audio/video attachments use the same send contract. React stores voice-note and media presentation metadata inside the frontend-encrypted message payload, so Messenger does not need to read waveform data, playable duration, captions, or media type hints to deliver the message.
+
+### `POST /messages/<message_id>/reaction/`
+
+Adds, changes, or removes the authenticated user's reaction for a message in a room they participate in.
+
+Request:
+
+```json
+{
+  "reaction": "heart"
+}
+```
+
+Supported reaction keys:
+
+| Key | UI Meaning |
+|---|---|
+| `thumbs_up` | thumbs up |
+| `heart` | heart |
+| `laugh` | laugh |
+| `surprised` | surprised |
+| `sad` | sad |
+
+Rules:
+
+- one user can have only one reaction per message
+- sending the same reaction again removes that user's reaction
+- sending a different supported reaction replaces the previous one
+- reactions are stored as constrained keys, not encrypted message text
+- the response includes grouped `reactions` counts and `my_reaction` for the current user
+
+Success response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "message_id": 123,
+    "reaction": "heart",
+    "reactions": [
+      {
+        "reaction": "heart",
+        "count": 1,
+        "reacted_by_me": true
+      }
+    ],
+    "my_reaction": "heart"
+  }
+}
+```
+
+After a successful change, Messenger broadcasts `message.reaction_updated` to the room and inbox participants so React can update open conversations and room cache data in real time.
 
 ### `POST /crypto/devices/`
 
@@ -529,6 +581,7 @@ Receives account-wide events:
 - `message.sent`
 - `message.delivered`
 - `message.read`
+- `message.reaction_updated`
 - `device.revoked`
 - `device.default_changed`
 - `recovery.key_updated`
@@ -542,6 +595,8 @@ Client may send:
 ### Room Socket
 
 Receives room-scoped events and typing state.
+
+Room participants receive `message.reaction_updated` whenever a participant adds, changes, or removes a reaction.
 
 Client may send:
 
