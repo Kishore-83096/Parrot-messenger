@@ -4,6 +4,7 @@ from .models import (
     Message,
     MessageAttachment,
     MessageEncryptedUploadIntent,
+    MessageReaction,
     Room,
     RoomParticipant,
     UserDeviceKey,
@@ -32,6 +33,13 @@ class MessageAttachmentInline(admin.TabularInline):
         'cloudinary_folder',
         'sort_order',
     )
+
+
+class MessageReactionInline(admin.TabularInline):
+    model = MessageReaction
+    extra = 0
+    fields = ('user_id', 'reaction', 'created_at', 'updated_at')
+    readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(Room)
@@ -79,7 +87,7 @@ class MessageAdmin(admin.ModelAdmin):
     )
     list_filter = ('status', 'delivery_blocked', 'sent_while_blocked', 'created_at')
     search_fields = ('=sender_user_id', '=recipient_user_id', 'client_message_id', 'text')
-    inlines = [MessageAttachmentInline]
+    inlines = [MessageAttachmentInline, MessageReactionInline]
 
 
 @admin.register(MessageAttachment)
@@ -104,6 +112,14 @@ class MessageAttachmentAdmin(admin.ModelAdmin):
         'cloudinary_public_id',
         'cloudinary_asset_id',
     )
+
+
+@admin.register(MessageReaction)
+class MessageReactionAdmin(admin.ModelAdmin):
+    list_display = ('id', 'message', 'user_id', 'reaction', 'created_at', 'updated_at')
+    list_filter = ('reaction', 'created_at', 'updated_at')
+    search_fields = ('=message__id', '=user_id')
+    readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(MessageEncryptedUploadIntent)

@@ -21,7 +21,7 @@ from .e2ee.payloads import (
     MAX_ENCRYPTED_MESSAGE_TEXT_LENGTH,
     is_encrypted_message_text,
 )
-from .models import Message, MessageAttachment, Room, RoomParticipant
+from .models import Message, MessageAttachment, MessageReaction, Room, RoomParticipant
 
 
 ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
@@ -671,7 +671,11 @@ def list_room_messages(user_id, room_id, limit=20, before_message_id=None, aroun
             'message': 'Room not found.',
         }, 404
 
-    messages = get_visible_messages_queryset(user_id, room_id=room_id).select_related('reply_to')
+    messages = (
+        get_visible_messages_queryset(user_id, room_id=room_id)
+        .select_related('reply_to')
+        .prefetch_related('attachments', 'reactions')
+    )
     if around_message_id:
         result, status = list_room_messages_around_target(
             user_id=user_id,
@@ -773,6 +777,102 @@ def list_room_messages_around_target(user_id, room, messages, limit, around_mess
             'next_after_message_id': newest_message.id if has_more_newer and newest_message else None,
         },
     }, 200
+
+
+def react_to_message(user_id, message_id, payload):
+    normalized_payload, errors = normalize_reaction_payload(payload)
+    if errors:
+        return validation_error(errors)
+
+    message = (
+        get_visible_messages_queryset(user_id)
+        .select_related('room')
+        .prefetch_related('reactions')
+        .filter(id=message_id)
+        .first()
+    )
+    if not message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    participant = RoomParticipant.objects.filter(
+        room_id=message.room_id,
+        user_id=user_id,
+        is_active=True,
+    ).first()
+    if not participant:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    requested_reaction = normalized_payload['reaction']
+    previous_reaction = None
+    action = 'set'
+
+    with transaction.atomic():
+        reaction = (
+            MessageReaction.objects.select_for_update()
+            .filter(message_id=message.id, user_id=user_id)
+            .first()
+        )
+
+        if reaction:
+            previous_reaction = reaction.reaction
+
+        if reaction and reaction.reaction == requested_reaction:
+            reaction.delete()
+            action = 'removed'
+            current_reaction = None
+        elif reaction:
+            reaction.reaction = requested_reaction
+            reaction.save(update_fields=['reaction', 'updated_at'])
+            action = 'updated'
+            current_reaction = requested_reaction
+        else:
+            MessageReaction.objects.create(
+                message_id=message.id,
+                user_id=user_id,
+                reaction=requested_reaction,
+            )
+            current_reaction = requested_reaction
+
+    message = (
+        Message.objects
+        .select_related('room')
+        .prefetch_related('reactions')
+        .get(id=message.id)
+    )
+    invalidate_room_caches(message.room_id)
+
+    return {
+        'status': 'ok',
+        'action': action,
+        'room_id': message.room_id,
+        'message_id': message.id,
+        'user_id': user_id,
+        'reaction': current_reaction,
+        'previous_reaction': previous_reaction,
+        'reactions': serialize_message_reaction_summary(message),
+        'my_reaction': current_reaction,
+        'room': serialize_room(message.room),
+    }, 200
+
+
+def normalize_reaction_payload(payload):
+    errors = {}
+    reaction = normalize_string(payload.get('reaction') if isinstance(payload, dict) else None)
+
+    if not reaction:
+        errors['reaction'] = ['Reaction is required.']
+    elif reaction not in MessageReaction.ALLOWED_REACTIONS:
+        errors['reaction'] = ['Unsupported reaction.']
+
+    return {
+        'reaction': reaction,
+    }, errors
 
 
 def mark_room_delivered(user_id, room_id, payload):
@@ -1026,6 +1126,7 @@ def get_visible_messages_queryset(user_id, room_id=None):
 def serialize_room_summary(room, current_user_id):
     latest_message = (
         get_visible_messages_queryset(current_user_id, room_id=room.id)
+        .prefetch_related('attachments', 'reactions')
         .order_by('-created_at', '-id')
         .first()
     )
@@ -1079,6 +1180,7 @@ def serialize_participant(participant):
 
 
 def serialize_message(message, current_user_id=None):
+    reaction_data = serialize_message_reactions(message, current_user_id)
     data = {
         'id': message.id,
         'room_id': message.room_id,
@@ -1096,9 +1198,46 @@ def serialize_message(message, current_user_id=None):
             serialize_attachment(attachment)
             for attachment in message.attachments.all().order_by('sort_order', 'id')
         ],
+        'reactions': reaction_data['reactions'],
+        'my_reaction': reaction_data['my_reaction'],
     }
 
     return data
+
+
+def serialize_message_reaction_summary(message):
+    return serialize_message_reactions(message, current_user_id=None)['reactions']
+
+
+def serialize_message_reactions(message, current_user_id=None):
+    reaction_counts = {}
+    my_reaction = None
+
+    for reaction in message.reactions.all():
+        reaction_key = reaction.reaction
+        reaction_counts[reaction_key] = reaction_counts.get(reaction_key, 0) + 1
+
+        if current_user_id and int(reaction.user_id) == int(current_user_id):
+            my_reaction = reaction_key
+
+    reactions = []
+    for reaction_key in MessageReaction.ALLOWED_REACTIONS:
+        count = reaction_counts.get(reaction_key, 0)
+        if not count:
+            continue
+
+        reaction_data = {
+            'reaction': reaction_key,
+            'count': count,
+        }
+        if current_user_id:
+            reaction_data['reacted_by_me'] = reaction_key == my_reaction
+        reactions.append(reaction_data)
+
+    return {
+        'reactions': reactions,
+        'my_reaction': my_reaction,
+    }
 
 
 def serialize_reply_preview(message, current_user_id=None):

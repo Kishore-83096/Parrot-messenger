@@ -26,6 +26,7 @@ from .models import (
     Message,
     MessageAttachment,
     MessageEncryptedUploadIntent,
+    MessageReaction,
     Room,
     RoomParticipant,
     UserDeviceDefaultCredential,
@@ -1390,6 +1391,14 @@ class MessageSendAuthorizationTests(TestCase):
             HTTP_AUTHORIZATION=self.auth_header(),
         )
 
+    def post_message_reaction(self, message_id, reaction, user_id=None, account_number=None):
+        return self.client.post(
+            f'/messages/{message_id}/reaction/',
+            data=json.dumps({'reaction': reaction}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(user_id=user_id, account_number=account_number),
+        )
+
     def cloudinary_response_signature(self, public_id, version):
         cloudinary_config(cloudinary_url=settings.CLOUDINARY_URL, secure=True)
         return api_sign_request(
@@ -1459,6 +1468,120 @@ class MessageSendAuthorizationTests(TestCase):
                 'status_code': 200,
             },
         }, 200
+
+    @patch('messaging.views.broadcast_participant_event')
+    @patch('messaging.views.broadcast_room_event')
+    def test_message_reaction_creates_updates_and_removes_user_reaction(
+        self,
+        broadcast_room_event,
+        broadcast_participant_event,
+    ):
+        room = self.create_direct_room()
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='React to this.',
+        )
+
+        create_response = self.post_message_reaction(message.id, 'heart')
+        self.assertEqual(create_response.status_code, 200)
+        create_body = create_response.json()
+        self.assertEqual(create_body['result']['action'], 'set')
+        self.assertEqual(create_body['result']['my_reaction'], 'heart')
+        self.assertEqual(create_body['result']['reactions'][0]['reaction'], 'heart')
+        self.assertEqual(create_body['result']['reactions'][0]['count'], 1)
+        self.assertEqual(MessageReaction.objects.count(), 1)
+
+        update_response = self.post_message_reaction(message.id, 'laugh')
+        self.assertEqual(update_response.status_code, 200)
+        update_body = update_response.json()
+        self.assertEqual(update_body['result']['action'], 'updated')
+        self.assertEqual(update_body['result']['previous_reaction'], 'heart')
+        self.assertEqual(update_body['result']['my_reaction'], 'laugh')
+        self.assertEqual(MessageReaction.objects.count(), 1)
+        self.assertEqual(MessageReaction.objects.get().reaction, 'laugh')
+
+        remove_response = self.post_message_reaction(message.id, 'laugh')
+        self.assertEqual(remove_response.status_code, 200)
+        remove_body = remove_response.json()
+        self.assertEqual(remove_body['result']['action'], 'removed')
+        self.assertIsNone(remove_body['result']['my_reaction'])
+        self.assertEqual(remove_body['result']['reactions'], [])
+        self.assertEqual(MessageReaction.objects.count(), 0)
+
+        self.assertEqual(broadcast_room_event.call_count, 3)
+        self.assertEqual(broadcast_room_event.call_args.args[1], 'message.reaction_updated')
+        last_event_payload = broadcast_room_event.call_args.args[2]
+        self.assertEqual(last_event_payload['message_id'], message.id)
+        self.assertEqual(broadcast_participant_event.call_count, 3)
+
+    def test_message_reaction_rejects_unsupported_reaction(self):
+        room = self.create_direct_room()
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='React to this.',
+        )
+
+        response = self.post_message_reaction(message.id, 'fire')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(MessageReaction.objects.count(), 0)
+        self.assertIn('reaction', response.json()['result']['errors'])
+
+    def test_message_reaction_requires_visible_message(self):
+        room = self.create_direct_room()
+        hidden_message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Hidden while blocked.',
+            delivery_blocked=True,
+            sent_while_blocked=True,
+        )
+
+        response = self.post_message_reaction(
+            hidden_message.id,
+            'heart',
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(MessageReaction.objects.count(), 0)
+
+    def test_room_messages_include_reaction_summary_for_current_user(self):
+        room = self.create_direct_room()
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Reacted message.',
+        )
+        MessageReaction.objects.create(
+            message=message,
+            user_id=self.sender_user_id,
+            reaction='heart',
+        )
+        MessageReaction.objects.create(
+            message=message,
+            user_id=self.recipient_user_id,
+            reaction='heart',
+        )
+
+        response = self.client.get(
+            f'/rooms/{room.id}/messages/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        message_payload = response.json()['result']['messages'][0]
+        self.assertEqual(message_payload['my_reaction'], 'heart')
+        self.assertEqual(message_payload['reactions'][0]['reaction'], 'heart')
+        self.assertEqual(message_payload['reactions'][0]['count'], 2)
+        self.assertTrue(message_payload['reactions'][0]['reacted_by_me'])
 
     @patch('messaging.views.broadcast_participant_event')
     @patch('messaging.views.broadcast_room_event')

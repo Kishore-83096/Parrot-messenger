@@ -305,6 +305,41 @@ class MessageAttachment(models.Model):
         return f'{self.file_type} attachment #{self.pk or "new"}'
 
 
+class MessageReaction(models.Model):
+    REACTION_THUMBS_UP = 'thumbs_up'
+    REACTION_HEART = 'heart'
+    REACTION_LAUGH = 'laugh'
+    REACTION_SURPRISED = 'surprised'
+    REACTION_SAD = 'sad'
+    REACTION_CHOICES = [
+        (REACTION_THUMBS_UP, 'Thumbs up'),
+        (REACTION_HEART, 'Heart'),
+        (REACTION_LAUGH, 'Laugh'),
+        (REACTION_SURPRISED, 'Surprised'),
+        (REACTION_SAD, 'Sad'),
+    ]
+    ALLOWED_REACTIONS = tuple(choice[0] for choice in REACTION_CHOICES)
+
+    message = models.ForeignKey(Message, related_name='reactions', on_delete=models.CASCADE)
+    user_id = models.PositiveBigIntegerField(db_index=True)
+    reaction = models.CharField(max_length=20, choices=REACTION_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['message', 'user_id'], name='uq_message_reaction_user'),
+        ]
+        indexes = [
+            models.Index(fields=['message', 'reaction']),
+            models.Index(fields=['user_id', 'updated_at']),
+        ]
+        ordering = ['created_at', 'id']
+
+    def __str__(self):
+        return f'{self.reaction} reaction by user {self.user_id} on message {self.message_id}'
+
+
 class MessageEncryptedUploadIntent(models.Model):
     STATUS_ISSUED = 'issued'
     STATUS_COMPLETED = 'completed'

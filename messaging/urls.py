@@ -8,6 +8,7 @@ from .views import (
     deliver_room,
     health_check,
     list_rooms,
+    message_reaction,
     read_room,
     register_crypto_device,
     recipient_crypto_devices,
@@ -40,4 +41,5 @@ urlpatterns = [
     path('crypto/recipients/<str:recipient_account_number>/devices/', recipient_crypto_devices, name='crypto-recipient-devices'),
     path('messages/authorize/', authorize_message, name='message-authorization'),
     path('messages/send/', send_message, name='message-send'),
+    path('messages/<int:message_id>/reaction/', message_reaction, name='message-reaction'),
 ]

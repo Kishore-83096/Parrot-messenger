@@ -40,6 +40,7 @@ from .services import (
     mark_room_delivered,
     mark_room_read,
     normalize_message_list_params,
+    react_to_message,
     release_room_blocked_messages,
     upload_message_files,
 )
@@ -792,6 +793,54 @@ def room_messages(request, room_id):
             'result': messages_result,
         },
         status=messages_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def message_reaction(request, message_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    reaction_result, reaction_status = react_to_message(
+        user_id=sender['user_id'],
+        message_id=message_id,
+        payload=payload,
+    )
+    if reaction_status < 300:
+        event_payload = {
+            'room_id': reaction_result['room_id'],
+            'message_id': reaction_result['message_id'],
+            'user_id': reaction_result['user_id'],
+            'reaction': reaction_result['reaction'],
+            'previous_reaction': reaction_result['previous_reaction'],
+            'action': reaction_result['action'],
+            'reactions': reaction_result['reactions'],
+        }
+        broadcast_room_event(
+            reaction_result['room_id'],
+            'message.reaction_updated',
+            event_payload,
+        )
+        broadcast_participant_event(
+            reaction_result['room']['participants'],
+            'message.reaction_updated',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': reaction_result['status'],
+            'service': 'messenger',
+            'user': sender,
+            'result': reaction_result,
+        },
+        status=reaction_status,
     )
 
 
