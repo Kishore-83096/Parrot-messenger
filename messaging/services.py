@@ -1,5 +1,6 @@
 import mimetypes
 import re
+import uuid
 from pathlib import Path
 
 from cloudinary import config as cloudinary_config
@@ -115,6 +116,10 @@ def normalize_send_payload(payload):
     if attachment_errors:
         errors['attachments'] = attachment_errors
 
+    story_context, story_context_errors = normalize_story_context(payload.get('story_context'))
+    if story_context_errors:
+        errors['story_context'] = story_context_errors
+
     if not text.strip() and not attachments:
         errors['message'] = ['Message must include text or at least one attachment.']
 
@@ -127,6 +132,54 @@ def normalize_send_payload(payload):
         'client_message_id': client_message_id.strip(),
         'reply_to_message_id': reply_to_message_id,
         'attachments': attachments,
+        'story_context': story_context,
+    }, None
+
+
+def normalize_story_context(value):
+    if value in (None, ''):
+        return {}, None
+
+    if not isinstance(value, dict):
+        return {}, ['Story context must be an object.']
+
+    errors = {}
+    story_id = normalize_string(value.get('story_id'))
+    context_type = normalize_string(value.get('type'))
+    media_type = normalize_string(value.get('media_type'))
+    preview_label = normalize_string(value.get('preview_label')) or 'Status'
+    created_at = normalize_string(value.get('created_at'))
+    expires_at = normalize_string(value.get('expires_at'))
+
+    if not story_id:
+        errors['story_id'] = 'Story id is required.'
+    else:
+        try:
+            story_id = str(uuid.UUID(story_id))
+        except (TypeError, ValueError):
+            errors['story_id'] = 'Story id is invalid.'
+
+    if not context_type:
+        errors['type'] = 'Story context type is required.'
+    elif context_type not in {'reply', 'reaction'}:
+        errors['type'] = 'Story context type must be reply or reaction.'
+
+    if media_type and media_type not in {'image', 'video'}:
+        errors['media_type'] = 'Story media type must be image or video.'
+
+    if len(preview_label) > 120:
+        preview_label = preview_label[:120]
+
+    if errors:
+        return {}, errors
+
+    return {
+        'story_id': story_id,
+        'type': context_type,
+        'media_type': media_type,
+        'preview_label': preview_label,
+        'created_at': created_at,
+        'expires_at': expires_at,
     }, None
 
 
@@ -505,6 +558,7 @@ def create_direct_message(sender, parent_authorization, payload):
                 recipient_user_id=recipient_user_id,
                 text=normalized_payload['text'],
                 client_message_id=normalized_payload['client_message_id'],
+                story_context=normalized_payload['story_context'],
                 status=Message.STATUS_SENT,
                 delivery_blocked=delivery_blocked,
                 sent_while_blocked=delivery_blocked,
@@ -1190,6 +1244,7 @@ def serialize_message(message, current_user_id=None):
         'reply_to': serialize_reply_preview(message.reply_to, current_user_id) if message.reply_to_id else None,
         'text': message.text,
         'client_message_id': message.client_message_id,
+        'story_context': message.story_context or {},
         'status': message.status,
         'sent_while_blocked': is_sent_while_blocked_visible(message, current_user_id),
         'created_at': message.created_at.isoformat(),
@@ -1257,6 +1312,7 @@ def serialize_reply_preview(message, current_user_id=None):
         'sender_user_id': message.sender_user_id,
         'recipient_user_id': message.recipient_user_id,
         'text': message.text,
+        'story_context': message.story_context or {},
         'attachment_count': message.attachments.count(),
         'created_at': message.created_at.isoformat(),
     }

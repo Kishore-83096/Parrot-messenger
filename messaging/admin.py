@@ -83,6 +83,7 @@ class MessageAdmin(admin.ModelAdmin):
         'status',
         'delivery_blocked',
         'sent_while_blocked',
+        'story_context',
         'created_at',
     )
     list_filter = ('status', 'delivery_blocked', 'sent_while_blocked', 'created_at')
