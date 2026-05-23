@@ -760,8 +760,10 @@ class StoryUploadIntentTests(TestCase):
         message = Message.objects.get()
         self.assertEqual(message.sender_user_id, 1)
         self.assertEqual(message.recipient_user_id, 2)
+        self.assertEqual(message.text, '\u2764\ufe0f')
         self.assertEqual(message.story_context['type'], 'reaction')
         self.assertEqual(message.story_context['story_id'], str(story.id))
+        self.assertEqual(message.story_context['preview_label'], 'Story')
         self.assertEqual(StoryReaction.objects.get().message_id, message.id)
         body = response.json()
         self.assertEqual(body['result']['message_result']['message']['story_context']['type'], 'reaction')
@@ -789,7 +791,7 @@ class StoryUploadIntentTests(TestCase):
             data=json.dumps(
                 {
                     'client_message_id': 'story-reply-message-1',
-                    'text': 'Nice status',
+                    'text': 'Nice story',
                 }
             ),
             content_type='application/json',
@@ -799,7 +801,7 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Message.objects.count(), 1)
         message = Message.objects.get()
-        self.assertEqual(message.text, 'Nice status')
+        self.assertEqual(message.text, 'Nice story')
         self.assertEqual(message.story_context['type'], 'reply')
         self.assertEqual(message.story_context['media_type'], 'image')
         self.assertEqual(StoryReply.objects.get().message_id, message.id)

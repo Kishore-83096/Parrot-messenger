@@ -147,7 +147,7 @@ def normalize_story_context(value):
     story_id = normalize_string(value.get('story_id'))
     context_type = normalize_string(value.get('type'))
     media_type = normalize_string(value.get('media_type'))
-    preview_label = normalize_string(value.get('preview_label')) or 'Status'
+    preview_label = normalize_string(value.get('preview_label')) or 'Story'
     created_at = normalize_string(value.get('created_at'))
     expires_at = normalize_string(value.get('expires_at'))
 

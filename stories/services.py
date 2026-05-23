@@ -46,6 +46,17 @@ STORY_MEDIA_TYPE_PREFIXES = {
     STORY_MEDIA_VIDEO: 'video/',
 }
 STORY_ALLOWED_EXPIRY_HOURS = {6, 12, 24}
+STORY_REACTION_MESSAGE_TEXT = {
+    StoryReaction.REACTION_THUMBS_UP: '\U0001F44D',
+    StoryReaction.REACTION_HEART: '\u2764\ufe0f',
+    StoryReaction.REACTION_LAUGH: '\U0001F602',
+    StoryReaction.REACTION_SURPRISED: '\U0001F62E',
+    StoryReaction.REACTION_SAD: '\U0001F622',
+}
+
+
+def get_story_reaction_message_text(reaction):
+    return STORY_REACTION_MESSAGE_TEXT.get(reaction, reaction)
 
 
 def create_story_media_upload_intents(sender, parent_audience, payload):
@@ -641,7 +652,10 @@ def react_to_story(sender, story_id, payload):
         parent_policy,
         {
             'client_message_id': normalized_payload['client_message_id'],
-            'text': normalized_payload['text'] or normalized_payload['reaction'],
+            'text': (
+                normalized_payload['text']
+                or get_story_reaction_message_text(normalized_payload['reaction'])
+            ),
             'story_context': build_story_context(story, 'reaction'),
         },
     )
@@ -912,7 +926,7 @@ def build_story_context(story, context_type):
         'story_id': str(story.id),
         'type': context_type,
         'media_type': first_media.media_type if first_media else '',
-        'preview_label': 'Status',
+        'preview_label': 'Story',
         'created_at': story.created_at.isoformat(),
         'expires_at': story.expires_at.isoformat(),
     }
