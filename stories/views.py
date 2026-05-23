@@ -2,16 +2,22 @@ import json
 
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from messaging.auth import validate_messaging_token
-from messaging.realtime import broadcast_participant_event, broadcast_room_event
+from messaging.realtime import (
+    broadcast_participant_event,
+    broadcast_room_event,
+    broadcast_user_event,
+)
 
+from .models import StoryAudience
 from .policy import resolve_parent_story_audience
 from .services import (
     complete_story_media_upload_intent,
     create_story_from_upload_intents,
     create_story_media_upload_intents,
+    delete_story,
     list_my_stories,
     list_story_feed,
     list_story_viewers,
@@ -131,6 +137,8 @@ def create_story(request):
         parent_policy,
         normalized_payload,
     )
+    if response_status == 201:
+        broadcast_story_created(result, sender)
 
     return JsonResponse(
         {
@@ -183,6 +191,28 @@ def my_stories(request):
 
 
 @csrf_exempt
+@require_http_methods(['DELETE'])
+def story_delete(request, story_id):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = delete_story(sender, story_id)
+    if response_status == 200 and result.get('deleted'):
+        broadcast_story_deleted(result, sender)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'user': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
 @require_POST
 def story_view(request, story_id):
     sender, error_response = get_authenticated_sender(request)
@@ -190,6 +220,8 @@ def story_view(request, story_id):
         return error_response
 
     result, response_status = mark_story_viewed(sender, story_id)
+    if response_status == 201:
+        broadcast_story_viewed(result, sender)
 
     return JsonResponse(
         {
@@ -268,6 +300,78 @@ def story_reply(request, story_id):
             'result': sanitize_policy_result(result),
         },
         status=response_status,
+    )
+
+
+def broadcast_story_created(result, sender):
+    if not isinstance(result, dict) or result.get('status') != 'ok':
+        return
+
+    story = result.get('story')
+    if not isinstance(story, dict) or not story.get('id'):
+        return
+
+    audience_user_ids = StoryAudience.objects.filter(
+        story_id=story['id'],
+    ).values_list('viewer_user_id', flat=True).distinct()
+    event_payload = {
+        'story': story,
+        'owner': sender,
+    }
+
+    for user_id in audience_user_ids:
+        if int(user_id) == int(sender['user_id']):
+            continue
+
+        broadcast_user_event(user_id, 'story.created', event_payload)
+
+
+def broadcast_story_deleted(result, sender):
+    if not isinstance(result, dict) or result.get('status') != 'ok':
+        return
+
+    story_id = result.get('story_id')
+    if not story_id:
+        return
+
+    event_payload = {
+        'story_id': story_id,
+        'story': result.get('story'),
+        'owner': sender,
+        'deleted_at': result.get('deleted_at'),
+    }
+
+    for user_id in result.get('audience_user_ids') or []:
+        if int(user_id) == int(sender['user_id']):
+            continue
+
+        broadcast_user_event(user_id, 'story.deleted', event_payload)
+
+
+def broadcast_story_viewed(result, sender):
+    if not isinstance(result, dict) or result.get('status') != 'ok':
+        return
+
+    owner_user_id = result.get('owner_user_id')
+    if not owner_user_id or int(owner_user_id) == int(sender['user_id']):
+        return
+
+    broadcast_user_event(
+        owner_user_id,
+        'story.viewed',
+        {
+            'story_id': result.get('story_id'),
+            'view_count': result.get('view_count'),
+            'viewer': {
+                'user_id': sender['user_id'],
+                'account_number': (
+                    result.get('viewer_account_number')
+                    or sender.get('account_number')
+                    or ''
+                ),
+                'viewed_at': result.get('viewed_at'),
+            },
+        },
     )
 
 

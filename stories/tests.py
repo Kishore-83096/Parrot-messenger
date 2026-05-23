@@ -19,9 +19,11 @@ from .models import (
     StoryView,
 )
 from .services import (
+    cleanup_stories,
     complete_story_media_upload_intent,
     create_story_from_upload_intents,
     create_story_media_upload_intents,
+    mark_expired_stories,
 )
 
 
@@ -312,6 +314,48 @@ class StoryUploadIntentTests(TestCase):
             }
         )
 
+    @patch('stories.views.broadcast_user_event')
+    @patch('stories.views.resolve_parent_story_audience')
+    def test_create_story_api_broadcasts_story_created_to_audience(
+        self,
+        resolve_policy,
+        broadcast_user_event,
+    ):
+        intent = self.completed_upload_intent(client_story_id='story-client-broadcast')
+        resolve_policy.return_value = (
+            {
+                'ok': True,
+                'parent': {
+                    'response': self.parent_audience,
+                    'status_code': 200,
+                },
+            },
+            200,
+        )
+
+        response = self.client.post(
+            '/stories/',
+            data=json.dumps(
+                {
+                    'client_story_id': 'story-client-broadcast',
+                    'expiry_hours': 12,
+                    'visibility': 'specific_contacts',
+                    'audience_account_numbers': ['7000000002'],
+                    'encrypted_upload_intent_ids': [str(intent.id)],
+                }
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        broadcast_user_event.assert_called_once()
+        user_id, event_type, payload = broadcast_user_event.call_args.args
+        self.assertEqual(user_id, 2)
+        self.assertEqual(event_type, 'story.created')
+        self.assertEqual(payload['owner']['user_id'], 1)
+        self.assertEqual(payload['story']['client_story_id'], 'story-client-broadcast')
+
     @patch('stories.services.authorize_parent_story_visibility')
     def test_story_feed_groups_visible_contacts_and_marks_viewed(self, authorize_visibility):
         visible_story = self.create_feed_story(
@@ -425,6 +469,143 @@ class StoryUploadIntentTests(TestCase):
         self.assertGreater(stories[0]['expires_in_seconds'], 0)
         self.assertEqual(stories[0]['media_preview'][0]['media_type'], 'image')
 
+    @patch('stories.views.broadcast_user_event')
+    def test_delete_story_marks_owner_story_deleted_and_broadcasts(
+        self,
+        broadcast_user_event,
+    ):
+        story = self.create_feed_story(
+            owner_user_id=1,
+            owner_account_number='7000000001',
+            client_story_id='delete-my-story',
+        )
+        StoryAudience.objects.filter(story=story).delete()
+        StoryAudience.objects.create(
+            story=story,
+            viewer_user_id=2,
+            viewer_account_number='7000000002',
+        )
+
+        response = self.client.delete(
+            f'/stories/{story.id}/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['status'], 'ok')
+        self.assertTrue(body['result']['deleted'])
+        story.refresh_from_db()
+        self.assertEqual(story.status, Story.STATUS_DELETED)
+        self.assertIsNotNone(story.deleted_at)
+        broadcast_user_event.assert_called_once()
+        user_id, event_type, payload = broadcast_user_event.call_args.args
+        self.assertEqual(user_id, 2)
+        self.assertEqual(event_type, 'story.deleted')
+        self.assertEqual(payload['story_id'], str(story.id))
+
+    def test_delete_story_requires_owner(self):
+        story = self.create_feed_story(
+            owner_user_id=1,
+            owner_account_number='7000000001',
+            client_story_id='delete-other-owner-story',
+        )
+
+        response = self.client.delete(
+            f'/stories/{story.id}/',
+            HTTP_AUTHORIZATION=self.auth_header(
+                user_id=2,
+                account_number='7000000002',
+            ),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        story.refresh_from_db()
+        self.assertEqual(story.status, Story.STATUS_ACTIVE)
+
+    def test_mark_expired_stories_updates_only_expired_active_stories(self):
+        expired_story = self.create_feed_story(
+            owner_user_id=1,
+            owner_account_number='7000000001',
+            client_story_id='expired-status-story',
+        )
+        active_story = self.create_feed_story(
+            owner_user_id=1,
+            owner_account_number='7000000001',
+            client_story_id='active-status-story',
+        )
+        expired_story.expires_at = timezone.now() - timedelta(minutes=5)
+        expired_story.save(update_fields=['expires_at', 'updated_at'])
+
+        expired_count = mark_expired_stories()
+
+        self.assertEqual(expired_count, 1)
+        expired_story.refresh_from_db()
+        active_story.refresh_from_db()
+        self.assertEqual(expired_story.status, Story.STATUS_EXPIRED)
+        self.assertEqual(active_story.status, Story.STATUS_ACTIVE)
+
+    @patch('stories.services.cloudinary_uploader.destroy')
+    def test_cleanup_stories_marks_expired_and_cleans_retained_media(
+        self,
+        cloudinary_destroy,
+    ):
+        story = self.create_feed_story(
+            owner_user_id=1,
+            owner_account_number='7000000001',
+            client_story_id='cleanup-status-story',
+        )
+        story.expires_at = timezone.now() - timedelta(days=8)
+        story.save(update_fields=['expires_at', 'updated_at'])
+        media = story.media.first()
+        StoryMedia.objects.filter(id=media.id).update(
+            cloudinary_public_id='MAIN/e2ee/stories/user-1/cleanup-status-story.txt',
+            cloudinary_resource_type='raw',
+        )
+
+        result = cleanup_stories(retention_days=7, media_limit=10)
+
+        story.refresh_from_db()
+        media.refresh_from_db()
+        self.assertEqual(result['expired_stories'], 1)
+        self.assertEqual(result['media_candidates'], 1)
+        self.assertEqual(result['media_cleaned'], 1)
+        self.assertEqual(story.status, Story.STATUS_EXPIRED)
+        self.assertEqual(media.encrypted_file_url, '')
+        cloudinary_destroy.assert_called_once_with(
+            'MAIN/e2ee/stories/user-1/cleanup-status-story.txt',
+            resource_type='raw',
+        )
+
+    @patch('stories.services.cloudinary_uploader.destroy')
+    def test_cleanup_stories_deletes_expired_media_immediately_by_default(
+        self,
+        cloudinary_destroy,
+    ):
+        story = self.create_feed_story(
+            owner_user_id=1,
+            owner_account_number='7000000001',
+            client_story_id='cleanup-immediate-status-story',
+        )
+        story.expires_at = timezone.now() - timedelta(seconds=1)
+        story.save(update_fields=['expires_at', 'updated_at'])
+        media = story.media.first()
+        StoryMedia.objects.filter(id=media.id).update(
+            cloudinary_public_id='MAIN/e2ee/stories/user-1/cleanup-immediate-status-story.txt',
+            cloudinary_resource_type='raw',
+        )
+
+        result = cleanup_stories(media_limit=10)
+
+        media.refresh_from_db()
+        self.assertEqual(result['expired_stories'], 1)
+        self.assertEqual(result['media_cleaned'], 1)
+        self.assertEqual(media.encrypted_file_url, '')
+        cloudinary_destroy.assert_called_once_with(
+            'MAIN/e2ee/stories/user-1/cleanup-immediate-status-story.txt',
+            resource_type='raw',
+        )
+
     @patch('stories.services.authorize_parent_story_visibility')
     def test_mark_story_viewed_records_view_once(self, authorize_visibility):
         story = self.create_feed_story(
@@ -461,6 +642,46 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(StoryView.objects.filter(story=story, viewer_user_id=1).count(), 1)
         self.assertTrue(first_response.json()['result']['created'])
         self.assertFalse(second_response.json()['result']['created'])
+
+    @patch('stories.views.broadcast_user_event')
+    @patch('stories.services.authorize_parent_story_visibility')
+    def test_mark_story_viewed_broadcasts_owner_event(
+        self,
+        authorize_visibility,
+        broadcast_user_event,
+    ):
+        story = self.create_feed_story(
+            owner_user_id=2,
+            owner_account_number='7000000002',
+            client_story_id='view-broadcast-story',
+        )
+        authorize_visibility.return_value = (
+            {
+                'ok': True,
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'viewer_user_id': 1,
+                        'viewer_account_number': '7000000001',
+                    },
+                    'status_code': 200,
+                },
+            },
+            200,
+        )
+
+        response = self.client.post(
+            f'/stories/{story.id}/view/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        broadcast_user_event.assert_called_once()
+        owner_user_id, event_type, payload = broadcast_user_event.call_args.args
+        self.assertEqual(owner_user_id, 2)
+        self.assertEqual(event_type, 'story.viewed')
+        self.assertEqual(payload['story_id'], str(story.id))
+        self.assertEqual(payload['viewer']['user_id'], 1)
 
     @patch('stories.services.authorize_parent_story_visibility')
     def test_mark_story_viewed_requires_story_audience(self, authorize_visibility):

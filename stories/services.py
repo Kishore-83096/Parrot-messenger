@@ -37,6 +37,8 @@ from .policy import authorize_parent_story_visibility
 
 
 MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST = 10
+DEFAULT_EXPIRED_STORY_MEDIA_RETENTION_DAYS = 0
+DEFAULT_EXPIRED_STORY_MEDIA_CLEANUP_LIMIT = 100
 STORY_MEDIA_IMAGE = StoryUploadIntent.MEDIA_IMAGE
 STORY_MEDIA_VIDEO = StoryUploadIntent.MEDIA_VIDEO
 STORY_MEDIA_TYPE_PREFIXES = {
@@ -431,6 +433,55 @@ def list_my_stories(sender):
     }, 200
 
 
+def delete_story(sender, story_id):
+    try:
+        story_uuid = uuid.UUID(str(story_id))
+    except (TypeError, ValueError):
+        return validation_error({'story_id': ['Story id is invalid.']})
+
+    story = (
+        Story.objects.filter(id=story_uuid)
+        .prefetch_related('audience', 'media')
+        .first()
+    )
+    if not story or story.status == Story.STATUS_DELETED:
+        return {
+            'status': 'error',
+            'message': 'Story was not found.',
+        }, 404
+
+    if story.owner_user_id != sender['user_id']:
+        return {
+            'status': 'denied',
+            'reason': 'story_owner_required',
+            'message': 'Only the story owner can delete this story.',
+        }, 403
+
+    now = timezone.now()
+    Story.objects.filter(id=story.id).update(
+        status=Story.STATUS_DELETED,
+        deleted_at=now,
+        updated_at=now,
+    )
+    story.status = Story.STATUS_DELETED
+    story.deleted_at = now
+    story.updated_at = now
+
+    return {
+        'status': 'ok',
+        'story_id': str(story.id),
+        'owner_user_id': story.owner_user_id,
+        'owner_account_number': story.owner_account_number,
+        'deleted': True,
+        'deleted_at': now.isoformat(),
+        'audience_user_ids': [
+            audience.viewer_user_id
+            for audience in story.audience.all()
+        ],
+        'story': serialize_story(story, include_audience=True),
+    }, 200
+
+
 def mark_story_viewed(sender, story_id):
     try:
         story_uuid = uuid.UUID(str(story_id))
@@ -457,6 +508,8 @@ def mark_story_viewed(sender, story_id):
         return {
             'status': 'ok',
             'story_id': str(story.id),
+            'owner_user_id': story.owner_user_id,
+            'owner_account_number': story.owner_account_number,
             'viewed': False,
             'created': False,
             'is_owner': True,
@@ -515,6 +568,8 @@ def mark_story_viewed(sender, story_id):
     return {
         'status': 'ok',
         'story_id': str(story.id),
+        'owner_user_id': story.owner_user_id,
+        'owner_account_number': story.owner_account_number,
         'viewer_user_id': sender['user_id'],
         'viewer_account_number': view.viewer_account_number,
         'viewed': True,
@@ -1252,6 +1307,151 @@ def expire_story_upload_intent(intent, cleanup_cloudinary=True):
     intent.save(update_fields=['status', 'updated_at'])
 
 
+def cleanup_stories(retention_days=None, media_limit=None, dry_run=False, now=None):
+    now = now or timezone.now()
+    expired_story_candidates = get_expired_story_queryset(now).count()
+    expired_stories = 0
+
+    if not dry_run:
+        expired_stories = mark_expired_stories(now=now)
+
+    media_result = cleanup_expired_story_media(
+        retention_days=retention_days,
+        limit=media_limit,
+        dry_run=dry_run,
+        now=now,
+    )
+
+    return {
+        'expired_story_candidates': expired_story_candidates,
+        'expired_stories': expired_stories,
+        **media_result,
+    }
+
+
+def mark_expired_stories(now=None, limit=None):
+    now = now or timezone.now()
+    queryset = get_expired_story_queryset(now)
+    normalized_limit = normalize_non_negative_int(limit)
+
+    if normalized_limit is not None:
+        if normalized_limit <= 0:
+            return 0
+
+        story_ids = list(
+            queryset.order_by('expires_at', 'created_at')
+            .values_list('id', flat=True)[:normalized_limit]
+        )
+        if not story_ids:
+            return 0
+
+        queryset = Story.objects.filter(id__in=story_ids)
+
+    return queryset.update(status=Story.STATUS_EXPIRED, updated_at=now)
+
+
+def get_expired_story_queryset(now):
+    return Story.objects.filter(
+        status=Story.STATUS_ACTIVE,
+        expires_at__lte=now,
+    )
+
+
+def cleanup_expired_story_media(retention_days=None, limit=None, dry_run=False, now=None):
+    now = now or timezone.now()
+    retention_days = get_expired_story_media_retention_days(retention_days)
+    cutoff = now - timedelta(days=retention_days)
+    normalized_limit = get_expired_story_media_cleanup_limit(limit)
+
+    if normalized_limit <= 0:
+        return {
+            'media_candidates': 0,
+            'media_cleaned': 0,
+            'cloudinary_errors': [],
+        }
+
+    media_queryset = (
+        StoryMedia.objects.filter(story__expires_at__lte=cutoff)
+        .exclude(encrypted_file_url='')
+        .order_by('story__expires_at', 'created_at', 'id')
+    )
+    media_items = list(media_queryset[:normalized_limit])
+
+    if dry_run:
+        return {
+            'media_candidates': len(media_items),
+            'media_cleaned': 0,
+            'cloudinary_errors': [],
+        }
+
+    cleaned_media_ids = []
+    cloudinary_errors = []
+    for media in media_items:
+        if media.cloudinary_public_id:
+            try:
+                cloudinary_uploader.destroy(
+                    media.cloudinary_public_id,
+                    resource_type=media.cloudinary_resource_type or 'raw',
+                )
+            except CloudinaryError as error:
+                cloudinary_errors.append(
+                    {
+                        'media_id': media.id,
+                        'cloudinary_public_id': media.cloudinary_public_id,
+                        'message': str(error),
+                    }
+                )
+                continue
+
+        cleaned_media_ids.append(media.id)
+
+    if cleaned_media_ids:
+        StoryMedia.objects.filter(id__in=cleaned_media_ids).update(
+            encrypted_file_url='',
+            thumbnail_url='',
+            cloudinary_public_id='',
+            cloudinary_asset_id='',
+            cloudinary_resource_type='',
+            cloudinary_folder='',
+        )
+
+    return {
+        'media_candidates': len(media_items),
+        'media_cleaned': len(cleaned_media_ids),
+        'cloudinary_errors': cloudinary_errors,
+    }
+
+
+def get_expired_story_media_retention_days(retention_days=None):
+    if retention_days is None:
+        retention_days = getattr(
+            settings,
+            'STORIES_EXPIRED_MEDIA_RETENTION_DAYS',
+            DEFAULT_EXPIRED_STORY_MEDIA_RETENTION_DAYS,
+        )
+
+    normalized_retention_days = normalize_non_negative_int(retention_days)
+    if normalized_retention_days is None:
+        return DEFAULT_EXPIRED_STORY_MEDIA_RETENTION_DAYS
+
+    return normalized_retention_days
+
+
+def get_expired_story_media_cleanup_limit(limit=None):
+    if limit is None:
+        limit = getattr(
+            settings,
+            'STORIES_EXPIRED_MEDIA_CLEANUP_LIMIT',
+            DEFAULT_EXPIRED_STORY_MEDIA_CLEANUP_LIMIT,
+        )
+
+    normalized_limit = normalize_non_negative_int(limit)
+    if normalized_limit is None:
+        return DEFAULT_EXPIRED_STORY_MEDIA_CLEANUP_LIMIT
+
+    return normalized_limit
+
+
 def serialize_completed_story_upload_intent(intent):
     return {
         'upload_intent_id': str(intent.id),
@@ -1283,6 +1483,7 @@ def serialize_story(story, viewed_story_ids=None, include_audience=False):
         'encrypted_payload': story.encrypted_payload,
         'status': story.status,
         'expires_at': story.expires_at.isoformat(),
+        'deleted_at': story.deleted_at.isoformat() if story.deleted_at else None,
         'created_at': story.created_at.isoformat(),
         'updated_at': story.updated_at.isoformat(),
         'viewed': story.id in viewed_story_ids,
