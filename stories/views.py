@@ -18,13 +18,17 @@ from .services import (
     create_story_from_upload_intents,
     create_story_media_upload_intents,
     delete_story,
+    get_story_settings,
+    get_story_settings_default_values,
     list_my_stories,
     list_story_feed,
     list_story_viewers,
     mark_story_viewed,
     normalize_create_story_payload,
+    normalize_story_settings_payload,
     react_to_story,
     reply_to_story,
+    update_story_settings,
 )
 
 
@@ -100,7 +104,11 @@ def create_story(request):
     if error_response:
         return error_response
 
-    normalized_payload, errors = normalize_create_story_payload(payload)
+    story_settings_defaults = get_story_settings_default_values(sender)
+    normalized_payload, errors = normalize_create_story_payload(
+        payload,
+        settings_defaults=story_settings_defaults,
+    )
     if errors:
         return JsonResponse(
             {
@@ -139,6 +147,83 @@ def create_story(request):
     )
     if response_status == 201:
         broadcast_story_created(result, sender)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'policy': sanitize_policy_result(parent_policy),
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_http_methods(['GET', 'POST', 'PUT', 'PATCH'])
+def story_settings(request):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    if request.method == 'GET':
+        result, response_status = get_story_settings(sender)
+        return JsonResponse(
+            {
+                'status': result.get('status', 'error'),
+                'service': 'messenger',
+                'user': sender,
+                'result': result,
+            },
+            status=response_status,
+        )
+
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    current_settings_defaults = get_story_settings_default_values(sender)
+    normalized_payload, errors = normalize_story_settings_payload(
+        payload,
+        current_settings=current_settings_defaults,
+    )
+    if errors:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'sender': sender,
+                'result': {
+                    'status': 'error',
+                    'errors': errors,
+                },
+            },
+            status=400,
+        )
+
+    policy_payload = {
+        'owner_user_id': sender['user_id'],
+        'audience_account_numbers': normalized_payload['audience_account_numbers'] or None,
+    }
+    policy_result, policy_status = resolve_parent_story_audience(policy_payload)
+    parent_policy = policy_result.get('parent', {}).get('response')
+    if not isinstance(parent_policy, dict) or parent_policy.get('allowed') is not True:
+        return JsonResponse(
+            {
+                'status': get_policy_status(policy_result, policy_status),
+                'service': 'messenger',
+                'sender': sender,
+                'policy': sanitize_policy_result(policy_result),
+            },
+            status=policy_status,
+        )
+
+    result, response_status = update_story_settings(
+        sender,
+        parent_policy,
+        normalized_payload,
+    )
 
     return JsonResponse(
         {
@@ -408,9 +493,17 @@ def create_story_upload_intents(request):
     if error_response:
         return error_response
 
+    story_settings_defaults = get_story_settings_default_values(sender)
+    audience_account_numbers = payload.get('audience_account_numbers')
+    if (
+        audience_account_numbers is None
+        and story_settings_defaults.get('visibility') == 'specific_contacts'
+    ):
+        audience_account_numbers = story_settings_defaults.get('audience_account_numbers')
+
     policy_payload = {
         'owner_user_id': sender['user_id'],
-        'audience_account_numbers': payload.get('audience_account_numbers'),
+        'audience_account_numbers': audience_account_numbers,
     }
     policy_result, policy_status = resolve_parent_story_audience(policy_payload)
     parent_policy = policy_result.get('parent', {}).get('response')

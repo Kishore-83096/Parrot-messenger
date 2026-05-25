@@ -15,6 +15,7 @@ from .models import (
     StoryMedia,
     StoryReaction,
     StoryReply,
+    StorySettings,
     StoryUploadIntent,
     StoryView,
 )
@@ -314,6 +315,161 @@ class StoryUploadIntentTests(TestCase):
             }
         )
 
+    @patch('stories.views.resolve_parent_story_audience')
+    def test_story_settings_api_persists_owner_defaults(self, resolve_policy):
+        resolve_policy.return_value = (
+            {
+                'ok': True,
+                'parent': {
+                    'response': self.parent_audience,
+                    'status_code': 200,
+                },
+            },
+            200,
+        )
+
+        response = self.client.put(
+            '/stories/settings/',
+            data=json.dumps(
+                {
+                    'expiry_hours': 6,
+                    'visibility': 'specific_contacts',
+                    'audience_account_numbers': ['7000000002'],
+                }
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['status'], 'ok')
+        self.assertEqual(body['result']['settings']['expiry_hours'], 6)
+        self.assertEqual(
+            body['result']['settings']['audience_account_numbers'],
+            ['7000000002'],
+        )
+        settings_row = StorySettings.objects.get(owner_user_id=1)
+        self.assertEqual(settings_row.visibility, Story.VISIBILITY_SPECIFIC_CONTACTS)
+        self.assertEqual(settings_row.expiry_hours, 6)
+        self.assertEqual(settings_row.audience_account_numbers, ['7000000002'])
+        resolve_policy.assert_called_once_with(
+            {
+                'owner_user_id': 1,
+                'audience_account_numbers': ['7000000002'],
+            }
+        )
+
+        get_response = self.client.get(
+            '/stories/settings/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        self.assertEqual(get_response.status_code, 200)
+        self.assertEqual(
+            get_response.json()['result']['settings']['visibility'],
+            Story.VISIBILITY_SPECIFIC_CONTACTS,
+        )
+
+    @patch('stories.views.resolve_parent_story_audience')
+    def test_create_story_api_uses_saved_settings_when_fields_are_missing(
+        self,
+        resolve_policy,
+    ):
+        StorySettings.objects.create(
+            owner_user_id=1,
+            owner_account_number='7000000001',
+            expiry_hours=6,
+            visibility=Story.VISIBILITY_SPECIFIC_CONTACTS,
+            audience_account_numbers=['7000000002'],
+        )
+        intent = self.completed_upload_intent(client_story_id='story-client-settings')
+        resolve_policy.return_value = (
+            {
+                'ok': True,
+                'parent': {
+                    'response': self.parent_audience,
+                    'status_code': 200,
+                },
+            },
+            200,
+        )
+
+        response = self.client.post(
+            '/stories/',
+            data=json.dumps(
+                {
+                    'client_story_id': 'story-client-settings',
+                    'encrypted_upload_intent_ids': [str(intent.id)],
+                }
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        story = Story.objects.get(client_story_id='story-client-settings')
+        self.assertEqual(story.expiry_hours, 6)
+        self.assertEqual(story.visibility, Story.VISIBILITY_SPECIFIC_CONTACTS)
+        self.assertEqual(StoryAudience.objects.filter(story=story).count(), 1)
+        resolve_policy.assert_called_once_with(
+            {
+                'owner_user_id': 1,
+                'audience_account_numbers': ['7000000002'],
+            }
+        )
+
+    @patch('stories.views.resolve_parent_story_audience')
+    def test_create_text_story_api_without_upload_intents(self, resolve_policy):
+        resolve_policy.return_value = (
+            {
+                'ok': True,
+                'parent': {
+                    'response': self.parent_audience,
+                    'status_code': 200,
+                },
+            },
+            200,
+        )
+
+        response = self.client.post(
+            '/stories/',
+            data=json.dumps(
+                {
+                    'client_story_id': 'story-client-text',
+                    'story_type': 'text',
+                    'expiry_hours': 12,
+                    'visibility': 'specific_contacts',
+                    'audience_account_numbers': ['7000000002'],
+                    'encrypted_payload': json.dumps(
+                        {
+                            'type': 'parrot.story.text',
+                            'v': 1,
+                            'text': 'Text board story',
+                            'background': 'lavender',
+                        }
+                    ),
+                    'encrypted_upload_intent_ids': [],
+                }
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body['status'], 'ok')
+        self.assertEqual(body['result']['story']['story_type'], Story.STORY_TYPE_TEXT)
+        story = Story.objects.get(client_story_id='story-client-text')
+        self.assertEqual(story.story_type, Story.STORY_TYPE_TEXT)
+        self.assertEqual(StoryMedia.objects.filter(story=story).count(), 0)
+        self.assertEqual(StoryAudience.objects.filter(story=story).count(), 1)
+        resolve_policy.assert_called_once_with(
+            {
+                'owner_user_id': 1,
+                'audience_account_numbers': ['7000000002'],
+            }
+        )
+
     @patch('stories.views.broadcast_user_event')
     @patch('stories.views.resolve_parent_story_audience')
     def test_create_story_api_broadcasts_story_created_to_audience(
@@ -398,6 +554,7 @@ class StoryUploadIntentTests(TestCase):
                             'allowed': True,
                             'viewer_contact': {
                                 'alias_name': 'Visible Contact',
+                                'profile_picture': 'https://cdn.example.test/visible.png',
                             },
                         },
                         'status_code': 200,
@@ -420,6 +577,10 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(len(contacts), 1)
         self.assertEqual(contacts[0]['user_id'], 2)
         self.assertEqual(contacts[0]['contact']['alias_name'], 'Visible Contact')
+        self.assertEqual(
+            contacts[0]['contact']['profile_picture'],
+            'https://cdn.example.test/visible.png',
+        )
         self.assertEqual(contacts[0]['unviewed_count'], 0)
         self.assertTrue(contacts[0]['stories'][0]['viewed'])
 

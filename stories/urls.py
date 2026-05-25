@@ -9,6 +9,7 @@ from .views import (
     story_feed,
     story_reaction,
     story_reply,
+    story_settings,
     story_view,
     story_viewers,
 )
@@ -18,6 +19,7 @@ urlpatterns = [
     path('', create_story, name='story-create'),
     path('feed/', story_feed, name='story-feed'),
     path('mine/', my_stories, name='story-mine'),
+    path('settings/', story_settings, name='story-settings'),
     path('upload-intents/', create_story_upload_intents, name='story-upload-intent-create'),
     path(
         'upload-intents/<uuid:upload_intent_id>/complete/',

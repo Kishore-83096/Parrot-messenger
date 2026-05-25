@@ -6,6 +6,7 @@ from .models import (
     StoryMedia,
     StoryReaction,
     StoryReply,
+    StorySettings,
     StoryUploadIntent,
     StoryView,
 )
@@ -29,13 +30,14 @@ class StoryAdmin(admin.ModelAdmin):
         'id',
         'owner_user_id',
         'owner_account_number',
+        'story_type',
         'visibility',
         'expiry_hours',
         'status',
         'expires_at',
         'created_at',
     )
-    list_filter = ('visibility', 'expiry_hours', 'status', 'created_at')
+    list_filter = ('story_type', 'visibility', 'expiry_hours', 'status', 'created_at')
     search_fields = ('id', 'owner_user_id', 'owner_account_number', 'client_story_id')
     readonly_fields = ('id', 'created_at', 'updated_at')
     inlines = [StoryMediaInline, StoryAudienceInline]
@@ -61,6 +63,21 @@ class StoryUploadIntentAdmin(admin.ModelAdmin):
         'cloudinary_public_id',
     )
     readonly_fields = ('id', 'created_at', 'updated_at')
+
+
+@admin.register(StorySettings)
+class StorySettingsAdmin(admin.ModelAdmin):
+    list_display = (
+        'id',
+        'owner_user_id',
+        'owner_account_number',
+        'visibility',
+        'expiry_hours',
+        'updated_at',
+    )
+    list_filter = ('visibility', 'expiry_hours', 'updated_at')
+    search_fields = ('owner_user_id', 'owner_account_number')
+    readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(StoryMedia)

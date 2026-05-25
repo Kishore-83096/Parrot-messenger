@@ -6,6 +6,13 @@ from django.db.models import Q
 
 
 class Story(models.Model):
+    STORY_TYPE_MEDIA = 'media'
+    STORY_TYPE_TEXT = 'text'
+    STORY_TYPE_CHOICES = [
+        (STORY_TYPE_MEDIA, 'Media'),
+        (STORY_TYPE_TEXT, 'Text'),
+    ]
+
     VISIBILITY_ALL_CONTACTS = 'all_contacts'
     VISIBILITY_SPECIFIC_CONTACTS = 'specific_contacts'
     VISIBILITY_CHOICES = [
@@ -35,6 +42,11 @@ class Story(models.Model):
     owner_user_id = models.PositiveBigIntegerField(db_index=True)
     owner_account_number = models.CharField(max_length=10, db_index=True)
     client_story_id = models.CharField(max_length=120, blank=True, db_index=True)
+    story_type = models.CharField(
+        max_length=20,
+        choices=STORY_TYPE_CHOICES,
+        default=STORY_TYPE_MEDIA,
+    )
     visibility = models.CharField(
         max_length=30,
         choices=VISIBILITY_CHOICES,
@@ -63,18 +75,72 @@ class Story(models.Model):
                 condition=Q(expiry_hours__in=[6, 12, 24]),
                 name='ck_story_expiry_hours_allowed',
             ),
+            models.CheckConstraint(
+                condition=Q(story_type__in=['media', 'text']),
+                name='ck_story_type_allowed',
+            ),
         ]
         indexes = [
             models.Index(fields=['owner_user_id', 'created_at']),
             models.Index(fields=['owner_user_id', 'expires_at']),
             models.Index(fields=['owner_account_number', 'expires_at']),
             models.Index(fields=['status', 'expires_at']),
+            models.Index(fields=['story_type', 'status']),
             models.Index(fields=['visibility', 'status']),
         ]
         ordering = ['-created_at', '-id']
 
     def __str__(self):
         return f'story {self.id} by user {self.owner_user_id}'
+
+
+class StorySettings(models.Model):
+    owner_user_id = models.PositiveBigIntegerField(unique=True)
+    owner_account_number = models.CharField(max_length=10, db_index=True)
+    expiry_hours = models.PositiveSmallIntegerField(
+        choices=Story.EXPIRY_CHOICES,
+        default=Story.EXPIRY_24_HOURS,
+    )
+    visibility = models.CharField(
+        max_length=30,
+        choices=Story.VISIBILITY_CHOICES,
+        default=Story.VISIBILITY_ALL_CONTACTS,
+    )
+    audience_account_numbers = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(expiry_hours__in=[6, 12, 24]),
+                name='ck_story_settings_expiry_hours_allowed',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['owner_account_number']),
+            models.Index(fields=['visibility', 'updated_at']),
+        ]
+        ordering = ['-updated_at', '-id']
+
+    def clean(self):
+        super().clean()
+
+        if self.visibility not in dict(Story.VISIBILITY_CHOICES):
+            raise ValidationError({'visibility': 'Story visibility is invalid.'})
+
+        if self.expiry_hours not in [6, 12, 24]:
+            raise ValidationError({'expiry_hours': 'Story expiry must be 6, 12, or 24 hours.'})
+
+        if not isinstance(self.audience_account_numbers, list):
+            raise ValidationError({'audience_account_numbers': 'Audience account numbers must be a list.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'story settings for user {self.owner_user_id}'
 
 
 class StoryUploadIntent(models.Model):

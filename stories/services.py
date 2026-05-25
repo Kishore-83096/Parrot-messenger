@@ -30,6 +30,7 @@ from .models import (
     StoryMedia,
     StoryReaction,
     StoryReply,
+    StorySettings,
     StoryUploadIntent,
     StoryView,
 )
@@ -45,7 +46,12 @@ STORY_MEDIA_TYPE_PREFIXES = {
     STORY_MEDIA_IMAGE: 'image/',
     STORY_MEDIA_VIDEO: 'video/',
 }
+STORY_ALLOWED_TYPES = {
+    Story.STORY_TYPE_MEDIA,
+    Story.STORY_TYPE_TEXT,
+}
 STORY_ALLOWED_EXPIRY_HOURS = {6, 12, 24}
+STORY_TEXT_PAYLOAD_MAX_LENGTH = 12000
 STORY_REACTION_MESSAGE_TEXT = {
     StoryReaction.REACTION_THUMBS_UP: '\U0001F44D',
     StoryReaction.REACTION_HEART: '\u2764\ufe0f',
@@ -57,6 +63,81 @@ STORY_REACTION_MESSAGE_TEXT = {
 
 def get_story_reaction_message_text(reaction):
     return STORY_REACTION_MESSAGE_TEXT.get(reaction, reaction)
+
+
+def get_or_create_story_settings(sender):
+    settings_row, _created = StorySettings.objects.get_or_create(
+        owner_user_id=sender['user_id'],
+        defaults={
+            'owner_account_number': sender.get('account_number') or '',
+        },
+    )
+    owner_account_number = sender.get('account_number') or settings_row.owner_account_number
+    if owner_account_number and settings_row.owner_account_number != owner_account_number:
+        settings_row.owner_account_number = owner_account_number
+        settings_row.save(update_fields=['owner_account_number', 'updated_at'])
+
+    return settings_row
+
+
+def get_story_settings_default_values(sender):
+    settings_row = get_or_create_story_settings(sender)
+    return {
+        'expiry_hours': settings_row.expiry_hours,
+        'visibility': settings_row.visibility,
+        'audience_account_numbers': normalize_settings_audience_list(
+            settings_row.audience_account_numbers,
+        ),
+    }
+
+
+def get_story_settings(sender):
+    return {
+        'status': 'ok',
+        'settings': serialize_story_settings(get_or_create_story_settings(sender)),
+    }, 200
+
+
+def update_story_settings(sender, parent_audience, payload):
+    settings_row = get_or_create_story_settings(sender)
+    normalized_payload, errors = normalize_story_settings_payload(payload, settings_row)
+    if errors:
+        return validation_error(errors)
+
+    _audience_contacts, audience_errors = validate_story_parent_audience(
+        normalized_payload,
+        parent_audience,
+    )
+    if audience_errors:
+        return validation_error(audience_errors)
+
+    settings_row.expiry_hours = normalized_payload['expiry_hours']
+    settings_row.visibility = normalized_payload['visibility']
+    settings_row.audience_account_numbers = normalized_payload['audience_account_numbers']
+    settings_row.owner_account_number = (
+        sender.get('account_number')
+        or parent_audience.get('owner_account_number')
+        or settings_row.owner_account_number
+    )
+    settings_row.save(
+        update_fields=[
+            'expiry_hours',
+            'visibility',
+            'audience_account_numbers',
+            'owner_account_number',
+            'updated_at',
+        ]
+    )
+
+    return {
+        'status': 'ok',
+        'settings': serialize_story_settings(settings_row),
+        'audience': {
+            'valid_count': parent_audience.get('valid_count', 0),
+            'excluded_contacts': parent_audience.get('excluded_contacts') or [],
+            'missing_account_numbers': parent_audience.get('missing_account_numbers') or [],
+        },
+    }, 200
 
 
 def create_story_media_upload_intents(sender, parent_audience, payload):
@@ -259,12 +340,14 @@ def create_story_from_upload_intents(sender, parent_audience, payload):
                     'idempotent': True,
                 }, 200
 
-            upload_intents, intent_errors = validate_completed_story_upload_intents(
-                sender,
-                normalized_payload,
-            )
-            if intent_errors:
-                return validation_error({'encrypted_upload_intent_ids': intent_errors})
+            upload_intents = []
+            if normalized_payload['story_type'] == Story.STORY_TYPE_MEDIA:
+                upload_intents, intent_errors = validate_completed_story_upload_intents(
+                    sender,
+                    normalized_payload,
+                )
+                if intent_errors:
+                    return validation_error({'encrypted_upload_intent_ids': intent_errors})
 
             now = timezone.now()
             story = Story.objects.create(
@@ -275,32 +358,34 @@ def create_story_from_upload_intents(sender, parent_audience, payload):
                     or ''
                 ),
                 client_story_id=normalized_payload['client_story_id'],
+                story_type=normalized_payload['story_type'],
                 visibility=normalized_payload['visibility'],
                 expiry_hours=normalized_payload['expiry_hours'],
                 encrypted_payload=normalized_payload['encrypted_payload'],
                 expires_at=now + timedelta(hours=normalized_payload['expiry_hours']),
             )
 
-            StoryMedia.objects.bulk_create(
-                [
-                    StoryMedia(
-                        story=story,
-                        upload_intent=intent,
-                        media_type=intent.media_type,
-                        encrypted_file_url=intent.secure_url,
-                        file_name=intent.original_file_name,
-                        mime_type=intent.original_mime_type,
-                        file_size_bytes=intent.original_file_size_bytes,
-                        encrypted_file_size_bytes=intent.encrypted_file_size_bytes,
-                        cloudinary_public_id=intent.cloudinary_public_id,
-                        cloudinary_asset_id=intent.cloudinary_asset_id,
-                        cloudinary_resource_type=intent.cloudinary_resource_type,
-                        cloudinary_folder=intent.cloudinary_folder,
-                        sort_order=intent.media_index,
-                    )
-                    for intent in upload_intents
-                ]
-            )
+            if upload_intents:
+                StoryMedia.objects.bulk_create(
+                    [
+                        StoryMedia(
+                            story=story,
+                            upload_intent=intent,
+                            media_type=intent.media_type,
+                            encrypted_file_url=intent.secure_url,
+                            file_name=intent.original_file_name,
+                            mime_type=intent.original_mime_type,
+                            file_size_bytes=intent.original_file_size_bytes,
+                            encrypted_file_size_bytes=intent.encrypted_file_size_bytes,
+                            cloudinary_public_id=intent.cloudinary_public_id,
+                            cloudinary_asset_id=intent.cloudinary_asset_id,
+                            cloudinary_resource_type=intent.cloudinary_resource_type,
+                            cloudinary_folder=intent.cloudinary_folder,
+                            sort_order=intent.media_index,
+                        )
+                        for intent in upload_intents
+                    ]
+                )
 
             StoryAudience.objects.bulk_create(
                 [
@@ -315,14 +400,15 @@ def create_story_from_upload_intents(sender, parent_audience, payload):
             )
 
             consumed_at = timezone.now()
-            StoryUploadIntent.objects.filter(
-                id__in=[intent.id for intent in upload_intents],
-                status=StoryUploadIntent.STATUS_COMPLETED,
-            ).update(
-                status=StoryUploadIntent.STATUS_CONSUMED,
-                consumed_at=consumed_at,
-                updated_at=consumed_at,
-            )
+            if upload_intents:
+                StoryUploadIntent.objects.filter(
+                    id__in=[intent.id for intent in upload_intents],
+                    status=StoryUploadIntent.STATUS_COMPLETED,
+                ).update(
+                    status=StoryUploadIntent.STATUS_CONSUMED,
+                    consumed_at=consumed_at,
+                    updated_at=consumed_at,
+                )
     except IntegrityError:
         existing_story = Story.objects.filter(
             owner_user_id=sender['user_id'],
@@ -925,7 +1011,13 @@ def build_story_context(story, context_type):
     return {
         'story_id': str(story.id),
         'type': context_type,
-        'media_type': first_media.media_type if first_media else '',
+        'media_type': (
+            first_media.media_type
+            if first_media
+            else story.story_type
+            if story.story_type == Story.STORY_TYPE_TEXT
+            else ''
+        ),
         'preview_label': 'Story',
         'created_at': story.created_at.isoformat(),
         'expires_at': story.expires_at.isoformat(),
@@ -946,26 +1038,44 @@ def record_story_view(sender, story, parent_policy):
     )
 
 
-def normalize_create_story_payload(payload):
+def normalize_create_story_payload(payload, settings_defaults=None):
     if not isinstance(payload, dict):
         return None, {'body': ['Request body must be a JSON object.']}
 
+    settings_defaults = settings_defaults if isinstance(settings_defaults, dict) else {}
     client_story_id = normalize_string(payload.get('client_story_id'))
     if not client_story_id:
         return None, {'client_story_id': ['Client story id is required.']}
     if len(client_story_id) > 120:
         return None, {'client_story_id': ['Client story id cannot exceed 120 characters.']}
 
-    expiry_hours = normalize_positive_int(payload.get('expiry_hours')) or Story.EXPIRY_24_HOURS
+    story_type = normalize_string(payload.get('story_type')) or Story.STORY_TYPE_MEDIA
+    if story_type not in STORY_ALLOWED_TYPES:
+        return None, {'story_type': ['Story type must be media or text.']}
+
+    expiry_hours = (
+        normalize_positive_int(payload.get('expiry_hours'))
+        or normalize_positive_int(settings_defaults.get('expiry_hours'))
+        or Story.EXPIRY_24_HOURS
+    )
     if expiry_hours not in STORY_ALLOWED_EXPIRY_HOURS:
         return None, {'expiry_hours': ['Story expiry must be 6, 12, or 24 hours.']}
 
-    visibility = normalize_string(payload.get('visibility')) or Story.VISIBILITY_ALL_CONTACTS
+    visibility = (
+        normalize_string(payload.get('visibility'))
+        or normalize_string(settings_defaults.get('visibility'))
+        or Story.VISIBILITY_ALL_CONTACTS
+    )
     if visibility not in dict(Story.VISIBILITY_CHOICES):
         return None, {'visibility': ['Story visibility must be all_contacts or specific_contacts.']}
 
+    audience_source = (
+        payload.get('audience_account_numbers')
+        if 'audience_account_numbers' in payload
+        else settings_defaults.get('audience_account_numbers')
+    )
     audience_account_numbers, audience_errors = normalize_audience_account_numbers(
-        payload.get('audience_account_numbers'),
+        audience_source,
     )
     if audience_errors:
         return None, {'audience_account_numbers': audience_errors}
@@ -983,23 +1093,103 @@ def normalize_create_story_payload(payload):
     )
     if upload_intent_errors:
         return None, {'encrypted_upload_intent_ids': upload_intent_errors}
-    if not upload_intent_ids:
+    if story_type == Story.STORY_TYPE_MEDIA and not upload_intent_ids:
         return None, {
             'encrypted_upload_intent_ids': [
                 'At least one completed encrypted story upload intent is required.',
             ],
         }
+    if story_type == Story.STORY_TYPE_TEXT and upload_intent_ids:
+        return None, {
+            'encrypted_upload_intent_ids': [
+                'Text stories cannot include encrypted media upload intents.',
+            ],
+        }
 
     encrypted_payload = normalize_string(payload.get('encrypted_payload'))
+    if story_type == Story.STORY_TYPE_TEXT:
+        if not encrypted_payload:
+            return None, {
+                'encrypted_payload': ['Text story payload is required.'],
+            }
+        if len(encrypted_payload) > STORY_TEXT_PAYLOAD_MAX_LENGTH:
+            return None, {
+                'encrypted_payload': ['Text story payload is too large.'],
+            }
 
     return {
         'client_story_id': client_story_id,
+        'story_type': story_type,
         'expiry_hours': expiry_hours,
         'visibility': visibility,
         'audience_account_numbers': audience_account_numbers,
         'encrypted_upload_intent_ids': upload_intent_ids,
         'encrypted_payload': encrypted_payload,
     }, None
+
+
+def normalize_story_settings_payload(payload, current_settings=None):
+    if not isinstance(payload, dict):
+        return None, {'body': ['Request body must be a JSON object.']}
+
+    if isinstance(current_settings, dict):
+        current_expiry_hours = current_settings.get('expiry_hours')
+        current_visibility = current_settings.get('visibility')
+        current_audience = current_settings.get('audience_account_numbers')
+    elif current_settings is not None:
+        current_expiry_hours = current_settings.expiry_hours
+        current_visibility = current_settings.visibility
+        current_audience = current_settings.audience_account_numbers
+    else:
+        current_expiry_hours = Story.EXPIRY_24_HOURS
+        current_visibility = Story.VISIBILITY_ALL_CONTACTS
+        current_audience = []
+
+    expiry_hours = (
+        normalize_positive_int(payload.get('expiry_hours'))
+        or normalize_positive_int(current_expiry_hours)
+        or Story.EXPIRY_24_HOURS
+    )
+    if expiry_hours not in STORY_ALLOWED_EXPIRY_HOURS:
+        return None, {'expiry_hours': ['Story expiry must be 6, 12, or 24 hours.']}
+
+    visibility = (
+        normalize_string(payload.get('visibility'))
+        or normalize_string(current_visibility)
+        or Story.VISIBILITY_ALL_CONTACTS
+    )
+    if visibility not in dict(Story.VISIBILITY_CHOICES):
+        return None, {'visibility': ['Story visibility must be all_contacts or specific_contacts.']}
+
+    audience_source = (
+        payload.get('audience_account_numbers')
+        if 'audience_account_numbers' in payload
+        else current_audience
+    )
+    audience_account_numbers, audience_errors = normalize_audience_account_numbers(
+        audience_source,
+    )
+    if audience_errors:
+        return None, {'audience_account_numbers': audience_errors}
+    if visibility == Story.VISIBILITY_SPECIFIC_CONTACTS and not audience_account_numbers:
+        return None, {
+            'audience_account_numbers': [
+                'At least one audience account number is required for specific contact stories.',
+            ],
+        }
+    if visibility == Story.VISIBILITY_ALL_CONTACTS:
+        audience_account_numbers = []
+
+    return {
+        'expiry_hours': expiry_hours,
+        'visibility': visibility,
+        'audience_account_numbers': audience_account_numbers,
+    }, None
+
+
+def normalize_settings_audience_list(value):
+    audience_account_numbers, audience_errors = normalize_audience_account_numbers(value)
+    return [] if audience_errors else audience_account_numbers
 
 
 def normalize_audience_account_numbers(value):
@@ -1492,6 +1682,7 @@ def serialize_story(story, viewed_story_ids=None, include_audience=False):
         'client_story_id': story.client_story_id,
         'owner_user_id': story.owner_user_id,
         'owner_account_number': story.owner_account_number,
+        'story_type': story.story_type,
         'visibility': story.visibility,
         'expiry_hours': story.expiry_hours,
         'encrypted_payload': story.encrypted_payload,
@@ -1563,6 +1754,20 @@ def serialize_story_media_preview(media):
     }
 
 
+def serialize_story_settings(settings_row):
+    return {
+        'owner_user_id': settings_row.owner_user_id,
+        'owner_account_number': settings_row.owner_account_number,
+        'expiry_hours': settings_row.expiry_hours,
+        'visibility': settings_row.visibility,
+        'audience_account_numbers': normalize_settings_audience_list(
+            settings_row.audience_account_numbers,
+        ),
+        'created_at': settings_row.created_at.isoformat(),
+        'updated_at': settings_row.updated_at.isoformat(),
+    }
+
+
 def serialize_story_viewer(viewer):
     return {
         'user_id': viewer.viewer_user_id,
@@ -1604,4 +1809,5 @@ def serialize_story_feed_contact(story, parent_policy):
         'user_id': story.owner_user_id,
         'account_number': story.owner_account_number,
         'alias_name': viewer_contact.get('alias_name'),
+        'profile_picture': viewer_contact.get('profile_picture'),
     }
