@@ -1753,6 +1753,7 @@ def serialize_story_media_preview(media):
     return {
         'id': media.id,
         'media_type': media.media_type,
+        'encrypted_file_url': media.encrypted_file_url,
         'thumbnail_url': media.thumbnail_url,
         'file_name': media.file_name,
         'mime_type': media.mime_type,

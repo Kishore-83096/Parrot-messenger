@@ -765,6 +765,10 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(stories[0]['view_count'], 2)
         self.assertGreater(stories[0]['expires_in_seconds'], 0)
         self.assertEqual(stories[0]['media_preview'][0]['media_type'], 'image')
+        self.assertEqual(
+            stories[0]['media_preview'][0]['encrypted_file_url'],
+            stories[0]['media'][0]['encrypted_file_url'],
+        )
 
     @patch('stories.views.broadcast_user_event')
     def test_delete_story_marks_owner_story_deleted_and_broadcasts(
