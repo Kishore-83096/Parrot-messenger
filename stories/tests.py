@@ -617,6 +617,40 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(contacts[0]['unviewed_count'], 0)
         self.assertTrue(contacts[0]['stories'][0]['viewed'])
 
+    @patch('stories.services.authorize_parent_story_visibility')
+    def test_story_feed_orders_latest_story_first(self, authorize_visibility):
+        now = timezone.now()
+        first_story = self.create_feed_story(
+            owner_user_id=2,
+            owner_account_number='7000000002',
+            client_story_id='first-story',
+        )
+        latest_story = self.create_feed_story(
+            owner_user_id=2,
+            owner_account_number='7000000002',
+            client_story_id='latest-story',
+        )
+        Story.objects.filter(id=first_story.id).update(
+            created_at=now - timedelta(minutes=2),
+        )
+        Story.objects.filter(id=latest_story.id).update(
+            created_at=now - timedelta(minutes=1),
+        )
+        authorize_visibility.return_value = self.allowed_visibility()
+
+        response = self.client.get(
+            '/stories/feed/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        contact = response.json()['result']['contacts'][0]
+        self.assertEqual(
+            [story['client_story_id'] for story in contact['stories']],
+            ['latest-story', 'first-story'],
+        )
+        self.assertEqual(contact['latest_story_at'], contact['stories'][0]['created_at'])
+
     def test_my_stories_returns_active_owner_stories_with_view_count(self):
         active_story = self.create_feed_story(
             owner_user_id=1,

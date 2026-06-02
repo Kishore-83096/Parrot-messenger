@@ -471,7 +471,7 @@ def list_story_feed(sender):
         )
         .exclude(owner_user_id=sender['user_id'])
         .prefetch_related('media')
-        .order_by('owner_user_id', 'created_at', 'id')
+        .order_by('owner_user_id', '-created_at', '-id')
     )
     if not stories:
         return {
@@ -520,7 +520,7 @@ def list_story_feed(sender):
                 'user_id': owner_user_id,
                 'account_number': first_story.owner_account_number,
                 'contact': serialize_story_feed_contact(first_story, parent_policy),
-                'latest_story_at': serialized_stories[-1]['created_at'],
+                'latest_story_at': serialized_stories[0]['created_at'],
                 'unviewed_count': sum(
                     1 for story_result in serialized_stories if not story_result['viewed']
                 ),
