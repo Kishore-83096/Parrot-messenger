@@ -37,7 +37,7 @@ from .models import (
 from .policy import authorize_parent_story_visibility
 
 
-MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST = 10
+MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST = 1
 DEFAULT_EXPIRED_STORY_MEDIA_RETENTION_DAYS = 0
 DEFAULT_EXPIRED_STORY_MEDIA_CLEANUP_LIMIT = 100
 STORY_MEDIA_IMAGE = StoryUploadIntent.MEDIA_IMAGE
@@ -1253,17 +1253,9 @@ def normalize_story_upload_intent_ids(value):
     if not isinstance(value, list):
         return [], ['Encrypted upload intent ids must be a list.']
 
-    max_count = int(
-        getattr(
-            settings,
-            'STORIES_MAX_MEDIA_UPLOAD_INTENTS_PER_REQUEST',
-            MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST,
-        )
-        or MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST
-    )
-    if len(value) > max_count:
+    if len(value) > MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST:
         return [], [
-            f'Cannot attach more than {max_count} encrypted media files to one story.',
+            'Stories support one encrypted media upload intent only.',
         ]
 
     normalized_ids = []
@@ -1393,18 +1385,10 @@ def normalize_story_upload_intent_payload(payload):
     if not isinstance(media, list) or not media:
         return None, {'media': ['At least one image or video is required.']}
 
-    max_count = int(
-        getattr(
-            settings,
-            'STORIES_MAX_MEDIA_UPLOAD_INTENTS_PER_REQUEST',
-            MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST,
-        )
-        or MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST
-    )
-    if len(media) > max_count:
+    if len(media) > MAX_STORY_MEDIA_UPLOAD_INTENTS_PER_REQUEST:
         return None, {
             'media': [
-                f'Cannot attach more than {max_count} files to one story.',
+                'Stories support one image or video only.',
             ],
         }
 

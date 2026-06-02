@@ -91,14 +91,6 @@ class StoryUploadIntentTests(TestCase):
                     'encrypted_file_size_bytes': 1408,
                     'sort_order': 0,
                 },
-                {
-                    'id': 'media-2',
-                    'file_name': 'clip.mp4',
-                    'mime_type': 'video/mp4',
-                    'file_size_bytes': 2048,
-                    'encrypted_file_size_bytes': 2496,
-                    'sort_order': 1,
-                },
             ],
         }
 
@@ -146,7 +138,7 @@ class StoryUploadIntentTests(TestCase):
             200,
         )
 
-    def test_create_story_upload_intents_for_image_and_video(self):
+    def test_create_story_upload_intent_for_image(self):
         result, status_code = create_story_media_upload_intents(
             self.sender,
             self.parent_audience,
@@ -155,12 +147,61 @@ class StoryUploadIntentTests(TestCase):
 
         self.assertEqual(status_code, 201)
         self.assertEqual(result['status'], 'ok')
-        self.assertEqual(len(result['upload_intents']), 2)
-        self.assertEqual(StoryUploadIntent.objects.count(), 2)
+        self.assertEqual(len(result['upload_intents']), 1)
+        self.assertEqual(StoryUploadIntent.objects.count(), 1)
         self.assertEqual(
-            sorted(StoryUploadIntent.objects.values_list('media_type', flat=True)),
-            ['image', 'video'],
+            StoryUploadIntent.objects.values_list('media_type', flat=True).get(),
+            'image',
         )
+
+    def test_create_story_upload_intent_for_video(self):
+        payload = self.story_media_payload()
+        payload['media'][0].update(
+            {
+                'id': 'media-video',
+                'file_name': 'clip.mp4',
+                'mime_type': 'video/mp4',
+                'file_size_bytes': 2048,
+                'encrypted_file_size_bytes': 2496,
+            }
+        )
+
+        result, status_code = create_story_media_upload_intents(
+            self.sender,
+            self.parent_audience,
+            payload,
+        )
+
+        self.assertEqual(status_code, 201)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(StoryUploadIntent.objects.count(), 1)
+        self.assertEqual(
+            StoryUploadIntent.objects.values_list('media_type', flat=True).get(),
+            'video',
+        )
+
+    def test_create_story_upload_intents_rejects_multiple_media_files(self):
+        payload = self.story_media_payload()
+        payload['media'].append(
+            {
+                'id': 'media-2',
+                'file_name': 'clip.mp4',
+                'mime_type': 'video/mp4',
+                'file_size_bytes': 2048,
+                'encrypted_file_size_bytes': 2496,
+                'sort_order': 1,
+            }
+        )
+
+        result, status_code = create_story_media_upload_intents(
+            self.sender,
+            self.parent_audience,
+            payload,
+        )
+
+        self.assertEqual(status_code, 400)
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(StoryUploadIntent.objects.count(), 0)
 
     def test_create_story_upload_intents_rejects_non_media_file(self):
         payload = {
@@ -244,7 +285,7 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(response.status_code, 201)
         body = response.json()
         self.assertEqual(body['status'], 'ok')
-        self.assertEqual(len(body['result']['upload_intents']), 2)
+        self.assertEqual(len(body['result']['upload_intents']), 1)
         resolve_policy.assert_called_once_with(
             {
                 'owner_user_id': 1,
@@ -285,6 +326,34 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(Story.objects.get().encrypted_payload, encrypted_payload)
         intent.refresh_from_db()
         self.assertEqual(intent.status, StoryUploadIntent.STATUS_CONSUMED)
+
+    def test_create_story_rejects_multiple_completed_upload_intents(self):
+        first_intent = self.completed_upload_intent(
+            client_story_id='story-client-multiple',
+        )
+        second_intent = self.completed_upload_intent(
+            client_story_id='story-client-multiple',
+            media_type='video',
+        )
+
+        result, status_code = create_story_from_upload_intents(
+            self.sender,
+            self.parent_audience,
+            {
+                'client_story_id': 'story-client-multiple',
+                'expiry_hours': 24,
+                'visibility': 'specific_contacts',
+                'audience_account_numbers': ['7000000002'],
+                'encrypted_upload_intent_ids': [
+                    str(first_intent.id),
+                    str(second_intent.id),
+                ],
+            },
+        )
+
+        self.assertEqual(status_code, 400)
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(Story.objects.count(), 0)
 
     @patch('stories.views.resolve_parent_story_audience')
     def test_create_story_api_uses_parent_audience_policy(self, resolve_policy):
