@@ -59,6 +59,7 @@ BLOCKED_UPLOAD_EXTENSIONS = {
     '.sh',
     '.vbs',
 }
+STORY_CONTEXT_MEDIA_TYPES = {'image', 'video', 'text'}
 
 
 def validation_error(errors):
@@ -164,8 +165,8 @@ def normalize_story_context(value):
     elif context_type not in {'reply', 'reaction'}:
         errors['type'] = 'Story context type must be reply or reaction.'
 
-    if media_type and media_type not in {'image', 'video'}:
-        errors['media_type'] = 'Story media type must be image or video.'
+    if media_type and media_type not in STORY_CONTEXT_MEDIA_TYPES:
+        errors['media_type'] = 'Story media type must be image, video, or text.'
 
     if len(preview_label) > 120:
         preview_label = preview_label[:120]

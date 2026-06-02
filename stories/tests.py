@@ -1140,25 +1140,132 @@ class StoryUploadIntentTests(TestCase):
         broadcast_room_event.assert_called_once()
         broadcast_participant_event.assert_called_once()
 
-    def create_feed_story(self, owner_user_id, owner_account_number, client_story_id):
+    @patch('stories.views.broadcast_participant_event')
+    @patch('stories.views.broadcast_room_event')
+    @patch('stories.services.authorize_parent_story_visibility')
+    def test_text_story_reaction_creates_chat_message_with_text_story_context(
+        self,
+        authorize_visibility,
+        broadcast_room_event,
+        broadcast_participant_event,
+    ):
+        story = self.create_feed_story(
+            owner_user_id=2,
+            owner_account_number='7000000002',
+            client_story_id='text-reaction-story',
+            story_type=Story.STORY_TYPE_TEXT,
+        )
+        authorize_visibility.return_value = self.allowed_visibility()
+
+        response = self.client.post(
+            f'/stories/{story.id}/reaction/',
+            data=json.dumps(
+                {
+                    'client_message_id': 'text-story-reaction-message-1',
+                    'reaction': 'heart',
+                }
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Message.objects.count(), 1)
+        message = Message.objects.get()
+        self.assertEqual(message.story_context['type'], 'reaction')
+        self.assertEqual(message.story_context['media_type'], 'text')
+        self.assertEqual(StoryReaction.objects.get().message_id, message.id)
+        body = response.json()
+        self.assertEqual(
+            body['result']['message_result']['message']['story_context']['media_type'],
+            'text',
+        )
+        broadcast_room_event.assert_called_once()
+        broadcast_participant_event.assert_called_once()
+
+    @patch('stories.views.broadcast_participant_event')
+    @patch('stories.views.broadcast_room_event')
+    @patch('stories.services.authorize_parent_story_visibility')
+    def test_text_story_reply_creates_chat_message_with_text_story_context(
+        self,
+        authorize_visibility,
+        broadcast_room_event,
+        broadcast_participant_event,
+    ):
+        story = self.create_feed_story(
+            owner_user_id=2,
+            owner_account_number='7000000002',
+            client_story_id='text-reply-story',
+            story_type=Story.STORY_TYPE_TEXT,
+        )
+        authorize_visibility.return_value = self.allowed_visibility()
+
+        response = self.client.post(
+            f'/stories/{story.id}/reply/',
+            data=json.dumps(
+                {
+                    'client_message_id': 'text-story-reply-message-1',
+                    'text': 'Nice text story',
+                }
+            ),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Message.objects.count(), 1)
+        message = Message.objects.get()
+        self.assertEqual(message.text, 'Nice text story')
+        self.assertEqual(message.story_context['type'], 'reply')
+        self.assertEqual(message.story_context['media_type'], 'text')
+        self.assertEqual(StoryReply.objects.get().message_id, message.id)
+        body = response.json()
+        self.assertEqual(
+            body['result']['message_result']['message']['story_context']['media_type'],
+            'text',
+        )
+        broadcast_room_event.assert_called_once()
+        broadcast_participant_event.assert_called_once()
+
+    def create_feed_story(
+        self,
+        owner_user_id,
+        owner_account_number,
+        client_story_id,
+        story_type=Story.STORY_TYPE_MEDIA,
+    ):
         story = Story.objects.create(
             owner_user_id=owner_user_id,
             owner_account_number=owner_account_number,
             client_story_id=client_story_id,
+            story_type=story_type,
             visibility=Story.VISIBILITY_ALL_CONTACTS,
             expiry_hours=24,
             expires_at=timezone.now() + timedelta(hours=1),
+            encrypted_payload=(
+                json.dumps(
+                    {
+                        'type': 'parrot.story.text',
+                        'v': 1,
+                        'text': 'Text board story',
+                        'theme': 'midnight',
+                    }
+                )
+                if story_type == Story.STORY_TYPE_TEXT
+                else ''
+            ),
         )
-        StoryMedia.objects.create(
-            story=story,
-            media_type=StoryMedia.MEDIA_IMAGE,
-            encrypted_file_url=f'https://res.cloudinary.com/test/raw/upload/v1/{client_story_id}.txt',
-            file_name='photo.jpg',
-            mime_type='image/jpeg',
-            file_size_bytes=1024,
-            encrypted_file_size_bytes=1408,
-            sort_order=0,
-        )
+        if story_type != Story.STORY_TYPE_TEXT:
+            StoryMedia.objects.create(
+                story=story,
+                media_type=StoryMedia.MEDIA_IMAGE,
+                encrypted_file_url=f'https://res.cloudinary.com/test/raw/upload/v1/{client_story_id}.txt',
+                file_name='photo.jpg',
+                mime_type='image/jpeg',
+                file_size_bytes=1024,
+                encrypted_file_size_bytes=1408,
+                sort_order=0,
+            )
         StoryAudience.objects.create(
             story=story,
             viewer_user_id=1,
