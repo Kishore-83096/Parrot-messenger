@@ -80,8 +80,28 @@ def get_or_create_story_settings(sender):
     return settings_row
 
 
+def get_saved_story_settings(sender):
+    settings_row = StorySettings.objects.filter(owner_user_id=sender['user_id']).first()
+    if not settings_row:
+        return None
+
+    owner_account_number = sender.get('account_number') or settings_row.owner_account_number
+    if owner_account_number and settings_row.owner_account_number != owner_account_number:
+        settings_row.owner_account_number = owner_account_number
+        settings_row.save(update_fields=['owner_account_number', 'updated_at'])
+
+    return settings_row
+
+
 def get_story_settings_default_values(sender):
-    settings_row = get_or_create_story_settings(sender)
+    settings_row = get_saved_story_settings(sender)
+    if not settings_row:
+        return {
+            'expiry_hours': Story.EXPIRY_24_HOURS,
+            'visibility': Story.VISIBILITY_ALL_CONTACTS,
+            'audience_account_numbers': [],
+        }
+
     return {
         'expiry_hours': settings_row.expiry_hours,
         'visibility': settings_row.visibility,
@@ -92,9 +112,16 @@ def get_story_settings_default_values(sender):
 
 
 def get_story_settings(sender):
+    settings_row = get_saved_story_settings(sender)
+
     return {
         'status': 'ok',
-        'settings': serialize_story_settings(get_or_create_story_settings(sender)),
+        'has_saved_settings': settings_row is not None,
+        'settings': (
+            serialize_story_settings(settings_row)
+            if settings_row
+            else get_story_settings_default_values(sender)
+        ),
     }, 200
 
 

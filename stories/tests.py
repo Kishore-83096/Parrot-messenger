@@ -254,6 +254,14 @@ class StoryUploadIntentTests(TestCase):
 
     def test_create_story_consumes_completed_upload_intent(self):
         intent = self.completed_upload_intent()
+        encrypted_payload = json.dumps(
+            {
+                'type': 'parrot.story.media',
+                'v': 1,
+                'caption': 'Media caption',
+                'media': [],
+            }
+        )
 
         result, status_code = create_story_from_upload_intents(
             self.sender,
@@ -263,6 +271,7 @@ class StoryUploadIntentTests(TestCase):
                 'expiry_hours': 24,
                 'visibility': 'specific_contacts',
                 'audience_account_numbers': ['7000000002'],
+                'encrypted_payload': encrypted_payload,
                 'encrypted_upload_intent_ids': [str(intent.id)],
             },
         )
@@ -272,6 +281,8 @@ class StoryUploadIntentTests(TestCase):
         self.assertEqual(Story.objects.count(), 1)
         self.assertEqual(StoryMedia.objects.count(), 1)
         self.assertEqual(StoryAudience.objects.count(), 1)
+        self.assertEqual(result['story']['encrypted_payload'], encrypted_payload)
+        self.assertEqual(Story.objects.get().encrypted_payload, encrypted_payload)
         intent.refresh_from_db()
         self.assertEqual(intent.status, StoryUploadIntent.STATUS_CONSUMED)
 
@@ -369,6 +380,28 @@ class StoryUploadIntentTests(TestCase):
             get_response.json()['result']['settings']['visibility'],
             Story.VISIBILITY_SPECIFIC_CONTACTS,
         )
+        self.assertTrue(get_response.json()['result']['has_saved_settings'])
+
+    def test_get_story_settings_returns_unsaved_defaults_without_creating_row(self):
+        response = self.client.get(
+            '/stories/settings/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('no-cache', response.headers['Cache-Control'])
+        body = response.json()
+        self.assertEqual(body['status'], 'ok')
+        self.assertFalse(body['result']['has_saved_settings'])
+        self.assertEqual(
+            body['result']['settings'],
+            {
+                'expiry_hours': 24,
+                'visibility': Story.VISIBILITY_ALL_CONTACTS,
+                'audience_account_numbers': [],
+            },
+        )
+        self.assertFalse(StorySettings.objects.filter(owner_user_id=1).exists())
 
     @patch('stories.views.resolve_parent_story_audience')
     def test_create_story_api_uses_saved_settings_when_fields_are_missing(

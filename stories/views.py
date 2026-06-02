@@ -1,6 +1,7 @@
 import json
 
 from django.http import JsonResponse
+from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
@@ -161,6 +162,7 @@ def create_story(request):
 
 
 @csrf_exempt
+@never_cache
 @require_http_methods(['GET', 'POST', 'PUT', 'PATCH'])
 def story_settings(request):
     sender, error_response = get_authenticated_sender(request)
