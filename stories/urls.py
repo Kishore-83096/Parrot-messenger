@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    cleanup_expired_stories,
     complete_story_upload_intent,
     create_story,
     create_story_upload_intents,
@@ -17,6 +18,7 @@ from .views import (
 
 urlpatterns = [
     path('', create_story, name='story-create'),
+    path('internal/cleanup-expired/', cleanup_expired_stories, name='story-cleanup-expired'),
     path('feed/', story_feed, name='story-feed'),
     path('mine/', my_stories, name='story-mine'),
     path('settings/', story_settings, name='story-settings'),

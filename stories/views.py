@@ -1,5 +1,7 @@
 import json
+from hmac import compare_digest
 
+from django.conf import settings
 from django.http import JsonResponse
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_exempt
@@ -15,6 +17,7 @@ from messaging.realtime import (
 from .models import StoryAudience
 from .policy import resolve_parent_story_audience
 from .services import (
+    cleanup_stories,
     complete_story_media_upload_intent,
     create_story_from_upload_intents,
     create_story_media_upload_intents,
@@ -31,6 +34,13 @@ from .services import (
     reply_to_story,
     update_story_settings,
 )
+
+
+def is_internal_service_request(request):
+    expected_token = settings.INTERNAL_SERVICE_TOKEN or ''
+    provided_token = request.headers.get('X-Internal-Service-Token', '')
+
+    return bool(expected_token) and compare_digest(provided_token, expected_token)
 
 
 def parse_json_body(request):
@@ -92,6 +102,30 @@ def sanitize_policy_result(result):
         return [sanitize_policy_result(value) for value in result]
 
     return result
+
+
+@csrf_exempt
+@require_POST
+def cleanup_expired_stories(request):
+    if not is_internal_service_request(request):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Unauthorized internal service request.',
+            },
+            status=401,
+        )
+
+    result = cleanup_stories()
+    return JsonResponse(
+        {
+            'status': 'ok',
+            'service': 'messenger',
+            'result': result,
+        },
+        status=200,
+    )
 
 
 @csrf_exempt

@@ -903,6 +903,35 @@ class StoryUploadIntentTests(TestCase):
             resource_type='raw',
         )
 
+    @override_settings(INTERNAL_SERVICE_TOKEN='test-internal-service-token')
+    @patch('stories.views.cleanup_stories')
+    def test_cleanup_expired_stories_api_requires_internal_service_token(self, cleanup):
+        response = self.client.post('/stories/internal/cleanup-expired/')
+
+        self.assertEqual(response.status_code, 401)
+        cleanup.assert_not_called()
+
+    @override_settings(INTERNAL_SERVICE_TOKEN='test-internal-service-token')
+    @patch('stories.views.cleanup_stories')
+    def test_cleanup_expired_stories_api_runs_cleanup(self, cleanup):
+        cleanup.return_value = {
+            'expired_story_candidates': 2,
+            'expired_stories': 2,
+            'media_candidates': 1,
+            'media_cleaned': 1,
+            'cloudinary_errors': [],
+        }
+
+        response = self.client.post(
+            '/stories/internal/cleanup-expired/',
+            HTTP_X_INTERNAL_SERVICE_TOKEN='test-internal-service-token',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'ok')
+        self.assertEqual(response.json()['result']['expired_stories'], 2)
+        cleanup.assert_called_once_with()
+
     @patch('stories.services.authorize_parent_story_visibility')
     def test_mark_story_viewed_records_view_once(self, authorize_visibility):
         story = self.create_feed_story(
