@@ -1,6 +1,13 @@
 from django.contrib import admin
 
-from .models import GroupActionLog, GroupProfile
+from .models import GroupActionLog, GroupMembership, GroupProfile
+
+
+@admin.register(GroupMembership)
+class GroupMembershipAdmin(admin.ModelAdmin):
+    list_display = ('id', 'room', 'user_id', 'role', 'is_active', 'updated_at')
+    list_filter = ('role', 'is_active')
+    search_fields = ('=room__id', '=user_id')
 
 
 @admin.register(GroupProfile)

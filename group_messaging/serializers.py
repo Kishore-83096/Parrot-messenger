@@ -1,12 +1,22 @@
-from .models import GroupActionLog, GroupProfile
+from .models import GroupActionLog, GroupMembership, GroupProfile
 
 
-def serialize_group_participant(participant):
+def get_group_role_map(room_id):
+    return {
+        membership.user_id: membership.role
+        for membership in GroupMembership.objects.filter(room_id=room_id, is_active=True)
+    }
+
+
+def serialize_group_participant(participant, role=None):
+    group_role = role or participant.role or GroupMembership.ROLE_MEMBER
+
     return {
         'user_id': participant.user_id,
         'account_number': participant.account_number,
         'display_name': participant.display_name,
-        'role': participant.role,
+        'role': group_role,
+        'group_role': group_role,
         'is_active': participant.is_active,
         'joined_at': participant.joined_at.isoformat(),
         'last_read_at': participant.last_read_at.isoformat() if participant.last_read_at else None,
@@ -44,12 +54,30 @@ def build_group_log_text(log):
     if log.action == GroupActionLog.ACTION_MEMBER_ADDED:
         return f'{actor} added {target}'
 
+    if log.action == GroupActionLog.ACTION_MEMBER_REMOVED:
+        return f'{actor} removed {target}'
+
+    if log.action == GroupActionLog.ACTION_MEMBER_LEFT:
+        return f'{actor} left the group'
+
     if log.action == GroupActionLog.ACTION_GROUP_UPDATED:
         title = metadata.get('title')
         return f'{actor} changed the group name to {title}' if title else f'{actor} updated the group'
 
     if log.action == GroupActionLog.ACTION_AVATAR_UPDATED:
         return f'{actor} changed the group picture'
+
+    if log.action == GroupActionLog.ACTION_SUB_ADMIN_ADDED:
+        return f'{actor} made {target} a sub admin'
+
+    if log.action == GroupActionLog.ACTION_SUB_ADMIN_REMOVED:
+        return f'{actor} removed sub admin from {target}'
+
+    if log.action == GroupActionLog.ACTION_ADMIN_TRANSFERRED:
+        return f'{actor} made {target} the admin'
+
+    if log.action == GroupActionLog.ACTION_GROUP_DELETED:
+        return f'{actor} deleted the group'
 
     return 'Group updated'
 
@@ -62,11 +90,19 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
     active_participants = list(
         room.participants.filter(is_active=True).order_by('joined_at', 'id')
     )
+    role_map = get_group_role_map(room.id)
+    participants = [
+        serialize_group_participant(
+            participant,
+            role_map.get(participant.user_id, participant.role),
+        )
+        for participant in active_participants
+    ]
     current_participant = next(
         (
             participant
-            for participant in active_participants
-            if current_user_id and int(participant.user_id) == int(current_user_id)
+            for participant in participants
+            if current_user_id and int(participant['user_id']) == int(current_user_id)
         ),
         None,
     )
@@ -79,8 +115,9 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
         'title': profile.title if profile else room.title,
         'avatar_url': profile.avatar_url if profile else '',
         'created_by_user_id': profile.created_by_user_id if profile else room.created_by_user_id,
+        'participants': participants,
         'member_count': len(active_participants),
-        'my_role': current_participant.role if current_participant else '',
+        'my_role': current_participant['role'] if current_participant else '',
         'latest_logs': [
             serialize_group_log(log)
             for log in reversed(logs)
@@ -89,10 +126,8 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
 
 
 def serialize_group_room(room, current_user_id=None):
-    participants = [
-        serialize_group_participant(participant)
-        for participant in room.participants.filter(is_active=True).order_by('joined_at', 'id')
-    ]
+    extension = get_group_room_extension(room, current_user_id=current_user_id)
+    participants = extension.get('participants') or []
     current_participant = next(
         (
             participant
@@ -101,7 +136,6 @@ def serialize_group_room(room, current_user_id=None):
         ),
         None,
     )
-    extension = get_group_room_extension(room, current_user_id=current_user_id)
 
     return {
         'id': room.id,
