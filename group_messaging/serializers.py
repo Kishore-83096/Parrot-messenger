@@ -1,3 +1,5 @@
+from messaging.models import RoomParticipant
+
 from .models import (
     GroupActionLog,
     GroupMembership,
@@ -46,6 +48,47 @@ def serialize_group_log(log):
         'avatar_url': metadata.get('avatar_url', ''),
         'text': build_group_log_text(log),
         'created_at': log.created_at.isoformat(),
+    }
+
+
+def get_group_participant_identity_map(room_id):
+    return {
+        participant.user_id: {
+            'user_id': participant.user_id,
+            'account_number': participant.account_number,
+            'display_name': participant.display_name or participant.account_number,
+        }
+        for participant in RoomParticipant.objects.filter(room_id=room_id)
+    }
+
+
+def attach_group_participant_identities(messages, room_id):
+    identity_map = get_group_participant_identity_map(room_id)
+
+    for message in messages:
+        message._group_participant_identity_by_user_id = identity_map
+        if getattr(message, 'reply_to', None):
+            message.reply_to._group_participant_identity_by_user_id = identity_map
+
+    return messages
+
+
+def get_group_message_participant_identity_map(message):
+    identity_map = getattr(message, '_group_participant_identity_by_user_id', None)
+    if identity_map is not None:
+        return identity_map
+
+    return get_group_participant_identity_map(message.room_id)
+
+
+def get_group_participant_identity(identity_map, user_id):
+    numeric_user_id = int(user_id or 0)
+    identity = identity_map.get(numeric_user_id) or {}
+
+    return {
+        'user_id': numeric_user_id,
+        'account_number': identity.get('account_number', ''),
+        'display_name': identity.get('display_name') or f'User {numeric_user_id}',
     }
 
 
@@ -205,16 +248,31 @@ def serialize_group_message(message, current_user_id=None):
     if not message:
         return None
 
-    reaction_data = serialize_group_message_reactions(message, current_user_id)
+    participant_identity_by_user_id = get_group_message_participant_identity_map(message)
+    sender_identity = get_group_participant_identity(
+        participant_identity_by_user_id,
+        message.sender_user_id,
+    )
+    reaction_data = serialize_group_message_reactions(
+        message,
+        current_user_id,
+        participant_identity_by_user_id=participant_identity_by_user_id,
+    )
     return {
         'id': message.id,
         'room_id': message.room_id,
         'room_type': 'group',
         'is_group_message': True,
         'sender_user_id': message.sender_user_id,
+        'sender_account_number': sender_identity['account_number'],
+        'sender_display_name': sender_identity['display_name'],
         'recipient_user_id': None,
         'reply_to_message_id': message.reply_to_id,
-        'reply_to': serialize_group_reply_preview(message.reply_to, current_user_id) if message.reply_to_id else None,
+        'reply_to': serialize_group_reply_preview(
+            message.reply_to,
+            current_user_id,
+            participant_identity_by_user_id=participant_identity_by_user_id,
+        ) if message.reply_to_id else None,
         'text': message.text,
         'client_message_id': message.client_message_id,
         'status': message.status,
@@ -227,9 +285,12 @@ def serialize_group_message(message, current_user_id=None):
     }
 
 
-def serialize_group_reply_preview(message, current_user_id=None):
+def serialize_group_reply_preview(message, current_user_id=None, participant_identity_by_user_id=None):
     if not message or message.deleted_at:
         return None
+
+    identity_map = participant_identity_by_user_id or get_group_message_participant_identity_map(message)
+    sender_identity = get_group_participant_identity(identity_map, message.sender_user_id)
 
     return {
         'id': message.id,
@@ -237,6 +298,8 @@ def serialize_group_reply_preview(message, current_user_id=None):
         'room_type': 'group',
         'is_group_message': True,
         'sender_user_id': message.sender_user_id,
+        'sender_account_number': sender_identity['account_number'],
+        'sender_display_name': sender_identity['display_name'],
         'recipient_user_id': None,
         'text': message.text,
         'attachment_count': 0,
@@ -244,13 +307,24 @@ def serialize_group_reply_preview(message, current_user_id=None):
     }
 
 
-def serialize_group_message_reactions(message, current_user_id=None):
+def serialize_group_message_reactions(
+    message,
+    current_user_id=None,
+    participant_identity_by_user_id=None,
+):
     reaction_counts = {}
+    reaction_users = {}
     my_reaction = None
+    identity_map = (
+        participant_identity_by_user_id or
+        get_group_message_participant_identity_map(message)
+    )
 
     for reaction in message.reactions.all():
         reaction_key = reaction.reaction
+        identity = get_group_participant_identity(identity_map, reaction.user_id)
         reaction_counts[reaction_key] = reaction_counts.get(reaction_key, 0) + 1
+        reaction_users.setdefault(reaction_key, []).append(identity)
 
         if current_user_id and int(reaction.user_id) == int(current_user_id):
             my_reaction = reaction_key
@@ -264,6 +338,7 @@ def serialize_group_message_reactions(message, current_user_id=None):
         reaction_data = {
             'reaction': reaction_key,
             'count': count,
+            'users': reaction_users.get(reaction_key, []),
         }
         if current_user_id:
             reaction_data['reacted_by_me'] = reaction_key == my_reaction

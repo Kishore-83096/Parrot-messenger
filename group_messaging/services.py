@@ -44,6 +44,7 @@ from .models import (
     GroupProfile,
 )
 from .serializers import (
+    attach_group_participant_identities,
     get_group_room_unread_count,
     serialize_group_log,
     serialize_group_message,
@@ -1369,9 +1370,11 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
     fetched_messages = list(messages.order_by('-created_at', '-id')[: limit + 1])
     has_more = len(fetched_messages) > limit
     page_messages = fetched_messages[:limit]
+    ordered_page_messages = list(reversed(page_messages))
+    attach_group_participant_identities(ordered_page_messages, context['room'].id)
     serialized_messages = [
         serialize_group_message(message, user_id)
-        for message in reversed(page_messages)
+        for message in ordered_page_messages
     ]
     next_before_message_id = page_messages[-1].id if has_more and page_messages else None
 
@@ -1425,6 +1428,7 @@ def list_group_messages_around_target(user_id, room, messages, limit, around_mes
         [*older_messages, target_message, *newer_messages],
         key=lambda message: (message.created_at, message.id),
     )
+    attach_group_participant_identities(page_messages, room.id)
     oldest_message = page_messages[0] if page_messages else None
     newest_message = page_messages[-1] if page_messages else None
     has_more_older = (
