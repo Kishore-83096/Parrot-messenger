@@ -67,6 +67,7 @@ MAX_GROUP_ENCRYPTED_FILE_SIZE_BYTES = 26 * 1024 * 1024
 MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST = 10
 DEFAULT_GROUP_UPLOAD_INTENT_TTL_SECONDS = 600
 MAIN_CLOUDINARY_FOLDER = 'MAIN'
+GROUP_TIMELINE_LOG_LIMIT = 100
 
 
 def validation_error(errors):
@@ -1378,6 +1379,7 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
         'status': 'ok',
         'room': serialize_group_room(context['room'], current_user_id=user_id),
         'messages': serialized_messages,
+        'logs': list_group_timeline_logs(context['room'].id),
         'pagination': {
             'limit': limit,
             'before_message_id': before_message_id,
@@ -1389,6 +1391,18 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
     set_cached_room_messages(user_id, room_id, limit, before_message_id, result)
 
     return result, 200
+
+
+def list_group_timeline_logs(room_id, limit=GROUP_TIMELINE_LOG_LIMIT):
+    logs = list(
+        GroupActionLog.objects.filter(room_id=room_id)
+        .order_by('-created_at', '-id')[:limit]
+    )
+
+    return [
+        serialize_group_log(log)
+        for log in reversed(logs)
+    ]
 
 
 def list_group_messages_around_target(user_id, room, messages, limit, around_message_id):
@@ -1431,6 +1445,7 @@ def list_group_messages_around_target(user_id, room, messages, limit, around_mes
             serialize_group_message(message, user_id)
             for message in page_messages
         ],
+        'logs': list_group_timeline_logs(room.id),
         'pagination': {
             'limit': limit,
             'before_message_id': None,
