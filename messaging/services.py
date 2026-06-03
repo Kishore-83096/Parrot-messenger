@@ -1185,7 +1185,7 @@ def serialize_room_summary(room, current_user_id):
         .order_by('-created_at', '-id')
         .first()
     )
-    room_data = serialize_room(room)
+    room_data = serialize_room(room, current_user_id=current_user_id)
     current_participant = next(
         (
             participant
@@ -1207,11 +1207,12 @@ def serialize_room_summary(room, current_user_id):
     return room_data
 
 
-def serialize_room(room):
-    return {
+def serialize_room(room, current_user_id=None):
+    room_data = {
         'id': room.id,
         'room_type': room.room_type,
         'is_group': room.is_group,
+        'title': room.title,
         'created_by_user_id': room.created_by_user_id,
         'created_at': room.created_at.isoformat(),
         'updated_at': room.updated_at.isoformat(),
@@ -1220,6 +1221,17 @@ def serialize_room(room):
             for participant in room.participants.filter(is_active=True).order_by('joined_at', 'id')
         ],
     }
+    if room.is_group:
+        try:
+            from group_messaging.serializers import get_group_room_extension
+
+            room_data.update(
+                get_group_room_extension(room, current_user_id=current_user_id)
+            )
+        except Exception:
+            pass
+
+    return room_data
 
 
 def serialize_participant(participant):
