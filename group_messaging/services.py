@@ -1,16 +1,32 @@
+import json
 import re
+import time
+import uuid
+from datetime import timedelta
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from cloudinary import config as cloudinary_config
 from cloudinary import uploader as cloudinary_uploader
 from cloudinary.exceptions import Error as CloudinaryError
+from cloudinary.utils import (
+    api_sign_request,
+    cloudinary_url,
+    verify_api_response_signature,
+)
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 import httpx
 
-from messaging.cache import invalidate_room_caches
-from messaging.models import Room, RoomParticipant
+from messaging.cache import (
+    get_cached_room_messages,
+    invalidate_room_caches,
+    set_cached_room_messages,
+)
+from messaging.models import Room, RoomParticipant, UserDeviceKey
+from messaging.e2ee.devices.service import serialize_device_key
 from messaging.realtime import broadcast_room_event, broadcast_user_event
 from messaging.signals import (
     build_parent_headers,
@@ -18,8 +34,22 @@ from messaging.signals import (
     label_parent_url,
 )
 
-from .models import GroupActionLog, GroupMembership, GroupProfile
-from .serializers import serialize_group_log, serialize_group_room
+from .models import (
+    GroupActionLog,
+    GroupMembership,
+    GroupMessage,
+    GroupMessageEncryptedUploadIntent,
+    GroupMessageReaction,
+    GroupMessageReceipt,
+    GroupProfile,
+)
+from .serializers import (
+    get_group_room_unread_count,
+    serialize_group_log,
+    serialize_group_message,
+    serialize_group_message_reaction_summary,
+    serialize_group_room,
+)
 
 
 ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
@@ -28,6 +58,15 @@ MAX_GROUP_TITLE_LENGTH = 120
 MAX_GROUP_AVATAR_BYTES = 5 * 1024 * 1024
 ALLOWED_AVATAR_CONTENT_TYPES = {'image/avif', 'image/gif', 'image/jpeg', 'image/png', 'image/webp'}
 GROUP_MANAGER_ROLES = {GroupMembership.ROLE_ADMIN, GroupMembership.ROLE_SUB_ADMIN}
+GROUP_E2EE_MESSAGE_TYPE = 'e2ee.group_message'
+GROUP_E2EE_MESSAGE_VERSION = 1
+MAX_GROUP_MESSAGE_TEXT_LENGTH = 5000
+MAX_GROUP_ENCRYPTED_MESSAGE_TEXT_LENGTH = 500000
+MAX_GROUP_ATTACHMENTS_PER_MESSAGE = 10
+MAX_GROUP_ENCRYPTED_FILE_SIZE_BYTES = 26 * 1024 * 1024
+MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST = 10
+DEFAULT_GROUP_UPLOAD_INTENT_TTL_SECONDS = 600
+MAIN_CLOUDINARY_FOLDER = 'MAIN'
 
 
 def validation_error(errors):
@@ -979,3 +1018,1149 @@ def broadcast_group_update(room, serialized_room, serialized_log, extra_user_ids
             'removed_room_id': room.id,
         }
         broadcast_user_event(numeric_user_id, serialized_log['action'], extra_payload)
+
+
+def is_group_encrypted_message_text(value):
+    if not isinstance(value, str):
+        return False
+
+    normalized_value = value.strip()
+    if not normalized_value or not normalized_value.startswith('{'):
+        return False
+
+    try:
+        payload = json.loads(normalized_value)
+    except ValueError:
+        return False
+
+    return (
+        payload.get('type') == GROUP_E2EE_MESSAGE_TYPE
+        and payload.get('v') == GROUP_E2EE_MESSAGE_VERSION
+        and isinstance(payload.get('nonce'), str)
+        and isinstance(payload.get('ciphertext'), str)
+        and isinstance(payload.get('keys'), list)
+    )
+
+
+def normalize_group_message_payload(payload):
+    if not isinstance(payload, dict):
+        return None, {'body': ['Request body must be a JSON object.']}
+
+    errors = {}
+    text = payload.get('text', '')
+    if text is None:
+        text = ''
+    if not isinstance(text, str):
+        errors['text'] = ['Message text must be a string.']
+        text = ''
+    else:
+        max_text_length = (
+            MAX_GROUP_ENCRYPTED_MESSAGE_TEXT_LENGTH
+            if is_group_encrypted_message_text(text)
+            else MAX_GROUP_MESSAGE_TEXT_LENGTH
+        )
+        if len(text) > max_text_length:
+            errors['text'] = [f'Message text cannot exceed {max_text_length} characters.']
+
+    client_message_id = payload.get('client_message_id', '')
+    if client_message_id is None:
+        client_message_id = ''
+    if not isinstance(client_message_id, str):
+        errors['client_message_id'] = ['Client message id must be a string.']
+        client_message_id = ''
+    elif len(client_message_id) > 120:
+        errors['client_message_id'] = ['Client message id cannot exceed 120 characters.']
+
+    reply_to_message_id = payload.get('reply_to_message_id')
+    if reply_to_message_id in ('', None):
+        reply_to_message_id = None
+    else:
+        try:
+            reply_to_message_id = int(reply_to_message_id)
+        except (TypeError, ValueError):
+            errors['reply_to_message_id'] = ['Reply target must be a message id.']
+
+    if not text.strip() and not payload.get('encrypted_upload_intent_ids'):
+        errors['message'] = ['Message must include text or at least one attachment.']
+
+    if errors:
+        return None, errors
+
+    return {
+        'text': text.strip(),
+        'client_message_id': client_message_id.strip(),
+        'reply_to_message_id': reply_to_message_id,
+    }, None
+
+
+def normalize_group_message_list_params(params):
+    errors = {}
+    limit = params.get('limit', 20)
+    before_message_id = params.get('before_message_id')
+    around_message_id = params.get('around_message_id')
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        errors['limit'] = ['Limit must be a number.']
+        limit = 20
+
+    if limit < 1 or limit > 100:
+        errors['limit'] = ['Limit must be between 1 and 100.']
+
+    if before_message_id in ('', None):
+        before_message_id = None
+    else:
+        try:
+            before_message_id = int(before_message_id)
+        except (TypeError, ValueError):
+            errors['before_message_id'] = ['before_message_id must be a message id.']
+
+    if around_message_id in ('', None):
+        around_message_id = None
+    else:
+        try:
+            around_message_id = int(around_message_id)
+        except (TypeError, ValueError):
+            errors['around_message_id'] = ['around_message_id must be a message id.']
+
+    if before_message_id and around_message_id:
+        errors['message'] = ['Use either before_message_id or around_message_id, not both.']
+
+    if errors:
+        return None, None, None, errors
+
+    return limit, before_message_id, around_message_id, None
+
+
+def normalize_group_message_marker_payload(payload, field_name):
+    if not isinstance(payload, dict):
+        return None, {'body': ['Request body must be a JSON object.']}
+
+    errors = {}
+    message_id = payload.get(field_name)
+    if message_id in ('', None):
+        message_id = None
+    else:
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            errors[field_name] = ['Message id must be a number.']
+
+    if errors:
+        return None, errors
+
+    return {field_name: message_id}, None
+
+
+def normalize_group_reaction_payload(payload):
+    errors = {}
+    reaction = normalize_string(payload.get('reaction') if isinstance(payload, dict) else None)
+
+    if not reaction:
+        errors['reaction'] = ['Reaction is required.']
+    elif reaction not in GroupMessageReaction.ALLOWED_REACTIONS:
+        errors['reaction'] = ['Unsupported reaction.']
+
+    return {
+        'reaction': reaction,
+    }, errors
+
+
+def list_group_crypto_devices(sender, room_id):
+    context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+
+    user_ids = list(
+        RoomParticipant.objects.filter(room_id=context['room'].id, is_active=True)
+        .values_list('user_id', flat=True)
+    )
+    devices = (
+        UserDeviceKey.objects
+        .filter(user_id__in=user_ids, status=UserDeviceKey.STATUS_ACTIVE)
+        .order_by('user_id', '-last_seen_at', '-id')
+    )
+
+    return {
+        'status': 'ok',
+        'room_id': context['room'].id,
+        'member_user_ids': user_ids,
+        'devices': [serialize_device_key(device) for device in devices],
+    }, 200
+
+
+def has_existing_group_client_message(sender_user_id, client_message_id):
+    client_message_id = normalize_string(client_message_id)
+    if not client_message_id:
+        return False
+
+    return GroupMessage.objects.filter(
+        sender_user_id=sender_user_id,
+        client_message_id=client_message_id,
+    ).exists()
+
+
+def get_group_reply_target(room, reply_to_message_id):
+    if not reply_to_message_id:
+        return None
+
+    return GroupMessage.objects.filter(
+        room_id=room.id,
+        deleted_at__isnull=True,
+    ).get(pk=reply_to_message_id)
+
+
+def create_group_message_receipts(room, message, sender_user_id):
+    recipients = RoomParticipant.objects.filter(
+        room_id=room.id,
+        is_active=True,
+    ).exclude(user_id=sender_user_id)
+
+    GroupMessageReceipt.objects.bulk_create(
+        [
+            GroupMessageReceipt(
+                message=message,
+                room=room,
+                user_id=recipient.user_id,
+            )
+            for recipient in recipients
+        ],
+        ignore_conflicts=True,
+    )
+
+
+def sync_group_message_status(message):
+    receipts = list(
+        GroupMessageReceipt.objects.filter(message_id=message.id)
+    )
+    if not receipts:
+        next_status = GroupMessage.STATUS_SENT
+    elif all(receipt.read_at for receipt in receipts):
+        next_status = GroupMessage.STATUS_READ
+    elif all(receipt.delivered_at or receipt.read_at for receipt in receipts):
+        next_status = GroupMessage.STATUS_DELIVERED
+    else:
+        next_status = GroupMessage.STATUS_SENT
+
+    if message.status != next_status:
+        message.status = next_status
+        message.save(update_fields=['status', 'updated_at'])
+
+    return next_status
+
+
+def refresh_group_message_statuses(messages):
+    changed_statuses = []
+    for message in messages:
+        previous_status = message.status
+        next_status = sync_group_message_status(message)
+        if previous_status != next_status:
+            changed_statuses.append(
+                {
+                    'message_id': message.id,
+                    'status': next_status,
+                }
+            )
+
+    return changed_statuses
+
+
+def send_group_message(sender, room_id, payload):
+    normalized_payload, errors = normalize_group_message_payload(payload)
+    if errors:
+        return validation_error(errors)
+
+    context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+
+    existing_message = None
+    if normalized_payload['client_message_id']:
+        existing_message = GroupMessage.objects.filter(
+            sender_user_id=sender['user_id'],
+            client_message_id=normalized_payload['client_message_id'],
+        ).first()
+    if existing_message:
+        return {
+            'status': 'duplicate',
+            'room': serialize_group_room(existing_message.room, current_user_id=sender['user_id']),
+            'message': serialize_group_message(existing_message, sender['user_id']),
+        }, 200
+
+    try:
+        with transaction.atomic():
+            room = context['room']
+            reply_to = get_group_reply_target(room, normalized_payload['reply_to_message_id'])
+            message = GroupMessage.objects.create(
+                room=room,
+                reply_to=reply_to,
+                sender_user_id=sender['user_id'],
+                text=normalized_payload['text'],
+                client_message_id=normalized_payload['client_message_id'],
+                status=GroupMessage.STATUS_SENT,
+            )
+            create_group_message_receipts(room, message, sender['user_id'])
+            room.updated_at = timezone.now()
+            room.save(update_fields=['updated_at'])
+    except GroupMessage.DoesNotExist:
+        return validation_error({'reply_to_message_id': ['Reply target message was not found in this group.']})
+    except ValidationError as error:
+        return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
+
+    message = (
+        GroupMessage.objects
+        .select_related('room', 'reply_to')
+        .prefetch_related('receipts', 'reactions')
+        .get(id=message.id)
+    )
+    invalidate_room_caches(room.id)
+
+    return {
+        'status': 'sent',
+        'room': serialize_group_room(room, current_user_id=sender['user_id']),
+        'message': serialize_group_message(message, sender['user_id']),
+    }, 201
+
+
+def list_group_messages(user_id, room_id, limit=20, before_message_id=None, around_message_id=None):
+    cached_result = get_cached_room_messages(
+        user_id,
+        room_id,
+        limit,
+        before_message_id,
+        around_message_id,
+    )
+    if cached_result is not None:
+        return cached_result, 200
+
+    context, error, status = require_group_member(user_id, room_id)
+    if error:
+        return error, status
+
+    messages = (
+        GroupMessage.objects.filter(room_id=room_id, deleted_at__isnull=True)
+        .select_related('reply_to')
+        .prefetch_related('receipts', 'reactions')
+    )
+    if around_message_id:
+        result, status = list_group_messages_around_target(
+            user_id=user_id,
+            room=context['room'],
+            messages=messages,
+            limit=limit,
+            around_message_id=around_message_id,
+        )
+        if status < 300:
+            set_cached_room_messages(
+                user_id,
+                room_id,
+                limit,
+                before_message_id,
+                result,
+                around_message_id,
+            )
+        return result, status
+
+    if before_message_id:
+        messages = messages.filter(id__lt=before_message_id)
+
+    fetched_messages = list(messages.order_by('-created_at', '-id')[: limit + 1])
+    has_more = len(fetched_messages) > limit
+    page_messages = fetched_messages[:limit]
+    serialized_messages = [
+        serialize_group_message(message, user_id)
+        for message in reversed(page_messages)
+    ]
+    next_before_message_id = page_messages[-1].id if has_more and page_messages else None
+
+    result = {
+        'status': 'ok',
+        'room': serialize_group_room(context['room'], current_user_id=user_id),
+        'messages': serialized_messages,
+        'pagination': {
+            'limit': limit,
+            'before_message_id': before_message_id,
+            'count': len(serialized_messages),
+            'has_more': has_more,
+            'next_before_message_id': next_before_message_id,
+        },
+    }
+    set_cached_room_messages(user_id, room_id, limit, before_message_id, result)
+
+    return result, 200
+
+
+def list_group_messages_around_target(user_id, room, messages, limit, around_message_id):
+    target_message = messages.filter(id=around_message_id).first()
+    if not target_message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    older_limit = max((limit - 1) // 2, 0)
+    newer_limit = max(limit - older_limit - 1, 0)
+    older_messages = list(
+        messages.filter(id__lt=target_message.id).order_by('-created_at', '-id')[:older_limit]
+    )
+    newer_messages = list(
+        messages.filter(id__gt=target_message.id).order_by('created_at', 'id')[:newer_limit]
+    )
+    page_messages = sorted(
+        [*older_messages, target_message, *newer_messages],
+        key=lambda message: (message.created_at, message.id),
+    )
+    oldest_message = page_messages[0] if page_messages else None
+    newest_message = page_messages[-1] if page_messages else None
+    has_more_older = (
+        messages.filter(id__lt=oldest_message.id).exists()
+        if oldest_message
+        else False
+    )
+    has_more_newer = (
+        messages.filter(id__gt=newest_message.id).exists()
+        if newest_message
+        else False
+    )
+
+    return {
+        'status': 'ok',
+        'room': serialize_group_room(room, current_user_id=user_id),
+        'messages': [
+            serialize_group_message(message, user_id)
+            for message in page_messages
+        ],
+        'pagination': {
+            'limit': limit,
+            'before_message_id': None,
+            'around_message_id': around_message_id,
+            'target_message_id': target_message.id,
+            'count': len(page_messages),
+            'has_more': has_more_older,
+            'next_before_message_id': oldest_message.id if has_more_older and oldest_message else None,
+            'has_newer': has_more_newer,
+            'next_after_message_id': newest_message.id if has_more_newer and newest_message else None,
+        },
+    }, 200
+
+
+def mark_group_room_delivered(user_id, room_id, payload):
+    normalized_payload, errors = normalize_group_message_marker_payload(
+        payload,
+        'last_delivered_message_id',
+    )
+    if errors:
+        return validation_error(errors)
+
+    context, error, status = require_group_member(user_id, room_id)
+    if error:
+        return error, status
+
+    received_messages = GroupMessage.objects.filter(
+        room_id=room_id,
+        deleted_at__isnull=True,
+        receipts__user_id=user_id,
+    ).exclude(sender_user_id=user_id)
+
+    delivered_message = None
+    if normalized_payload['last_delivered_message_id']:
+        delivered_message = received_messages.filter(
+            id=normalized_payload['last_delivered_message_id'],
+        ).first()
+        if not delivered_message:
+            return validation_error(
+                {
+                    'last_delivered_message_id': [
+                        'Last delivered message must be a received message in this group.',
+                    ],
+                }
+            )
+        delivered_until = delivered_message.created_at
+    else:
+        delivered_message = received_messages.order_by('-created_at', '-id').first()
+        delivered_until = delivered_message.created_at if delivered_message else timezone.now()
+
+    receipt_ids = list(
+        GroupMessageReceipt.objects.filter(
+            room_id=room_id,
+            user_id=user_id,
+            delivered_at__isnull=True,
+            message__created_at__lte=delivered_until,
+            message__deleted_at__isnull=True,
+        )
+        .exclude(message__sender_user_id=user_id)
+        .values_list('id', flat=True)
+    )
+    now = timezone.now()
+    updated_receipts = 0
+    changed_statuses = []
+    if receipt_ids:
+        GroupMessageReceipt.objects.filter(id__in=receipt_ids).update(
+            delivered_at=now,
+            updated_at=now,
+        )
+        updated_receipts = len(receipt_ids)
+        affected_messages = list(
+            GroupMessage.objects.filter(receipts__id__in=receipt_ids)
+            .distinct()
+            .prefetch_related('receipts')
+        )
+        changed_statuses = refresh_group_message_statuses(affected_messages)
+
+    invalidate_room_caches(context['room'].id)
+
+    return {
+        'status': 'delivered',
+        'room_id': context['room'].id,
+        'user_id': user_id,
+        'last_delivered_message_id': delivered_message.id if delivered_message else None,
+        'delivered_until': delivered_until.isoformat(),
+        'updated_messages': updated_receipts,
+        'message_statuses': changed_statuses,
+        'unread_count': get_group_room_unread_count(context['room'].id, user_id),
+        'room': serialize_group_room(context['room'], current_user_id=user_id),
+    }, 200
+
+
+def mark_group_room_read(user_id, room_id, payload):
+    normalized_payload, errors = normalize_group_message_marker_payload(
+        payload,
+        'last_read_message_id',
+    )
+    if errors:
+        return validation_error(errors)
+
+    context, error, status = require_group_member(user_id, room_id)
+    if error:
+        return error, status
+
+    read_message = None
+    messages = GroupMessage.objects.filter(room_id=room_id, deleted_at__isnull=True)
+    if normalized_payload['last_read_message_id']:
+        read_message = messages.filter(id=normalized_payload['last_read_message_id']).first()
+        if not read_message:
+            return validation_error(
+                {
+                    'last_read_message_id': [
+                        'Last read message was not found in this group.',
+                    ],
+                }
+            )
+        requested_read_at = read_message.created_at
+    else:
+        read_message = messages.order_by('-created_at', '-id').first()
+        requested_read_at = read_message.created_at if read_message else timezone.now()
+
+    participant = context['participant']
+    current_read_at = participant.last_read_at
+    final_read_at = requested_read_at
+    read_marker_moved = True
+    if current_read_at and current_read_at >= requested_read_at:
+        final_read_at = current_read_at
+        read_marker_moved = False
+
+    receipt_ids = list(
+        GroupMessageReceipt.objects.filter(
+            room_id=room_id,
+            user_id=user_id,
+            read_at__isnull=True,
+            message__created_at__lte=final_read_at,
+            message__deleted_at__isnull=True,
+        )
+        .exclude(message__sender_user_id=user_id)
+        .values_list('id', flat=True)
+    )
+    now = timezone.now()
+    changed_statuses = []
+    with transaction.atomic():
+        if read_marker_moved:
+            participant.last_read_at = final_read_at
+            participant.save(update_fields=['last_read_at'])
+
+        if receipt_ids:
+            GroupMessageReceipt.objects.filter(id__in=receipt_ids).update(
+                delivered_at=now,
+                read_at=now,
+                updated_at=now,
+            )
+
+    if receipt_ids:
+        affected_messages = list(
+            GroupMessage.objects.filter(receipts__id__in=receipt_ids)
+            .distinct()
+            .prefetch_related('receipts')
+        )
+        changed_statuses = refresh_group_message_statuses(affected_messages)
+
+    invalidate_room_caches(context['room'].id)
+
+    return {
+        'status': 'read',
+        'room_id': context['room'].id,
+        'user_id': user_id,
+        'last_read_message_id': read_message.id if read_message else None,
+        'last_read_at': final_read_at.isoformat(),
+        'read_marker_moved': read_marker_moved,
+        'updated_messages': len(receipt_ids),
+        'message_statuses': changed_statuses,
+        'unread_count': get_group_room_unread_count(context['room'].id, user_id),
+        'room': serialize_group_room(context['room'], current_user_id=user_id),
+    }, 200
+
+
+def react_to_group_message(user_id, room_id, message_id, payload):
+    normalized_payload, errors = normalize_group_reaction_payload(payload)
+    if errors:
+        return validation_error(errors)
+
+    context, error, status = require_group_member(user_id, room_id)
+    if error:
+        return error, status
+
+    message = (
+        GroupMessage.objects.filter(
+            id=message_id,
+            room_id=context['room'].id,
+            deleted_at__isnull=True,
+        )
+        .prefetch_related('reactions')
+        .first()
+    )
+    if not message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    requested_reaction = normalized_payload['reaction']
+    previous_reaction = None
+    action = 'set'
+
+    with transaction.atomic():
+        reaction = (
+            GroupMessageReaction.objects.select_for_update()
+            .filter(message_id=message.id, user_id=user_id)
+            .first()
+        )
+        if reaction:
+            previous_reaction = reaction.reaction
+
+        if reaction and reaction.reaction == requested_reaction:
+            reaction.delete()
+            action = 'removed'
+            current_reaction = None
+        elif reaction:
+            reaction.reaction = requested_reaction
+            reaction.save(update_fields=['reaction', 'updated_at'])
+            action = 'updated'
+            current_reaction = requested_reaction
+        else:
+            GroupMessageReaction.objects.create(
+                message_id=message.id,
+                user_id=user_id,
+                reaction=requested_reaction,
+            )
+            current_reaction = requested_reaction
+
+    message = (
+        GroupMessage.objects
+        .prefetch_related('reactions')
+        .get(id=message.id)
+    )
+    invalidate_room_caches(context['room'].id)
+
+    return {
+        'status': 'ok',
+        'action': action,
+        'room_id': context['room'].id,
+        'message_id': message.id,
+        'user_id': user_id,
+        'reaction': current_reaction,
+        'previous_reaction': previous_reaction,
+        'reactions': serialize_group_message_reaction_summary(message),
+        'my_reaction': current_reaction,
+        'room': serialize_group_room(context['room'], current_user_id=user_id),
+    }, 200
+
+
+def create_group_encrypted_file_upload_intents(sender, room_id, payload):
+    context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+
+    normalized_payload, errors = normalize_group_encrypted_upload_intent_payload(payload)
+    if errors:
+        return validation_error(errors)
+
+    cloudinary_settings, errors = get_group_cloudinary_upload_settings()
+    if errors:
+        return validation_error(errors)
+
+    cleanup_expired_group_encrypted_upload_intents()
+
+    now = timezone.now()
+    timestamp = int(time.time())
+    ttl_seconds = int(
+        getattr(
+            settings,
+            'GROUP_MESSAGING_ENCRYPTED_UPLOAD_INTENT_TTL_SECONDS',
+            DEFAULT_GROUP_UPLOAD_INTENT_TTL_SECONDS,
+        )
+        or DEFAULT_GROUP_UPLOAD_INTENT_TTL_SECONDS
+    )
+    expires_at = now + timedelta(seconds=max(ttl_seconds, 60))
+    folder = f'{get_group_encrypted_upload_folder()}/room-{context["room"].id}/user-{sender["user_id"]}'
+    upload_intents = []
+
+    for index, attachment in enumerate(normalized_payload['attachments']):
+        public_id_param = f'{uuid.uuid4().hex}.txt'
+        cloudinary_public_id = f'{folder}/{public_id_param}'
+        signature_params = {
+            'folder': folder,
+            'overwrite': 'false',
+            'public_id': public_id_param,
+            'timestamp': timestamp,
+            'unique_filename': 'false',
+            'use_filename': 'false',
+        }
+        signature = api_sign_request(
+            signature_params,
+            cloudinary_settings['api_secret'],
+        )
+
+        intent = GroupMessageEncryptedUploadIntent.objects.create(
+            room=context['room'],
+            sender_user_id=sender['user_id'],
+            sender_account_number=sender.get('account_number') or context['participant'].account_number or '',
+            client_message_id=normalized_payload['client_message_id'],
+            attachment_client_id=attachment['attachment_client_id'],
+            attachment_index=attachment.get('sort_order', index),
+            original_file_name=attachment['file_name'],
+            original_mime_type=attachment['mime_type'],
+            original_file_size_bytes=attachment['file_size_bytes'],
+            encrypted_file_size_bytes=attachment['encrypted_file_size_bytes'],
+            cloudinary_public_id=cloudinary_public_id,
+            cloudinary_resource_type='raw',
+            cloudinary_folder=folder,
+            signature_timestamp=timestamp,
+            expires_at=expires_at,
+        )
+        upload_intents.append(
+            {
+                'id': str(intent.id),
+                'attachment_id': intent.attachment_client_id,
+                'attachment_index': intent.attachment_index,
+                'upload_url': (
+                    f'https://api.cloudinary.com/v1_1/'
+                    f'{cloudinary_settings["cloud_name"]}/raw/upload'
+                ),
+                'cloud_name': cloudinary_settings['cloud_name'],
+                'api_key': cloudinary_settings['api_key'],
+                'resource_type': 'raw',
+                'expires_at': intent.expires_at.isoformat(),
+                'encrypted_file_size_bytes': intent.encrypted_file_size_bytes,
+                'parameters': {
+                    **signature_params,
+                    'api_key': cloudinary_settings['api_key'],
+                    'signature': signature,
+                },
+            }
+        )
+
+    return {
+        'status': 'ok',
+        'room_id': context['room'].id,
+        'upload_intents': upload_intents,
+    }, 201
+
+
+def complete_group_encrypted_file_upload_intent(sender, room_id, upload_intent_id, payload):
+    context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+
+    try:
+        intent_id = uuid.UUID(str(upload_intent_id))
+    except (TypeError, ValueError):
+        return validation_error({'upload_intent_id': ['Upload intent id is invalid.']})
+
+    cloudinary_settings, errors = get_group_cloudinary_upload_settings()
+    if errors:
+        return validation_error(errors)
+
+    try:
+        intent = GroupMessageEncryptedUploadIntent.objects.get(
+            id=intent_id,
+            room_id=context['room'].id,
+            sender_user_id=sender['user_id'],
+        )
+    except GroupMessageEncryptedUploadIntent.DoesNotExist:
+        return {
+            'status': 'error',
+            'message': 'Upload intent was not found.',
+        }, 404
+
+    if intent.status == GroupMessageEncryptedUploadIntent.STATUS_COMPLETED:
+        return {
+            'status': 'ok',
+            'file': serialize_completed_group_upload_intent(intent),
+        }, 200
+
+    if intent.status != GroupMessageEncryptedUploadIntent.STATUS_ISSUED:
+        return validation_error({'upload_intent': ['Upload intent cannot be completed.']})
+
+    if intent.expires_at <= timezone.now():
+        expire_group_upload_intent(intent, cleanup_cloudinary=False)
+        return validation_error({'upload_intent': ['Upload intent has expired.']})
+
+    errors = validate_group_cloudinary_upload_response(intent, payload)
+    if errors:
+        return validation_error(errors)
+
+    version = str(payload.get('version')).strip()
+    secure_url = cloudinary_url(
+        intent.cloudinary_public_id,
+        resource_type='raw',
+        secure=True,
+        version=version,
+        cloud_name=cloudinary_settings['cloud_name'],
+    )[0]
+
+    intent.cloudinary_asset_id = normalize_string(payload.get('asset_id'))
+    intent.secure_url = secure_url
+    intent.status = GroupMessageEncryptedUploadIntent.STATUS_COMPLETED
+    intent.completed_at = timezone.now()
+    intent.save(
+        update_fields=[
+            'cloudinary_asset_id',
+            'secure_url',
+            'status',
+            'completed_at',
+            'updated_at',
+        ]
+    )
+
+    return {
+        'status': 'ok',
+        'file': serialize_completed_group_upload_intent(intent),
+    }, 200
+
+
+def validate_completed_group_encrypted_upload_intents(sender, room_id, payload):
+    upload_intent_ids, errors = normalize_group_upload_intent_ids(
+        payload.get('encrypted_upload_intent_ids'),
+    )
+    if errors:
+        return None, errors
+
+    if not upload_intent_ids:
+        return [], None
+
+    client_message_id = normalize_string(payload.get('client_message_id'))
+    if not client_message_id:
+        return None, {
+            'encrypted_upload_intent_ids': [
+                'Client message id is required when encrypted upload intents are attached.',
+            ],
+        }
+
+    intents = list(
+        GroupMessageEncryptedUploadIntent.objects.filter(id__in=upload_intent_ids)
+    )
+    intents_by_id = {str(intent.id): intent for intent in intents}
+    now = timezone.now()
+    errors = []
+
+    for index, upload_intent_id in enumerate(upload_intent_ids):
+        intent = intents_by_id.get(str(upload_intent_id))
+        if not intent:
+            errors.append({index: 'Upload intent was not found.'})
+            continue
+
+        item_errors = {}
+        if intent.sender_user_id != sender['user_id']:
+            item_errors['sender'] = 'Upload intent does not belong to this user.'
+        if int(intent.room_id) != int(room_id):
+            item_errors['room'] = 'Upload intent room does not match this message.'
+        if intent.client_message_id != client_message_id:
+            item_errors['client_message_id'] = 'Upload intent does not match this message.'
+        if intent.status != GroupMessageEncryptedUploadIntent.STATUS_COMPLETED:
+            item_errors['status'] = 'Upload intent has not been completed.'
+        if intent.expires_at <= now:
+            item_errors['expires_at'] = 'Upload intent has expired.'
+
+        if item_errors:
+            errors.append({index: item_errors})
+
+    return intents, errors or None
+
+
+def consume_completed_group_encrypted_upload_intents(intents):
+    intent_ids = [intent.id for intent in intents or []]
+    if not intent_ids:
+        return
+
+    now = timezone.now()
+    with transaction.atomic():
+        GroupMessageEncryptedUploadIntent.objects.filter(
+            id__in=intent_ids,
+            status=GroupMessageEncryptedUploadIntent.STATUS_COMPLETED,
+        ).update(
+            status=GroupMessageEncryptedUploadIntent.STATUS_CONSUMED,
+            consumed_at=now,
+            updated_at=now,
+        )
+
+
+def normalize_group_encrypted_upload_intent_payload(payload):
+    if not isinstance(payload, dict):
+        return None, {'body': ['Request body must be a JSON object.']}
+
+    client_message_id = normalize_string(payload.get('client_message_id'))
+    if not client_message_id:
+        return None, {'client_message_id': ['Client message id is required.']}
+    if len(client_message_id) > 120:
+        return None, {'client_message_id': ['Client message id cannot exceed 120 characters.']}
+
+    attachments = payload.get('attachments')
+    if not isinstance(attachments, list) or not attachments:
+        return None, {'attachments': ['At least one attachment is required.']}
+    if len(attachments) > MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST:
+        return None, {
+            'attachments': [
+                f'Cannot attach more than {MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST} files to one message.',
+            ],
+        }
+
+    normalized_attachments = []
+    errors = []
+    for index, attachment in enumerate(attachments):
+        normalized_attachment, item_errors = normalize_group_encrypted_upload_attachment(
+            attachment,
+            index,
+        )
+        if item_errors:
+            errors.append({index: item_errors})
+            continue
+
+        normalized_attachments.append(normalized_attachment)
+
+    if errors:
+        return None, {'attachments': errors}
+
+    return {
+        'client_message_id': client_message_id,
+        'attachments': normalized_attachments,
+    }, None
+
+
+def normalize_group_encrypted_upload_attachment(attachment, index):
+    if not isinstance(attachment, dict):
+        return None, 'Attachment must be an object.'
+
+    max_size = getattr(
+        settings,
+        'GROUP_MESSAGING_MAX_ENCRYPTED_UPLOAD_FILE_SIZE_BYTES',
+        MAX_GROUP_ENCRYPTED_FILE_SIZE_BYTES,
+    )
+    file_name = normalize_string(attachment.get('file_name')) or f'attachment-{index + 1}'
+    mime_type = normalize_string(attachment.get('mime_type')) or 'application/octet-stream'
+    attachment_client_id = normalize_string(attachment.get('id'))[:255]
+    file_size_bytes = normalize_positive_int(attachment.get('file_size_bytes'))
+    encrypted_file_size_bytes = normalize_positive_int(attachment.get('encrypted_file_size_bytes'))
+    sort_order = normalize_non_negative_int(attachment.get('sort_order'))
+    errors = {}
+
+    if not file_size_bytes:
+        errors['file_size_bytes'] = 'Attachment file is empty.'
+    if not encrypted_file_size_bytes:
+        errors['encrypted_file_size_bytes'] = 'Encrypted file is empty.'
+    elif encrypted_file_size_bytes > max_size:
+        errors['encrypted_file_size_bytes'] = (
+            f'Encrypted attachment cannot exceed {max_size // (1024 * 1024)} MB.'
+        )
+
+    if len(file_name) > 255:
+        file_name = file_name[:255]
+    if len(mime_type) > 120:
+        mime_type = mime_type[:120]
+
+    if errors:
+        return None, errors
+
+    return {
+        'attachment_client_id': attachment_client_id,
+        'file_name': file_name,
+        'mime_type': mime_type,
+        'file_size_bytes': file_size_bytes,
+        'encrypted_file_size_bytes': encrypted_file_size_bytes,
+        'sort_order': sort_order if sort_order is not None else index,
+    }, None
+
+
+def normalize_group_upload_intent_ids(value):
+    if value in (None, ''):
+        return [], None
+
+    if not isinstance(value, list):
+        return [], ['Encrypted upload intent ids must be a list.']
+
+    if len(value) > MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST:
+        return [], [
+            f'Cannot attach more than {MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST} encrypted files to one message.',
+        ]
+
+    normalized_ids = []
+    errors = []
+    seen_ids = set()
+
+    for index, item in enumerate(value):
+        try:
+            upload_intent_id = str(uuid.UUID(str(item)))
+        except (TypeError, ValueError):
+            errors.append({index: 'Upload intent id is invalid.'})
+            continue
+
+        if upload_intent_id in seen_ids:
+            errors.append({index: 'Upload intent id is duplicated.'})
+            continue
+
+        seen_ids.add(upload_intent_id)
+        normalized_ids.append(upload_intent_id)
+
+    return normalized_ids, errors or None
+
+
+def validate_group_cloudinary_upload_response(intent, payload):
+    if not isinstance(payload, dict):
+        return {'body': ['Request body must be a JSON object.']}
+
+    public_id = normalize_string(payload.get('public_id'))
+    resource_type = normalize_string(payload.get('resource_type')) or 'raw'
+    version = str(payload.get('version') or '').strip()
+    signature = normalize_string(payload.get('signature'))
+    uploaded_bytes = normalize_positive_int(payload.get('bytes'))
+    errors = {}
+
+    if public_id != intent.cloudinary_public_id:
+        errors['public_id'] = 'Cloudinary upload does not match this intent.'
+    if resource_type != 'raw':
+        errors['resource_type'] = 'Encrypted uploads must use raw Cloudinary resource type.'
+    if uploaded_bytes != intent.encrypted_file_size_bytes:
+        errors['bytes'] = 'Uploaded encrypted file size does not match this intent.'
+    if not version:
+        errors['version'] = 'Cloudinary upload version is required.'
+    if not signature:
+        errors['signature'] = 'Cloudinary upload signature is required.'
+
+    if not errors and not verify_api_response_signature(public_id, version, signature):
+        errors['signature'] = 'Cloudinary upload signature is invalid.'
+
+    return errors or None
+
+
+def serialize_completed_group_upload_intent(intent):
+    return {
+        'upload_intent_id': str(intent.id),
+        'encrypted_file_url': intent.secure_url,
+        'encrypted_file_size_bytes': intent.encrypted_file_size_bytes,
+        'cloudinary_public_id': intent.cloudinary_public_id,
+        'cloudinary_asset_id': intent.cloudinary_asset_id,
+        'cloudinary_resource_type': intent.cloudinary_resource_type,
+        'cloudinary_folder': intent.cloudinary_folder,
+    }
+
+
+def get_group_encrypted_upload_folder():
+    root_folder = (
+        getattr(settings, 'CLOUDINARY_MAIN_FOLDER', MAIN_CLOUDINARY_FOLDER).strip('/')
+        or MAIN_CLOUDINARY_FOLDER
+    )
+    return f'{root_folder}/e2ee/groups'
+
+
+def get_group_cloudinary_upload_settings():
+    cloudinary_url_value = getattr(settings, 'CLOUDINARY_URL', '')
+    if not cloudinary_url_value:
+        return None, {'cloudinary': ['Cloudinary is not configured for encrypted uploads.']}
+
+    parsed_url = urlparse(cloudinary_url_value)
+    if parsed_url.scheme != 'cloudinary':
+        return None, {'cloudinary': ['Cloudinary upload credentials are invalid.']}
+
+    cloud_name = parsed_url.hostname or ''
+    api_key = unquote(parsed_url.username or '')
+    api_secret = unquote(parsed_url.password or '')
+
+    if not cloud_name or not api_key or not api_secret:
+        return None, {'cloudinary': ['Cloudinary upload credentials are incomplete.']}
+
+    cloudinary_config(
+        cloud_name=cloud_name,
+        api_key=api_key,
+        api_secret=api_secret,
+        secure=True,
+    )
+
+    return {
+        'cloud_name': cloud_name,
+        'api_key': api_key,
+        'api_secret': api_secret,
+    }, None
+
+
+def cleanup_expired_group_encrypted_upload_intents(limit=25):
+    now = timezone.now()
+    expired_intents = list(
+        GroupMessageEncryptedUploadIntent.objects.filter(
+            expires_at__lt=now,
+            status__in=[
+                GroupMessageEncryptedUploadIntent.STATUS_ISSUED,
+                GroupMessageEncryptedUploadIntent.STATUS_COMPLETED,
+            ],
+        ).order_by('expires_at', 'created_at')[:limit]
+    )
+
+    for intent in expired_intents:
+        expire_group_upload_intent(
+            intent,
+            cleanup_cloudinary=(
+                intent.status == GroupMessageEncryptedUploadIntent.STATUS_COMPLETED
+            ),
+        )
+
+
+def expire_group_upload_intent(intent, cleanup_cloudinary=True):
+    if cleanup_cloudinary and intent.cloudinary_public_id:
+        try:
+            cloudinary_uploader.destroy(
+                intent.cloudinary_public_id,
+                resource_type=intent.cloudinary_resource_type or 'raw',
+            )
+        except CloudinaryError:
+            pass
+
+    intent.status = GroupMessageEncryptedUploadIntent.STATUS_EXPIRED
+    intent.save(update_fields=['status', 'updated_at'])
+
+
+def normalize_positive_int(value):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    return value if value > 0 else None
+
+
+def normalize_non_negative_int(value):
+    if value in (None, ''):
+        return None
+
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    return value if value >= 0 else None

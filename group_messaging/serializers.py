@@ -1,4 +1,10 @@
-from .models import GroupActionLog, GroupMembership, GroupProfile
+from .models import (
+    GroupActionLog,
+    GroupMembership,
+    GroupMessage,
+    GroupMessageReaction,
+    GroupProfile,
+)
 
 
 def get_group_role_map(room_id):
@@ -110,6 +116,18 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
         GroupActionLog.objects.filter(room_id=room.id)
         .order_by('-created_at', '-id')[:latest_log_limit]
     )
+    latest_message = (
+        GroupMessage.objects.filter(room_id=room.id, deleted_at__isnull=True)
+        .select_related('reply_to')
+        .prefetch_related('receipts', 'reactions')
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    unread_count = (
+        get_group_room_unread_count(room.id, current_user_id)
+        if current_user_id
+        else 0
+    )
 
     return {
         'title': profile.title if profile else room.title,
@@ -118,6 +136,10 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
         'participants': participants,
         'member_count': len(active_participants),
         'my_role': current_participant['role'] if current_participant else '',
+        'last_message': serialize_group_message(latest_message, current_user_id) if latest_message else None,
+        'unread_count': unread_count,
+        'has_unread': unread_count > 0,
+        'my_last_read_at': current_participant['last_read_at'] if current_participant else None,
         'latest_logs': [
             serialize_group_log(log)
             for log in reversed(logs)
@@ -154,5 +176,118 @@ def serialize_group_room(room, current_user_id=None):
         ],
         'member_count': extension.get('member_count', len(participants)),
         'my_role': current_participant['role'] if current_participant else extension.get('my_role', ''),
+        'last_message': extension.get('last_message'),
+        'unread_count': extension.get('unread_count', 0),
+        'has_unread': extension.get('has_unread', False),
+        'my_last_read_at': extension.get('my_last_read_at'),
         'latest_logs': extension.get('latest_logs', []),
     }
+
+
+def get_group_room_unread_count(room_id, current_user_id):
+    if not current_user_id:
+        return 0
+
+    return (
+        GroupMessage.objects.filter(
+            room_id=room_id,
+            deleted_at__isnull=True,
+            receipts__user_id=current_user_id,
+            receipts__read_at__isnull=True,
+        )
+        .exclude(sender_user_id=current_user_id)
+        .distinct()
+        .count()
+    )
+
+
+def serialize_group_message(message, current_user_id=None):
+    if not message:
+        return None
+
+    reaction_data = serialize_group_message_reactions(message, current_user_id)
+    return {
+        'id': message.id,
+        'room_id': message.room_id,
+        'room_type': 'group',
+        'is_group_message': True,
+        'sender_user_id': message.sender_user_id,
+        'recipient_user_id': None,
+        'reply_to_message_id': message.reply_to_id,
+        'reply_to': serialize_group_reply_preview(message.reply_to, current_user_id) if message.reply_to_id else None,
+        'text': message.text,
+        'client_message_id': message.client_message_id,
+        'status': message.status,
+        'created_at': message.created_at.isoformat(),
+        'updated_at': message.updated_at.isoformat(),
+        'attachments': [],
+        'reactions': reaction_data['reactions'],
+        'my_reaction': reaction_data['my_reaction'],
+        'receipts': serialize_group_message_receipts(message, current_user_id),
+    }
+
+
+def serialize_group_reply_preview(message, current_user_id=None):
+    if not message or message.deleted_at:
+        return None
+
+    return {
+        'id': message.id,
+        'room_id': message.room_id,
+        'room_type': 'group',
+        'is_group_message': True,
+        'sender_user_id': message.sender_user_id,
+        'recipient_user_id': None,
+        'text': message.text,
+        'attachment_count': 0,
+        'created_at': message.created_at.isoformat(),
+    }
+
+
+def serialize_group_message_reactions(message, current_user_id=None):
+    reaction_counts = {}
+    my_reaction = None
+
+    for reaction in message.reactions.all():
+        reaction_key = reaction.reaction
+        reaction_counts[reaction_key] = reaction_counts.get(reaction_key, 0) + 1
+
+        if current_user_id and int(reaction.user_id) == int(current_user_id):
+            my_reaction = reaction_key
+
+    reactions = []
+    for reaction_key in GroupMessageReaction.ALLOWED_REACTIONS:
+        count = reaction_counts.get(reaction_key, 0)
+        if not count:
+            continue
+
+        reaction_data = {
+            'reaction': reaction_key,
+            'count': count,
+        }
+        if current_user_id:
+            reaction_data['reacted_by_me'] = reaction_key == my_reaction
+        reactions.append(reaction_data)
+
+    return {
+        'reactions': reactions,
+        'my_reaction': my_reaction,
+    }
+
+
+def serialize_group_message_reaction_summary(message):
+    return serialize_group_message_reactions(message, current_user_id=None)['reactions']
+
+
+def serialize_group_message_receipts(message, current_user_id=None):
+    if current_user_id and int(message.sender_user_id) != int(current_user_id):
+        return []
+
+    return [
+        {
+            'user_id': receipt.user_id,
+            'delivered_at': receipt.delivered_at.isoformat() if receipt.delivered_at else None,
+            'read_at': receipt.read_at.isoformat() if receipt.read_at else None,
+        }
+        for receipt in message.receipts.all()
+    ]

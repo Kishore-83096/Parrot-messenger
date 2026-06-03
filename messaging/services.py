@@ -1179,6 +1179,14 @@ def get_visible_messages_queryset(user_id, room_id=None):
 
 
 def serialize_room_summary(room, current_user_id):
+    if room.is_group:
+        try:
+            from group_messaging.serializers import serialize_group_room
+
+            return serialize_group_room(room, current_user_id=current_user_id)
+        except Exception:
+            pass
+
     latest_message = (
         get_visible_messages_queryset(current_user_id, room_id=room.id)
         .prefetch_related('attachments', 'reactions')
