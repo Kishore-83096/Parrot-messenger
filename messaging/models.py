@@ -208,6 +208,7 @@ class Message(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_SENT)
     delivery_blocked = models.BooleanField(default=False)
     sent_while_blocked = models.BooleanField(default=False)
+    receipt_hidden_from_sender = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     edited_at = models.DateTimeField(null=True, blank=True)

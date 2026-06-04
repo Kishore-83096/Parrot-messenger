@@ -293,7 +293,7 @@ def serialize_group_message(message, current_user_id=None):
         ) if message.reply_to_id else None,
         'text': message.text,
         'client_message_id': message.client_message_id,
-        'status': message.status,
+        'status': get_group_message_status_for_viewer(message, current_user_id),
         'created_at': message.created_at.isoformat(),
         'updated_at': message.updated_at.isoformat(),
         'attachments': [],
@@ -376,6 +376,27 @@ def serialize_group_message_reaction_summary(message):
     return serialize_group_message_reactions(message, current_user_id=None)['reactions']
 
 
+def get_group_message_status_for_viewer(message, current_user_id=None):
+    if not current_user_id or int(message.sender_user_id) != int(current_user_id):
+        return message.status
+
+    visible_receipts = [
+        receipt
+        for receipt in message.receipts.all()
+        if not receipt.hidden_from_sender
+    ]
+    if not visible_receipts:
+        return GroupMessage.STATUS_SENT
+
+    if all(receipt.read_at for receipt in visible_receipts):
+        return GroupMessage.STATUS_READ
+
+    if all(receipt.delivered_at or receipt.read_at for receipt in visible_receipts):
+        return GroupMessage.STATUS_DELIVERED
+
+    return GroupMessage.STATUS_SENT
+
+
 def serialize_group_message_receipts(
     message,
     current_user_id=None,
@@ -400,4 +421,5 @@ def serialize_group_message_receipts(
             'read_at': receipt.read_at.isoformat() if receipt.read_at else None,
         }
         for receipt in message.receipts.all()
+        if not receipt.hidden_from_sender
     ]

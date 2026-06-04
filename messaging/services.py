@@ -23,6 +23,7 @@ from .e2ee.payloads import (
     is_encrypted_message_text,
 )
 from .models import Message, MessageAttachment, MessageReaction, Room, RoomParticipant
+from .signals import resolve_parent_receipt_visibility
 
 
 ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
@@ -691,17 +692,31 @@ def list_user_rooms(user_id):
 
 
 def get_room_unread_count(room_id, user_id):
-    return (
-        Message.objects.filter(
+    participant = (
+        RoomParticipant.objects.filter(
             room_id=room_id,
-            recipient_user_id=user_id,
-            deleted_at__isnull=True,
+            user_id=user_id,
+            is_active=True,
         )
-        .exclude(sender_user_id=user_id)
-        .exclude(room__room_type=Room.TYPE_DIRECT, delivery_blocked=True)
-        .exclude(status=Message.STATUS_READ)
-        .count()
+        .select_related('room')
+        .first()
     )
+    if not participant:
+        return 0
+
+    messages = Message.objects.filter(
+        room_id=room_id,
+        recipient_user_id=user_id,
+        deleted_at__isnull=True,
+    ).exclude(sender_user_id=user_id)
+
+    if participant.room.is_direct:
+        messages = messages.filter(delivery_blocked=False)
+        if participant.last_read_at:
+            messages = messages.filter(created_at__gt=participant.last_read_at)
+        return messages.count()
+
+    return messages.exclude(status=Message.STATUS_READ).count()
 
 
 def list_room_messages(user_id, room_id, limit=20, before_message_id=None, around_message_id=None):
@@ -930,6 +945,45 @@ def normalize_reaction_payload(payload):
     }, errors
 
 
+def resolve_hidden_receipt_sender_ids(owner_user_id, sender_user_ids):
+    candidate_user_ids = sorted(
+        {
+            int(user_id)
+            for user_id in sender_user_ids
+            if user_id and int(user_id) != int(owner_user_id)
+        }
+    )
+    if not candidate_user_ids:
+        return set(), None, None
+
+    policy_result, policy_status = resolve_parent_receipt_visibility(
+        {
+            'owner_user_id': int(owner_user_id),
+            'candidate_user_ids': candidate_user_ids,
+        }
+    )
+    parent_policy = policy_result.get('parent', {}).get('response')
+
+    if policy_status >= 500:
+        return None, {
+            'status': 'error',
+            'message': 'Unable to verify receipt visibility with Parent service.',
+            'policy': policy_result,
+        }, policy_status
+
+    if not isinstance(parent_policy, dict) or parent_policy.get('allowed') is not True:
+        return None, {
+            'status': 'error',
+            'message': 'Receipt visibility was not authorized.',
+            'policy': policy_result,
+        }, policy_status if policy_status >= 400 else 403
+
+    return {
+        int(user_id)
+        for user_id in parent_policy.get('hidden_user_ids') or []
+    }, None, None
+
+
 def mark_room_delivered(user_id, room_id, payload):
     normalized_payload, errors = normalize_delivered_payload(payload)
     if errors:
@@ -976,12 +1030,36 @@ def mark_room_delivered(user_id, room_id, payload):
         )
         delivered_until = delivered_message.created_at if delivered_message else timezone.now()
 
-    delivered_count = received_messages.filter(
+    status_candidates = received_messages.filter(
         created_at__lte=delivered_until,
         status=Message.STATUS_SENT,
-    ).update(
+        receipt_hidden_from_sender=False,
+    )
+    hidden_sender_ids, policy_error, policy_status = resolve_hidden_receipt_sender_ids(
+        user_id,
+        status_candidates.values_list('sender_user_id', flat=True).distinct(),
+    )
+    if policy_error:
+        return policy_error, policy_status
+
+    hidden_message_ids = list(
+        status_candidates.filter(sender_user_id__in=hidden_sender_ids)
+        .values_list('id', flat=True)
+    )
+    visible_status_candidates = status_candidates.exclude(
+        sender_user_id__in=hidden_sender_ids,
+    )
+    visible_message_ids = list(visible_status_candidates.values_list('id', flat=True))
+
+    now = timezone.now()
+    if hidden_message_ids:
+        Message.objects.filter(id__in=hidden_message_ids).update(
+            receipt_hidden_from_sender=True,
+            updated_at=now,
+        )
+    delivered_count = Message.objects.filter(id__in=visible_message_ids).update(
         status=Message.STATUS_DELIVERED,
-        updated_at=timezone.now(),
+        updated_at=now,
     )
 
     invalidate_room_caches(participant.room_id)
@@ -993,6 +1071,14 @@ def mark_room_delivered(user_id, room_id, payload):
         'last_delivered_message_id': delivered_message.id if delivered_message else None,
         'delivered_until': delivered_until.isoformat(),
         'updated_messages': delivered_count,
+        'hidden_receipts': len(hidden_message_ids),
+        'message_statuses': [
+            {
+                'message_id': message_id,
+                'status': Message.STATUS_DELIVERED,
+            }
+            for message_id in visible_message_ids
+        ],
         'unread_count': get_room_unread_count(participant.room_id, user_id),
         'room': serialize_room(participant.room),
     }, 200
@@ -1045,25 +1131,52 @@ def mark_room_read(user_id, room_id, payload):
         read_marker_moved = False
 
     updated_messages = 0
+    hidden_message_ids = []
+    visible_message_ids = []
+    if participant.room.is_direct:
+        status_candidates = Message.objects.filter(
+            room_id=room_id,
+            recipient_user_id=user_id,
+            delivery_blocked=False,
+            deleted_at__isnull=True,
+            created_at__lte=final_read_at,
+            receipt_hidden_from_sender=False,
+        ).exclude(
+            sender_user_id=user_id,
+        ).exclude(
+            status=Message.STATUS_READ,
+        )
+        hidden_sender_ids, policy_error, policy_status = resolve_hidden_receipt_sender_ids(
+            user_id,
+            status_candidates.values_list('sender_user_id', flat=True).distinct(),
+        )
+        if policy_error:
+            return policy_error, policy_status
+
+        hidden_message_ids = list(
+            status_candidates.filter(sender_user_id__in=hidden_sender_ids)
+            .values_list('id', flat=True)
+        )
+        visible_status_candidates = status_candidates.exclude(
+            sender_user_id__in=hidden_sender_ids,
+        )
+        visible_message_ids = list(visible_status_candidates.values_list('id', flat=True))
+
     with transaction.atomic():
         if read_marker_moved:
             participant.last_read_at = final_read_at
             participant.save(update_fields=['last_read_at'])
 
         if participant.room.is_direct:
-            updated_messages = Message.objects.filter(
-                room_id=room_id,
-                recipient_user_id=user_id,
-                delivery_blocked=False,
-                deleted_at__isnull=True,
-                created_at__lte=final_read_at,
-            ).exclude(
-                sender_user_id=user_id,
-            ).exclude(
+            now = timezone.now()
+            if hidden_message_ids:
+                Message.objects.filter(id__in=hidden_message_ids).update(
+                    receipt_hidden_from_sender=True,
+                    updated_at=now,
+                )
+            updated_messages = Message.objects.filter(id__in=visible_message_ids).update(
                 status=Message.STATUS_READ,
-            ).update(
-                status=Message.STATUS_READ,
-                updated_at=timezone.now(),
+                updated_at=now,
             )
 
     invalidate_room_caches(participant.room_id)
@@ -1076,6 +1189,14 @@ def mark_room_read(user_id, room_id, payload):
         'last_read_at': final_read_at.isoformat(),
         'read_marker_moved': read_marker_moved,
         'updated_messages': updated_messages,
+        'hidden_receipts': len(hidden_message_ids) if participant.room.is_direct else 0,
+        'message_statuses': [
+            {
+                'message_id': message_id,
+                'status': Message.STATUS_READ,
+            }
+            for message_id in (visible_message_ids if participant.room.is_direct else [])
+        ],
         'unread_count': get_room_unread_count(participant.room_id, user_id),
         'message_status_updated': participant.room.is_direct,
         'room': serialize_room(participant.room),
@@ -1266,7 +1387,7 @@ def serialize_message(message, current_user_id=None):
         'text': message.text,
         'client_message_id': message.client_message_id,
         'story_context': message.story_context or {},
-        'status': message.status,
+        'status': get_message_status_for_viewer(message, current_user_id),
         'sent_while_blocked': is_sent_while_blocked_visible(message, current_user_id),
         'created_at': message.created_at.isoformat(),
         'updated_at': message.updated_at.isoformat(),
@@ -1279,6 +1400,17 @@ def serialize_message(message, current_user_id=None):
     }
 
     return data
+
+
+def get_message_status_for_viewer(message, current_user_id=None):
+    if (
+        current_user_id
+        and int(message.sender_user_id or 0) == int(current_user_id)
+        and message.receipt_hidden_from_sender
+    ):
+        return Message.STATUS_SENT
+
+    return message.status
 
 
 def serialize_message_reaction_summary(message):

@@ -33,13 +33,22 @@ from .services import (
 )
 
 
-def broadcast_group_participant_event(room_payload, event_type, payload):
+def broadcast_group_participant_event(room_payload, event_type, payload, exclude_user_ids=None):
     participants = room_payload.get('participants') if isinstance(room_payload, dict) else []
     sent_user_ids = set()
+    excluded_user_ids = {
+        int(user_id)
+        for user_id in (exclude_user_ids or [])
+        if user_id
+    }
 
     for participant in participants or []:
         user_id = participant.get('user_id')
-        if not user_id or int(user_id) in sent_user_ids:
+        if (
+            not user_id
+            or int(user_id) in sent_user_ids
+            or int(user_id) in excluded_user_ids
+        ):
             continue
 
         broadcast_user_event(user_id, event_type, payload)
@@ -496,7 +505,7 @@ def group_deliver_room(request, room_id):
         room_id,
         payload,
     )
-    if response_status < 300:
+    if response_status < 300 and result.get('updated_messages', 0) > 0:
         event_payload = {
             'room_id': result['room_id'],
             'user_id': result['user_id'],
@@ -506,8 +515,12 @@ def group_deliver_room(request, room_id):
             'unread_count': result['unread_count'],
             'message_statuses': result.get('message_statuses', []),
         }
-        broadcast_room_event(room_id, 'group.message.delivered', event_payload)
-        broadcast_group_participant_event(result['room'], 'group.message.delivered', event_payload)
+        broadcast_group_participant_event(
+            result['room'],
+            'group.message.delivered',
+            event_payload,
+            exclude_user_ids=result.get('hidden_sender_user_ids', []),
+        )
 
     return JsonResponse(
         {
@@ -536,7 +549,7 @@ def group_read_room(request, room_id):
         room_id,
         payload,
     )
-    if response_status < 300:
+    if response_status < 300 and result.get('updated_messages', 0) > 0:
         event_payload = {
             'room_id': result['room_id'],
             'user_id': result['user_id'],
@@ -547,8 +560,12 @@ def group_read_room(request, room_id):
             'unread_count': result['unread_count'],
             'message_statuses': result.get('message_statuses', []),
         }
-        broadcast_room_event(room_id, 'group.message.read', event_payload)
-        broadcast_group_participant_event(result['room'], 'group.message.read', event_payload)
+        broadcast_group_participant_event(
+            result['room'],
+            'group.message.read',
+            event_payload,
+            exclude_user_ids=result.get('hidden_sender_user_ids', []),
+        )
 
     return JsonResponse(
         {

@@ -171,6 +171,7 @@ class GroupMessageReceipt(models.Model):
     user_id = models.PositiveBigIntegerField(db_index=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
     read_at = models.DateTimeField(null=True, blank=True)
+    hidden_from_sender = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -183,6 +184,7 @@ class GroupMessageReceipt(models.Model):
             models.Index(fields=['room', 'user_id', 'delivered_at'], name='group_messa_room_id_39a6de_idx'),
             models.Index(fields=['message', 'delivered_at'], name='group_messa_message_25b23b_idx'),
             models.Index(fields=['message', 'read_at'], name='group_messa_message_71d010_idx'),
+            models.Index(fields=['message', 'hidden_from_sender'], name='group_messa_message_ghost_idx'),
         ]
         ordering = ['created_at', 'id']
 

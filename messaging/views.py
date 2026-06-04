@@ -164,7 +164,7 @@ def sanitize_authorization_result(result):
         return {
             key: sanitize_authorization_result(value)
             for key, value in result.items()
-            if key not in {'delivery_blocked', 'block_context'}
+            if key not in {'delivery_blocked', 'block_context', 'ghost_context'}
         }
 
     if isinstance(result, list):
@@ -922,15 +922,22 @@ def read_room(request, room_id):
         room_id=room_id,
         payload=payload,
     )
-    if read_status < 300:
+    read_message_statuses = read_result.get('message_statuses', [])
+    if read_status < 300 and read_message_statuses:
+        last_visible_read_message_id = max(
+            item['message_id']
+            for item in read_message_statuses
+            if item.get('message_id')
+        )
         event_payload = {
             'room_id': read_result['room_id'],
             'user_id': read_result['user_id'],
-            'last_read_message_id': read_result['last_read_message_id'],
+            'last_read_message_id': last_visible_read_message_id,
             'last_read_at': read_result['last_read_at'],
             'read_marker_moved': read_result['read_marker_moved'],
             'updated_messages': read_result['updated_messages'],
             'unread_count': read_result['unread_count'],
+            'message_statuses': read_message_statuses,
         }
         broadcast_room_event(
             room_id,
@@ -970,14 +977,21 @@ def deliver_room(request, room_id):
         room_id=room_id,
         payload=payload,
     )
-    if delivered_status < 300:
+    delivered_message_statuses = delivered_result.get('message_statuses', [])
+    if delivered_status < 300 and delivered_message_statuses:
+        last_visible_delivered_message_id = max(
+            item['message_id']
+            for item in delivered_message_statuses
+            if item.get('message_id')
+        )
         event_payload = {
             'room_id': delivered_result['room_id'],
             'user_id': delivered_result['user_id'],
-            'last_delivered_message_id': delivered_result['last_delivered_message_id'],
+            'last_delivered_message_id': last_visible_delivered_message_id,
             'delivered_until': delivered_result['delivered_until'],
             'updated_messages': delivered_result['updated_messages'],
             'unread_count': delivered_result['unread_count'],
+            'message_statuses': delivered_message_statuses,
         }
         broadcast_room_event(
             room_id,

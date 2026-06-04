@@ -8,7 +8,7 @@ from cloudinary.exceptions import Error as CloudinaryError
 from cloudinary.utils import api_sign_request, cloudinary_url
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from messaging.e2ee.files import (
@@ -63,6 +63,21 @@ STORY_REACTION_MESSAGE_TEXT = {
 
 def get_story_reaction_message_text(reaction):
     return STORY_REACTION_MESSAGE_TEXT.get(reaction, reaction)
+
+
+def is_story_view_hidden_from_owner(parent_policy):
+    if not isinstance(parent_policy, dict):
+        return False
+
+    ghost_context = parent_policy.get('ghost_context')
+    if isinstance(ghost_context, dict):
+        return bool(ghost_context.get('viewer_ghosted_owner'))
+
+    viewer_contact = parent_policy.get('viewer_contact')
+    if isinstance(viewer_contact, dict):
+        return bool(viewer_contact.get('ghosted'))
+
+    return False
 
 
 def get_or_create_story_settings(sender):
@@ -544,7 +559,13 @@ def list_my_stories(sender):
             expires_at__gt=now,
         )
         .prefetch_related('media')
-        .annotate(view_count=Count('views', distinct=True))
+        .annotate(
+            view_count=Count(
+                'views',
+                filter=Q(views__hidden_from_owner=False),
+                distinct=True,
+            )
+        )
         .order_by('-created_at', '-id')
     )
 
@@ -637,7 +658,10 @@ def mark_story_viewed(sender, story_id):
             'viewed': False,
             'created': False,
             'is_owner': True,
-            'view_count': StoryView.objects.filter(story=story).count(),
+            'view_count': StoryView.objects.filter(
+                story=story,
+                hidden_from_owner=False,
+            ).count(),
         }, 200
 
     if not StoryAudience.objects.filter(
@@ -677,6 +701,7 @@ def mark_story_viewed(sender, story_id):
             'policy': policy_result,
         }, policy_status if policy_status >= 400 else 403
 
+    hidden_from_owner = is_story_view_hidden_from_owner(parent_policy)
     view, created = StoryView.objects.get_or_create(
         story=story,
         viewer_user_id=sender['user_id'],
@@ -686,6 +711,7 @@ def mark_story_viewed(sender, story_id):
                 or parent_policy.get('viewer_account_number')
                 or ''
             ),
+            'hidden_from_owner': hidden_from_owner,
         },
     )
 
@@ -699,7 +725,11 @@ def mark_story_viewed(sender, story_id):
         'viewed': True,
         'created': created,
         'viewed_at': view.viewed_at.isoformat(),
-        'view_count': StoryView.objects.filter(story=story).count(),
+        'hidden_from_owner': view.hidden_from_owner,
+        'view_count': StoryView.objects.filter(
+            story=story,
+            hidden_from_owner=False,
+        ).count(),
     }, 200 if not created else 201
 
 
@@ -724,7 +754,7 @@ def list_story_viewers(sender, story_id):
         }, 403
 
     viewers = list(
-        StoryView.objects.filter(story=story)
+        StoryView.objects.filter(story=story, hidden_from_owner=False)
         .order_by('-viewed_at', '-id')
     )
 
@@ -1061,6 +1091,7 @@ def record_story_view(sender, story, parent_policy):
                 or parent_policy.get('viewer_account_number')
                 or ''
             ),
+            'hidden_from_owner': is_story_view_hidden_from_owner(parent_policy),
         },
     )
 

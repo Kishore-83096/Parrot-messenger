@@ -279,6 +279,7 @@ class StoryView(models.Model):
     story = models.ForeignKey(Story, related_name='views', on_delete=models.CASCADE)
     viewer_user_id = models.PositiveBigIntegerField(db_index=True)
     viewer_account_number = models.CharField(max_length=10, db_index=True)
+    hidden_from_owner = models.BooleanField(default=False)
     viewed_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -289,6 +290,7 @@ class StoryView(models.Model):
             models.Index(fields=['story', 'viewed_at']),
             models.Index(fields=['viewer_user_id', 'viewed_at']),
             models.Index(fields=['viewer_account_number', 'viewed_at']),
+            models.Index(fields=['story', 'hidden_from_owner']),
         ]
         ordering = ['viewed_at', 'id']
 

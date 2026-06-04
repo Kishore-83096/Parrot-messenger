@@ -95,7 +95,7 @@ def sanitize_policy_result(result):
         return {
             key: sanitize_policy_result(value)
             for key, value in result.items()
-            if key != 'block_context'
+            if key not in {'block_context', 'ghost_context'}
         }
 
     if isinstance(result, list):
@@ -341,7 +341,7 @@ def story_view(request, story_id):
         return error_response
 
     result, response_status = mark_story_viewed(sender, story_id)
-    if response_status == 201:
+    if response_status == 201 and not result.get('hidden_from_owner'):
         broadcast_story_viewed(result, sender)
 
     return JsonResponse(
@@ -474,7 +474,11 @@ def broadcast_story_viewed(result, sender):
         return
 
     owner_user_id = result.get('owner_user_id')
-    if not owner_user_id or int(owner_user_id) == int(sender['user_id']):
+    if (
+        result.get('hidden_from_owner')
+        or not owner_user_id
+        or int(owner_user_id) == int(sender['user_id'])
+    ):
         return
 
     broadcast_user_event(

@@ -78,3 +78,7 @@ def resolve_parent_story_audience(payload):
 
 def authorize_parent_story_visibility(payload):
     return post_parent_story_policy('/parent/internal/stories/visibility', payload)
+
+
+def resolve_parent_receipt_visibility(payload):
+    return post_parent_story_policy('/parent/internal/receipts/visibility', payload)

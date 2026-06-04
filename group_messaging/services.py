@@ -32,6 +32,7 @@ from messaging.signals import (
     build_parent_headers,
     decode_parent_response,
     label_parent_url,
+    resolve_parent_receipt_visibility,
 )
 
 from .models import (
@@ -1251,9 +1252,51 @@ def create_group_message_receipts(room, message, sender_user_id):
     )
 
 
+def resolve_hidden_group_receipt_sender_ids(owner_user_id, sender_user_ids):
+    candidate_user_ids = sorted(
+        {
+            int(user_id)
+            for user_id in sender_user_ids
+            if user_id and int(user_id) != int(owner_user_id)
+        }
+    )
+    if not candidate_user_ids:
+        return set(), None, None
+
+    policy_result, policy_status = resolve_parent_receipt_visibility(
+        {
+            'owner_user_id': int(owner_user_id),
+            'candidate_user_ids': candidate_user_ids,
+        }
+    )
+    parent_policy = policy_result.get('parent', {}).get('response')
+
+    if policy_status >= 500:
+        return None, {
+            'status': 'error',
+            'message': 'Unable to verify receipt visibility with Parent service.',
+            'policy': policy_result,
+        }, policy_status
+
+    if not isinstance(parent_policy, dict) or parent_policy.get('allowed') is not True:
+        return None, {
+            'status': 'error',
+            'message': 'Receipt visibility was not authorized.',
+            'policy': policy_result,
+        }, policy_status if policy_status >= 400 else 403
+
+    return {
+        int(user_id)
+        for user_id in parent_policy.get('hidden_user_ids') or []
+    }, None, None
+
+
 def sync_group_message_status(message):
     receipts = list(
-        GroupMessageReceipt.objects.filter(message_id=message.id)
+        GroupMessageReceipt.objects.filter(
+            message_id=message.id,
+            hidden_from_sender=False,
+        )
     )
     if not receipts:
         next_status = GroupMessage.STATUS_SENT
@@ -1271,12 +1314,23 @@ def sync_group_message_status(message):
     return next_status
 
 
-def refresh_group_message_statuses(messages):
+def refresh_group_message_statuses(messages, emit_message_ids=None):
+    emit_message_id_set = (
+        {int(message_id) for message_id in emit_message_ids}
+        if emit_message_ids is not None
+        else None
+    )
     changed_statuses = []
     for message in messages:
         previous_status = message.status
         next_status = sync_group_message_status(message)
-        if previous_status != next_status:
+        if (
+            previous_status != next_status
+            and (
+                emit_message_id_set is None
+                or int(message.id) in emit_message_id_set
+            )
+        ):
             changed_statuses.append(
                 {
                     'message_id': message.id,
@@ -1531,33 +1585,71 @@ def mark_group_room_delivered(user_id, room_id, payload):
         delivered_message = received_messages.order_by('-created_at', '-id').first()
         delivered_until = delivered_message.created_at if delivered_message else timezone.now()
 
-    receipt_ids = list(
+    receipt_rows = list(
         GroupMessageReceipt.objects.filter(
             room_id=room_id,
             user_id=user_id,
             delivered_at__isnull=True,
+            hidden_from_sender=False,
             message__created_at__gte=visible_since,
             message__created_at__lte=delivered_until,
             message__deleted_at__isnull=True,
         )
         .exclude(message__sender_user_id=user_id)
-        .values_list('id', flat=True)
+        .values('id', 'message_id', 'message__sender_user_id')
     )
+    hidden_sender_ids, policy_error, policy_status = resolve_hidden_group_receipt_sender_ids(
+        user_id,
+        [row['message__sender_user_id'] for row in receipt_rows],
+    )
+    if policy_error:
+        return policy_error, policy_status
+
+    hidden_receipt_ids = [
+        row['id']
+        for row in receipt_rows
+        if int(row['message__sender_user_id']) in hidden_sender_ids
+    ]
+    visible_receipt_ids = [
+        row['id']
+        for row in receipt_rows
+        if int(row['message__sender_user_id']) not in hidden_sender_ids
+    ]
+    visible_message_ids = {
+        row['message_id']
+        for row in receipt_rows
+        if int(row['message__sender_user_id']) not in hidden_sender_ids
+    }
     now = timezone.now()
     updated_receipts = 0
     changed_statuses = []
-    if receipt_ids:
-        GroupMessageReceipt.objects.filter(id__in=receipt_ids).update(
+    if hidden_receipt_ids:
+        GroupMessageReceipt.objects.filter(id__in=hidden_receipt_ids).update(
+            delivered_at=now,
+            hidden_from_sender=True,
+            updated_at=now,
+        )
+    if visible_receipt_ids:
+        GroupMessageReceipt.objects.filter(id__in=visible_receipt_ids).update(
             delivered_at=now,
             updated_at=now,
         )
-        updated_receipts = len(receipt_ids)
+        updated_receipts = len(visible_receipt_ids)
+    if receipt_rows:
         affected_messages = list(
-            GroupMessage.objects.filter(receipts__id__in=receipt_ids)
+            GroupMessage.objects.filter(
+                receipts__id__in=[
+                    *hidden_receipt_ids,
+                    *visible_receipt_ids,
+                ]
+            )
             .distinct()
             .prefetch_related('receipts')
         )
-        changed_statuses = refresh_group_message_statuses(affected_messages)
+        changed_statuses = refresh_group_message_statuses(
+            affected_messages,
+            emit_message_ids=visible_message_ids,
+        )
 
     invalidate_room_caches(context['room'].id)
 
@@ -1568,6 +1660,8 @@ def mark_group_room_delivered(user_id, room_id, payload):
         'last_delivered_message_id': delivered_message.id if delivered_message else None,
         'delivered_until': delivered_until.isoformat(),
         'updated_messages': updated_receipts,
+        'hidden_receipts': len(hidden_receipt_ids),
+        'hidden_sender_user_ids': sorted(hidden_sender_ids),
         'message_statuses': changed_statuses,
         'unread_count': get_group_room_unread_count(
             context['room'].id,
@@ -1618,18 +1712,41 @@ def mark_group_room_read(user_id, room_id, payload):
         final_read_at = current_read_at
         read_marker_moved = False
 
-    receipt_ids = list(
+    receipt_rows = list(
         GroupMessageReceipt.objects.filter(
             room_id=room_id,
             user_id=user_id,
             read_at__isnull=True,
+            hidden_from_sender=False,
             message__created_at__gte=visible_since,
             message__created_at__lte=final_read_at,
             message__deleted_at__isnull=True,
         )
         .exclude(message__sender_user_id=user_id)
-        .values_list('id', flat=True)
+        .values('id', 'message_id', 'message__sender_user_id')
     )
+    hidden_sender_ids, policy_error, policy_status = resolve_hidden_group_receipt_sender_ids(
+        user_id,
+        [row['message__sender_user_id'] for row in receipt_rows],
+    )
+    if policy_error:
+        return policy_error, policy_status
+
+    hidden_receipt_ids = [
+        row['id']
+        for row in receipt_rows
+        if int(row['message__sender_user_id']) in hidden_sender_ids
+    ]
+    visible_receipt_ids = [
+        row['id']
+        for row in receipt_rows
+        if int(row['message__sender_user_id']) not in hidden_sender_ids
+    ]
+    visible_message_ids = {
+        row['message_id']
+        for row in receipt_rows
+        if int(row['message__sender_user_id']) not in hidden_sender_ids
+    }
     now = timezone.now()
     changed_statuses = []
     with transaction.atomic():
@@ -1637,20 +1754,36 @@ def mark_group_room_read(user_id, room_id, payload):
             participant.last_read_at = final_read_at
             participant.save(update_fields=['last_read_at'])
 
-        if receipt_ids:
-            GroupMessageReceipt.objects.filter(id__in=receipt_ids).update(
+        if hidden_receipt_ids:
+            GroupMessageReceipt.objects.filter(id__in=hidden_receipt_ids).update(
+                delivered_at=now,
+                read_at=now,
+                hidden_from_sender=True,
+                updated_at=now,
+            )
+
+        if visible_receipt_ids:
+            GroupMessageReceipt.objects.filter(id__in=visible_receipt_ids).update(
                 delivered_at=now,
                 read_at=now,
                 updated_at=now,
             )
 
-    if receipt_ids:
+    if receipt_rows:
         affected_messages = list(
-            GroupMessage.objects.filter(receipts__id__in=receipt_ids)
+            GroupMessage.objects.filter(
+                receipts__id__in=[
+                    *hidden_receipt_ids,
+                    *visible_receipt_ids,
+                ]
+            )
             .distinct()
             .prefetch_related('receipts')
         )
-        changed_statuses = refresh_group_message_statuses(affected_messages)
+        changed_statuses = refresh_group_message_statuses(
+            affected_messages,
+            emit_message_ids=visible_message_ids,
+        )
 
     invalidate_room_caches(context['room'].id)
 
@@ -1661,7 +1794,9 @@ def mark_group_room_read(user_id, room_id, payload):
         'last_read_message_id': read_message.id if read_message else None,
         'last_read_at': final_read_at.isoformat(),
         'read_marker_moved': read_marker_moved,
-        'updated_messages': len(receipt_ids),
+        'updated_messages': len(visible_receipt_ids),
+        'hidden_receipts': len(hidden_receipt_ids),
+        'hidden_sender_user_ids': sorted(hidden_sender_ids),
         'message_statuses': changed_statuses,
         'unread_count': get_group_room_unread_count(
             context['room'].id,
