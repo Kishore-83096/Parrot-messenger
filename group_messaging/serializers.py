@@ -147,6 +147,14 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
         )
         for participant in active_participants
     ]
+    current_participant_model = next(
+        (
+            participant
+            for participant in active_participants
+            if current_user_id and int(participant.user_id) == int(current_user_id)
+        ),
+        None,
+    )
     current_participant = next(
         (
             participant
@@ -155,19 +163,25 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
         ),
         None,
     )
-    logs = list(
-        GroupActionLog.objects.filter(room_id=room.id)
-        .order_by('-created_at', '-id')[:latest_log_limit]
+    visible_since = (
+        current_participant_model.joined_at
+        if current_participant_model and current_user_id
+        else None
     )
+    logs = GroupActionLog.objects.filter(room_id=room.id)
+    latest_messages = GroupMessage.objects.filter(room_id=room.id, deleted_at__isnull=True)
+    if visible_since:
+        logs = logs.filter(created_at__gte=visible_since)
+        latest_messages = latest_messages.filter(created_at__gte=visible_since)
+    logs = list(logs.order_by('-created_at', '-id')[:latest_log_limit])
     latest_message = (
-        GroupMessage.objects.filter(room_id=room.id, deleted_at__isnull=True)
-        .select_related('reply_to')
+        latest_messages.select_related('reply_to')
         .prefetch_related('receipts', 'reactions')
         .order_by('-created_at', '-id')
         .first()
     )
     unread_count = (
-        get_group_room_unread_count(room.id, current_user_id)
+        get_group_room_unread_count(room.id, current_user_id, visible_since=visible_since)
         if current_user_id
         else 0
     )
@@ -227,17 +241,21 @@ def serialize_group_room(room, current_user_id=None):
     }
 
 
-def get_group_room_unread_count(room_id, current_user_id):
+def get_group_room_unread_count(room_id, current_user_id, visible_since=None):
     if not current_user_id:
         return 0
 
+    messages = GroupMessage.objects.filter(
+        room_id=room_id,
+        deleted_at__isnull=True,
+        receipts__user_id=current_user_id,
+        receipts__read_at__isnull=True,
+    )
+    if visible_since:
+        messages = messages.filter(created_at__gte=visible_since)
+
     return (
-        GroupMessage.objects.filter(
-            room_id=room_id,
-            deleted_at__isnull=True,
-            receipts__user_id=current_user_id,
-            receipts__read_at__isnull=True,
-        )
+        messages
         .exclude(sender_user_id=current_user_id)
         .distinct()
         .count()

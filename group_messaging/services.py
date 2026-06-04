@@ -675,6 +675,7 @@ def add_group_members(sender, room_id, payload):
     logs = []
     with transaction.atomic():
         for contact in valid_contacts:
+            joined_at = timezone.now()
             participant, created = RoomParticipant.objects.get_or_create(
                 room=room,
                 user_id=contact['user_id'],
@@ -685,12 +686,26 @@ def add_group_members(sender, room_id, payload):
                     'is_active': True,
                 },
             )
-            if not created:
+            if created:
+                RoomParticipant.objects.filter(pk=participant.pk).update(joined_at=joined_at)
+                participant.joined_at = joined_at
+            else:
                 participant.account_number = contact['account_number']
                 participant.display_name = contact.get('display_name') or contact['account_number']
                 participant.role = RoomParticipant.ROLE_MEMBER
                 participant.is_active = True
-                participant.save(update_fields=['account_number', 'display_name', 'role', 'is_active'])
+                participant.last_read_at = None
+                participant.joined_at = joined_at
+                participant.save(
+                    update_fields=[
+                        'account_number',
+                        'display_name',
+                        'role',
+                        'is_active',
+                        'last_read_at',
+                        'joined_at',
+                    ]
+                )
 
             membership, _ = GroupMembership.objects.get_or_create(
                 room=room,
@@ -1203,14 +1218,18 @@ def has_existing_group_client_message(sender_user_id, client_message_id):
     ).exists()
 
 
-def get_group_reply_target(room, reply_to_message_id):
+def get_group_reply_target(room, reply_to_message_id, visible_since=None):
     if not reply_to_message_id:
         return None
 
-    return GroupMessage.objects.filter(
+    messages = GroupMessage.objects.filter(
         room_id=room.id,
         deleted_at__isnull=True,
-    ).get(pk=reply_to_message_id)
+    )
+    if visible_since:
+        messages = messages.filter(created_at__gte=visible_since)
+
+    return messages.get(pk=reply_to_message_id)
 
 
 def create_group_message_receipts(room, message, sender_user_id):
@@ -1293,7 +1312,11 @@ def send_group_message(sender, room_id, payload):
     try:
         with transaction.atomic():
             room = context['room']
-            reply_to = get_group_reply_target(room, normalized_payload['reply_to_message_id'])
+            reply_to = get_group_reply_target(
+                room,
+                normalized_payload['reply_to_message_id'],
+                visible_since=context['participant'].joined_at,
+            )
             message = GroupMessage.objects.create(
                 room=room,
                 reply_to=reply_to,
@@ -1326,6 +1349,10 @@ def send_group_message(sender, room_id, payload):
 
 
 def list_group_messages(user_id, room_id, limit=20, before_message_id=None, around_message_id=None):
+    context, error, status = require_group_member(user_id, room_id)
+    if error:
+        return error, status
+
     cached_result = get_cached_room_messages(
         user_id,
         room_id,
@@ -1336,15 +1363,14 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
     if cached_result is not None:
         return cached_result, 200
 
-    context, error, status = require_group_member(user_id, room_id)
-    if error:
-        return error, status
-
     messages = (
         GroupMessage.objects.filter(room_id=room_id, deleted_at__isnull=True)
         .select_related('reply_to')
         .prefetch_related('receipts', 'reactions')
     )
+    visible_since = context['participant'].joined_at
+    if visible_since:
+        messages = messages.filter(created_at__gte=visible_since)
     if around_message_id:
         result, status = list_group_messages_around_target(
             user_id=user_id,
@@ -1352,6 +1378,7 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
             messages=messages,
             limit=limit,
             around_message_id=around_message_id,
+            visible_since=visible_since,
         )
         if status < 300:
             set_cached_room_messages(
@@ -1382,7 +1409,7 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
         'status': 'ok',
         'room': serialize_group_room(context['room'], current_user_id=user_id),
         'messages': serialized_messages,
-        'logs': list_group_timeline_logs(context['room'].id),
+        'logs': list_group_timeline_logs(context['room'].id, visible_since=visible_since),
         'pagination': {
             'limit': limit,
             'before_message_id': before_message_id,
@@ -1396,11 +1423,12 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
     return result, 200
 
 
-def list_group_timeline_logs(room_id, limit=GROUP_TIMELINE_LOG_LIMIT):
-    logs = list(
-        GroupActionLog.objects.filter(room_id=room_id)
-        .order_by('-created_at', '-id')[:limit]
-    )
+def list_group_timeline_logs(room_id, limit=GROUP_TIMELINE_LOG_LIMIT, visible_since=None):
+    logs = GroupActionLog.objects.filter(room_id=room_id)
+    if visible_since:
+        logs = logs.filter(created_at__gte=visible_since)
+
+    logs = list(logs.order_by('-created_at', '-id')[:limit])
 
     return [
         serialize_group_log(log)
@@ -1408,7 +1436,7 @@ def list_group_timeline_logs(room_id, limit=GROUP_TIMELINE_LOG_LIMIT):
     ]
 
 
-def list_group_messages_around_target(user_id, room, messages, limit, around_message_id):
+def list_group_messages_around_target(user_id, room, messages, limit, around_message_id, visible_since=None):
     target_message = messages.filter(id=around_message_id).first()
     if not target_message:
         return {
@@ -1449,7 +1477,7 @@ def list_group_messages_around_target(user_id, room, messages, limit, around_mes
             serialize_group_message(message, user_id)
             for message in page_messages
         ],
-        'logs': list_group_timeline_logs(room.id),
+        'logs': list_group_timeline_logs(room.id, visible_since=visible_since),
         'pagination': {
             'limit': limit,
             'before_message_id': None,
@@ -1476,11 +1504,14 @@ def mark_group_room_delivered(user_id, room_id, payload):
     if error:
         return error, status
 
+    visible_since = context['participant'].joined_at
     received_messages = GroupMessage.objects.filter(
         room_id=room_id,
         deleted_at__isnull=True,
         receipts__user_id=user_id,
     ).exclude(sender_user_id=user_id)
+    if visible_since:
+        received_messages = received_messages.filter(created_at__gte=visible_since)
 
     delivered_message = None
     if normalized_payload['last_delivered_message_id']:
@@ -1505,6 +1536,7 @@ def mark_group_room_delivered(user_id, room_id, payload):
             room_id=room_id,
             user_id=user_id,
             delivered_at__isnull=True,
+            message__created_at__gte=visible_since,
             message__created_at__lte=delivered_until,
             message__deleted_at__isnull=True,
         )
@@ -1537,7 +1569,11 @@ def mark_group_room_delivered(user_id, room_id, payload):
         'delivered_until': delivered_until.isoformat(),
         'updated_messages': updated_receipts,
         'message_statuses': changed_statuses,
-        'unread_count': get_group_room_unread_count(context['room'].id, user_id),
+        'unread_count': get_group_room_unread_count(
+            context['room'].id,
+            user_id,
+            visible_since=visible_since,
+        ),
         'room': serialize_group_room(context['room'], current_user_id=user_id),
     }, 200
 
@@ -1555,7 +1591,10 @@ def mark_group_room_read(user_id, room_id, payload):
         return error, status
 
     read_message = None
+    visible_since = context['participant'].joined_at
     messages = GroupMessage.objects.filter(room_id=room_id, deleted_at__isnull=True)
+    if visible_since:
+        messages = messages.filter(created_at__gte=visible_since)
     if normalized_payload['last_read_message_id']:
         read_message = messages.filter(id=normalized_payload['last_read_message_id']).first()
         if not read_message:
@@ -1584,6 +1623,7 @@ def mark_group_room_read(user_id, room_id, payload):
             room_id=room_id,
             user_id=user_id,
             read_at__isnull=True,
+            message__created_at__gte=visible_since,
             message__created_at__lte=final_read_at,
             message__deleted_at__isnull=True,
         )
@@ -1623,7 +1663,11 @@ def mark_group_room_read(user_id, room_id, payload):
         'read_marker_moved': read_marker_moved,
         'updated_messages': len(receipt_ids),
         'message_statuses': changed_statuses,
-        'unread_count': get_group_room_unread_count(context['room'].id, user_id),
+        'unread_count': get_group_room_unread_count(
+            context['room'].id,
+            user_id,
+            visible_since=visible_since,
+        ),
         'room': serialize_group_room(context['room'], current_user_id=user_id),
     }, 200
 
@@ -1637,11 +1681,13 @@ def react_to_group_message(user_id, room_id, message_id, payload):
     if error:
         return error, status
 
+    visible_since = context['participant'].joined_at
     message = (
         GroupMessage.objects.filter(
             id=message_id,
             room_id=context['room'].id,
             deleted_at__isnull=True,
+            created_at__gte=visible_since,
         )
         .prefetch_related('reactions')
         .first()
