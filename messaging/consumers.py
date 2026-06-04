@@ -9,6 +9,7 @@ from django.core.cache import cache
 from .auth import validate_messaging_token
 from .models import RoomParticipant
 from .realtime import get_room_group_name, get_user_group_name
+from .signals import resolve_parent_presence_visibility
 
 
 def get_typing_cache_key(room_id, user_id):
@@ -362,7 +363,7 @@ class InboxConsumer(AsyncJsonWebsocketConsumer):
 
         return not active_connection_ids
 
-    def get_presence_recipient_user_ids_sync(self):
+    def get_presence_candidate_user_ids_sync(self):
         room_ids = RoomParticipant.objects.filter(
             user_id=self.user_id,
             is_active=True,
@@ -378,19 +379,101 @@ class InboxConsumer(AsyncJsonWebsocketConsumer):
             .distinct()
         )
 
+    def get_presence_recipient_user_ids_sync(self):
+        return self.filter_presence_user_ids_by_owner_blocks(
+            self.get_presence_candidate_user_ids_sync()
+        )
+
+    def normalize_presence_user_ids(self, candidate_user_ids):
+        return [
+            int(user_id)
+            for user_id in dict.fromkeys(candidate_user_ids or [])
+            if user_id and int(user_id) != int(self.user_id)
+        ]
+
+    def filter_presence_user_ids_by_owner_blocks(self, candidate_user_ids):
+        candidate_user_ids = self.normalize_presence_user_ids(candidate_user_ids)
+        if not candidate_user_ids:
+            return []
+
+        policy_result, policy_status = resolve_parent_presence_visibility(
+            {
+                'owner_user_id': self.user_id,
+                'candidate_user_ids': candidate_user_ids,
+            }
+        )
+        parent_policy = policy_result.get('parent', {}).get('response')
+
+        if policy_status >= 500:
+            return []
+
+        if not isinstance(parent_policy, dict) or parent_policy.get('allowed') is not True:
+            return []
+
+        visible_user_ids = parent_policy.get('visible_user_ids')
+        if not isinstance(visible_user_ids, list):
+            return []
+
+        visible_user_id_set = {
+            int(user_id)
+            for user_id in visible_user_ids
+            if user_id
+        }
+
+        return [
+            user_id
+            for user_id in candidate_user_ids
+            if user_id in visible_user_id_set
+        ]
+
+    def filter_presence_user_ids_by_viewer_blocks(self, candidate_user_ids):
+        candidate_user_ids = self.normalize_presence_user_ids(candidate_user_ids)
+        if not candidate_user_ids:
+            return []
+
+        policy_result, policy_status = resolve_parent_presence_visibility(
+            {
+                'viewer_user_id': self.user_id,
+                'candidate_user_ids': candidate_user_ids,
+            }
+        )
+        parent_policy = policy_result.get('parent', {}).get('response')
+
+        if policy_status >= 500:
+            return []
+
+        if not isinstance(parent_policy, dict) or parent_policy.get('allowed') is not True:
+            return []
+
+        visible_user_ids = parent_policy.get('visible_user_ids')
+        if not isinstance(visible_user_ids, list):
+            return []
+
+        visible_user_id_set = {
+            int(user_id)
+            for user_id in visible_user_ids
+            if user_id
+        }
+
+        return [
+            user_id
+            for user_id in candidate_user_ids
+            if user_id in visible_user_id_set
+        ]
+
     @database_sync_to_async
     def get_presence_recipient_user_ids(self):
         return self.get_presence_recipient_user_ids_sync()
 
     @database_sync_to_async
     def get_visible_online_user_ids(self):
-        visible_user_ids = self.get_presence_recipient_user_ids_sync()
-
-        return [
+        online_user_ids = [
             user_id
-            for user_id in visible_user_ids
+            for user_id in self.get_presence_candidate_user_ids_sync()
             if self.is_user_online(user_id)
         ]
+
+        return self.filter_presence_user_ids_by_viewer_blocks(online_user_ids)
 
     def get_close_code(self, status):
         if status == 401:

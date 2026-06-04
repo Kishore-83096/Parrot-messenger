@@ -1,4 +1,5 @@
 import json
+from hmac import compare_digest
 
 from django.conf import settings
 from django.http import JsonResponse
@@ -46,6 +47,13 @@ from .services import (
 )
 
 
+def is_internal_service_request(request):
+    expected_token = getattr(settings, 'INTERNAL_SERVICE_TOKEN', '') or ''
+    provided_token = request.headers.get('X-Internal-Service-Token', '')
+
+    return bool(expected_token) and compare_digest(provided_token, expected_token)
+
+
 def health_check(request):
     database_status = check_database()
     redis_status = check_redis()
@@ -75,6 +83,60 @@ def health_check(request):
             },
         },
         status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def hide_presence_from_user(request):
+    if not is_internal_service_request(request):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Unauthorized internal service request.',
+            },
+            status=401,
+        )
+
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    try:
+        owner_user_id = int(payload.get('owner_user_id') or 0)
+        viewer_user_id = int(payload.get('viewer_user_id') or 0)
+    except (TypeError, ValueError):
+        owner_user_id = 0
+        viewer_user_id = 0
+
+    if owner_user_id <= 0 or viewer_user_id <= 0 or owner_user_id == viewer_user_id:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Valid owner_user_id and viewer_user_id are required.',
+            },
+            status=400,
+        )
+
+    delivered = broadcast_user_event(
+        viewer_user_id,
+        'presence.offline',
+        {
+            'user_id': owner_user_id,
+            'account_number': payload.get('owner_account_number') or '',
+            'expires_in': 0,
+        },
+    )
+
+    return JsonResponse(
+        {
+            'status': 'ok',
+            'service': 'messenger',
+            'delivered': delivered,
+        },
+        status=200,
     )
 
 

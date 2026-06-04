@@ -7,6 +7,7 @@ from .views import (
     crypto_key_backup,
     deliver_room,
     health_check,
+    hide_presence_from_user,
     list_rooms,
     message_reaction,
     read_room,
@@ -24,6 +25,7 @@ from .views import (
 
 urlpatterns = [
     path('health/', health_check, name='messenger-health'),
+    path('presence/internal/hidden/', hide_presence_from_user, name='presence-hidden'),
     path('rooms/', list_rooms, name='room-list'),
     path('rooms/<int:room_id>/messages/', room_messages, name='room-messages'),
     path('rooms/<int:room_id>/delivered/', deliver_room, name='room-delivered'),
