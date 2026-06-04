@@ -2129,6 +2129,164 @@ class WebSocketRealtimeTests(TransactionTestCase):
         await communicator.disconnect()
 
 
+@override_settings(**TEST_JWT_SETTINGS)
+class PresenceVisibilityWebhookTests(TestCase):
+    owner_user_id = 1
+    viewer_user_id = 2
+    owner_account_number = '7000000001'
+
+    def setUp(self):
+        cache.clear()
+
+    def auth_header(self):
+        now = timezone.now()
+        token = jwt.encode(
+            {
+                'sub': str(self.owner_user_id),
+                'user_id': self.owner_user_id,
+                'account_number': self.owner_account_number,
+                'iss': settings.MESSAGING_JWT_ISSUER,
+                'aud': settings.MESSAGING_JWT_AUDIENCE,
+                'iat': now,
+                'exp': now + timedelta(minutes=5),
+            },
+            settings.MESSAGING_JWT_SECRET,
+            algorithm='HS256',
+        )
+
+        return f'Bearer {token}'
+
+    def post_presence_visibility(self, visible):
+        return self.client.post(
+            '/presence/internal/visibility/',
+            data=json.dumps(
+                {
+                    'owner_user_id': self.owner_user_id,
+                    'owner_account_number': self.owner_account_number,
+                    'viewer_user_id': self.viewer_user_id,
+                    'visible': visible,
+                }
+            ),
+            content_type='application/json',
+            HTTP_X_INTERNAL_SERVICE_TOKEN=settings.INTERNAL_SERVICE_TOKEN,
+        )
+
+    def post_presence_refresh(self):
+        return self.client.post(
+            '/presence/visibility/refresh/',
+            data=json.dumps({'viewer_user_id': self.viewer_user_id}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+    @patch('messaging.views.broadcast_user_event')
+    def test_presence_visibility_hidden_broadcasts_offline_immediately(
+        self,
+        broadcast_user_event,
+    ):
+        broadcast_user_event.return_value = True
+
+        response = self.post_presence_visibility(False)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['event_type'], 'presence.offline')
+        broadcast_user_event.assert_called_once_with(
+            self.viewer_user_id,
+            'presence.offline',
+            {
+                'user_id': self.owner_user_id,
+                'account_number': self.owner_account_number,
+                'expires_in': 0,
+            },
+        )
+
+    @patch('messaging.views.broadcast_user_event')
+    def test_presence_visibility_visible_broadcasts_online_when_owner_online(
+        self,
+        broadcast_user_event,
+    ):
+        broadcast_user_event.return_value = True
+        cache.set(
+            f'messaging:presence:user:{self.owner_user_id}:connections',
+            ['connection-1'],
+            timeout=settings.MESSAGING_PRESENCE_TTL_SECONDS * 2,
+        )
+        cache.set(
+            f'messaging:presence:user:{self.owner_user_id}:connection:connection-1',
+            True,
+            timeout=settings.MESSAGING_PRESENCE_TTL_SECONDS,
+        )
+
+        response = self.post_presence_visibility(True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['owner_online'])
+        self.assertEqual(response.json()['event_type'], 'presence.online')
+        broadcast_user_event.assert_called_once_with(
+            self.viewer_user_id,
+            'presence.online',
+            {
+                'user_id': self.owner_user_id,
+                'account_number': self.owner_account_number,
+                'expires_in': settings.MESSAGING_PRESENCE_TTL_SECONDS,
+            },
+        )
+
+    @patch('messaging.views.broadcast_user_event')
+    def test_presence_visibility_visible_does_not_broadcast_when_owner_offline(
+        self,
+        broadcast_user_event,
+    ):
+        response = self.post_presence_visibility(True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['owner_online'])
+        self.assertIsNone(response.json()['event_type'])
+        broadcast_user_event.assert_not_called()
+
+    @patch('messaging.views.resolve_parent_presence_visibility')
+    @patch('messaging.views.broadcast_user_event')
+    def test_authenticated_presence_refresh_uses_parent_policy_for_live_broadcast(
+        self,
+        broadcast_user_event,
+        resolve_parent_presence_visibility,
+    ):
+        broadcast_user_event.return_value = True
+        resolve_parent_presence_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'visible_user_ids': [],
+                        'hidden_user_ids': [self.viewer_user_id],
+                    },
+                },
+            },
+            200,
+        )
+
+        response = self.post_presence_refresh()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['visible'])
+        self.assertEqual(response.json()['event_type'], 'presence.offline')
+        resolve_parent_presence_visibility.assert_called_once_with(
+            {
+                'owner_user_id': self.owner_user_id,
+                'candidate_user_ids': [self.viewer_user_id],
+            }
+        )
+        broadcast_user_event.assert_called_once_with(
+            self.viewer_user_id,
+            'presence.offline',
+            {
+                'user_id': self.owner_user_id,
+                'account_number': self.owner_account_number,
+                'expires_in': 0,
+            },
+        )
+
+
 class MessagingCacheTests(TestCase):
     sender_user_id = 1
     recipient_user_id = 2

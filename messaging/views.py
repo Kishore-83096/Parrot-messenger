@@ -2,6 +2,7 @@ import json
 from hmac import compare_digest
 
 from django.conf import settings
+from django.core.cache import cache
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
@@ -30,6 +31,7 @@ from .signals import (
     check_database,
     check_parent_services,
     check_redis,
+    resolve_parent_presence_visibility,
 )
 from .services import (
     cleanup_uploaded_attachments,
@@ -89,6 +91,12 @@ def health_check(request):
 @csrf_exempt
 @require_POST
 def hide_presence_from_user(request):
+    return update_presence_visibility_for_user(request, force_visible=False)
+
+
+@csrf_exempt
+@require_POST
+def update_presence_visibility_for_user(request, force_visible=None):
     if not is_internal_service_request(request):
         return JsonResponse(
             {
@@ -120,24 +128,154 @@ def hide_presence_from_user(request):
             status=400,
         )
 
-    delivered = broadcast_user_event(
-        viewer_user_id,
-        'presence.offline',
-        {
-            'user_id': owner_user_id,
-            'account_number': payload.get('owner_account_number') or '',
-            'expires_in': 0,
-        },
+    visible = bool(payload.get('visible'))
+    if force_visible is not None:
+        visible = bool(force_visible)
+
+    result = broadcast_presence_visibility_to_viewer(
+        owner_user_id=owner_user_id,
+        owner_account_number=payload.get('owner_account_number') or '',
+        viewer_user_id=viewer_user_id,
+        visible=visible,
     )
 
     return JsonResponse(
         {
             'status': 'ok',
             'service': 'messenger',
-            'delivered': delivered,
+            **result,
         },
         status=200,
     )
+
+
+@csrf_exempt
+@require_POST
+def refresh_presence_visibility_for_user(request):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    try:
+        viewer_user_id = int(payload.get('viewer_user_id') or 0)
+    except (TypeError, ValueError):
+        viewer_user_id = 0
+
+    if viewer_user_id <= 0 or viewer_user_id == int(sender['user_id']):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Valid viewer_user_id is required.',
+            },
+            status=400,
+        )
+
+    policy_result, policy_status = resolve_parent_presence_visibility(
+        {
+            'owner_user_id': sender['user_id'],
+            'candidate_user_ids': [viewer_user_id],
+        }
+    )
+    parent_policy = policy_result.get('parent', {}).get('response')
+    if policy_status >= 500:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Unable to verify presence visibility with Parent service.',
+                'policy': policy_result,
+            },
+            status=policy_status,
+        )
+
+    if not isinstance(parent_policy, dict) or parent_policy.get('allowed') is not True:
+        return JsonResponse(
+            {
+                'status': 'denied',
+                'service': 'messenger',
+                'message': 'Presence visibility was not authorized.',
+                'policy': policy_result,
+            },
+            status=policy_status if policy_status >= 400 else 403,
+        )
+
+    visible_user_ids = {
+        int(user_id)
+        for user_id in parent_policy.get('visible_user_ids') or []
+        if user_id
+    }
+    visible = viewer_user_id in visible_user_ids
+    result = broadcast_presence_visibility_to_viewer(
+        owner_user_id=sender['user_id'],
+        owner_account_number=sender.get('account_number') or '',
+        viewer_user_id=viewer_user_id,
+        visible=visible,
+    )
+
+    return JsonResponse(
+        {
+            'status': 'ok',
+            'service': 'messenger',
+            **result,
+        },
+        status=200,
+    )
+
+
+def broadcast_presence_visibility_to_viewer(
+    owner_user_id,
+    owner_account_number,
+    viewer_user_id,
+    visible,
+):
+    owner_online = is_presence_user_online(owner_user_id)
+    delivered = False
+    event_type = 'presence.online' if visible else 'presence.offline'
+    if not visible or owner_online:
+        delivered = broadcast_user_event(
+            viewer_user_id,
+            event_type,
+            {
+                'user_id': owner_user_id,
+                'account_number': owner_account_number or '',
+                'expires_in': (
+                    getattr(settings, 'MESSAGING_PRESENCE_TTL_SECONDS', 60)
+                    if visible
+                    else 0
+                ),
+            },
+        )
+
+    return {
+        'event_type': event_type if (not visible or owner_online) else None,
+        'owner_online': owner_online,
+        'visible': visible,
+        'delivered': bool(delivered),
+    }
+
+
+def is_presence_user_online(user_id):
+    connection_ids = cache.get(f'messaging:presence:user:{int(user_id)}:connections') or []
+    active_connection_ids = [
+        connection_id
+        for connection_id in connection_ids
+        if cache.get(
+            f'messaging:presence:user:{int(user_id)}:connection:{connection_id}'
+        ) is not None
+    ]
+    if active_connection_ids != connection_ids:
+        cache.set(
+            f'messaging:presence:user:{int(user_id)}:connections',
+            active_connection_ids,
+            timeout=getattr(settings, 'MESSAGING_PRESENCE_TTL_SECONDS', 60) * 2,
+        )
+
+    return bool(active_connection_ids)
 
 
 def get_authorization_status(result, response_status):
