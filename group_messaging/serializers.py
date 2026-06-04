@@ -281,7 +281,11 @@ def serialize_group_message(message, current_user_id=None):
         'attachments': [],
         'reactions': reaction_data['reactions'],
         'my_reaction': reaction_data['my_reaction'],
-        'receipts': serialize_group_message_receipts(message, current_user_id),
+        'receipts': serialize_group_message_receipts(
+            message,
+            current_user_id,
+            participant_identity_by_user_id=participant_identity_by_user_id,
+        ),
     }
 
 
@@ -354,13 +358,26 @@ def serialize_group_message_reaction_summary(message):
     return serialize_group_message_reactions(message, current_user_id=None)['reactions']
 
 
-def serialize_group_message_receipts(message, current_user_id=None):
-    if current_user_id and int(message.sender_user_id) != int(current_user_id):
+def serialize_group_message_receipts(
+    message,
+    current_user_id=None,
+    participant_identity_by_user_id=None,
+):
+    if not current_user_id or int(message.sender_user_id) != int(current_user_id):
         return []
+
+    identity_map = (
+        participant_identity_by_user_id or
+        get_group_message_participant_identity_map(message)
+    )
 
     return [
         {
             'user_id': receipt.user_id,
+            'account_number': get_group_participant_identity(
+                identity_map,
+                receipt.user_id,
+            )['account_number'],
             'delivered_at': receipt.delivered_at.isoformat() if receipt.delivered_at else None,
             'read_at': receipt.read_at.isoformat() if receipt.read_at else None,
         }
