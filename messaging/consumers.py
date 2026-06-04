@@ -380,7 +380,7 @@ class InboxConsumer(AsyncJsonWebsocketConsumer):
         )
 
     def get_presence_recipient_user_ids_sync(self):
-        return self.filter_presence_user_ids_by_owner_blocks(
+        return self.filter_presence_user_ids_by_owner_visibility(
             self.get_presence_candidate_user_ids_sync()
         )
 
@@ -391,7 +391,7 @@ class InboxConsumer(AsyncJsonWebsocketConsumer):
             if user_id and int(user_id) != int(self.user_id)
         ]
 
-    def filter_presence_user_ids_by_owner_blocks(self, candidate_user_ids):
+    def filter_presence_user_ids_by_owner_visibility(self, candidate_user_ids):
         candidate_user_ids = self.normalize_presence_user_ids(candidate_user_ids)
         if not candidate_user_ids:
             return []
@@ -426,7 +426,7 @@ class InboxConsumer(AsyncJsonWebsocketConsumer):
             if user_id in visible_user_id_set
         ]
 
-    def filter_presence_user_ids_by_viewer_blocks(self, candidate_user_ids):
+    def filter_presence_user_ids_by_viewer_visibility(self, candidate_user_ids):
         candidate_user_ids = self.normalize_presence_user_ids(candidate_user_ids)
         if not candidate_user_ids:
             return []
@@ -473,7 +473,7 @@ class InboxConsumer(AsyncJsonWebsocketConsumer):
             if self.is_user_online(user_id)
         ]
 
-        return self.filter_presence_user_ids_by_viewer_blocks(online_user_ids)
+        return self.filter_presence_user_ids_by_viewer_visibility(online_user_ids)
 
     def get_close_code(self, status):
         if status == 401:

@@ -1033,7 +1033,6 @@ def mark_room_delivered(user_id, room_id, payload):
     status_candidates = received_messages.filter(
         created_at__lte=delivered_until,
         status=Message.STATUS_SENT,
-        receipt_hidden_from_sender=False,
     )
     hidden_sender_ids, policy_error, policy_status = resolve_hidden_receipt_sender_ids(
         user_id,
@@ -1059,6 +1058,7 @@ def mark_room_delivered(user_id, room_id, payload):
         )
     delivered_count = Message.objects.filter(id__in=visible_message_ids).update(
         status=Message.STATUS_DELIVERED,
+        receipt_hidden_from_sender=False,
         updated_at=now,
     )
 
@@ -1140,7 +1140,6 @@ def mark_room_read(user_id, room_id, payload):
             delivery_blocked=False,
             deleted_at__isnull=True,
             created_at__lte=final_read_at,
-            receipt_hidden_from_sender=False,
         ).exclude(
             sender_user_id=user_id,
         ).exclude(
@@ -1176,6 +1175,7 @@ def mark_room_read(user_id, room_id, payload):
                 )
             updated_messages = Message.objects.filter(id__in=visible_message_ids).update(
                 status=Message.STATUS_READ,
+                receipt_hidden_from_sender=False,
                 updated_at=now,
             )
 

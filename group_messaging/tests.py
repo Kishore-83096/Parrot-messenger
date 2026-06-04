@@ -1,4 +1,5 @@
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.core.cache import cache
 from django.test import TestCase, override_settings
@@ -8,7 +9,7 @@ from messaging.models import Room, RoomParticipant
 
 from .models import GroupActionLog, GroupMembership, GroupMessage, GroupMessageReceipt
 from .serializers import serialize_group_room
-from .services import list_group_messages
+from .services import list_group_messages, mark_group_room_read
 
 
 TEST_CACHE_SETTINGS = {
@@ -132,3 +133,138 @@ class GroupMembershipVisibilityTests(TestCase):
             [log['action'] for log in room['latest_logs']],
             [GroupActionLog.ACTION_MEMBER_ADDED],
         )
+
+
+@override_settings(**TEST_CACHE_SETTINGS)
+class GroupGhostReceiptTests(TestCase):
+    sender_user_id = 1
+    recipient_user_id = 2
+
+    def setUp(self):
+        cache.clear()
+        self.room = Room.objects.create(
+            room_type=Room.TYPE_GROUP,
+            title='Ghost receipts',
+            created_by_user_id=self.sender_user_id,
+        )
+        RoomParticipant.objects.create(
+            room=self.room,
+            user_id=self.sender_user_id,
+            account_number='7000000001',
+            display_name='Sender',
+            role=RoomParticipant.ROLE_ADMIN,
+        )
+        RoomParticipant.objects.create(
+            room=self.room,
+            user_id=self.recipient_user_id,
+            account_number='7000000002',
+            display_name='Recipient',
+        )
+        GroupMembership.objects.create(
+            room=self.room,
+            user_id=self.sender_user_id,
+            role=GroupMembership.ROLE_ADMIN,
+            is_active=True,
+        )
+        GroupMembership.objects.create(
+            room=self.room,
+            user_id=self.recipient_user_id,
+            role=GroupMembership.ROLE_MEMBER,
+            is_active=True,
+        )
+
+    @patch('group_messaging.services.resolve_parent_receipt_visibility')
+    def test_hidden_group_receipts_release_after_ghosting_is_removed(
+        self,
+        resolve_parent_receipt_visibility,
+    ):
+        first_message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            text='Group hidden while ghosted.',
+        )
+        latest_message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            text='Latest group hidden while ghosted.',
+        )
+        first_receipt = GroupMessageReceipt.objects.create(
+            message=first_message,
+            room=self.room,
+            user_id=self.recipient_user_id,
+        )
+        latest_receipt = GroupMessageReceipt.objects.create(
+            message=latest_message,
+            room=self.room,
+            user_id=self.recipient_user_id,
+        )
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [self.sender_user_id],
+                        'visible_user_ids': [],
+                    },
+                },
+            },
+            200,
+        )
+
+        hidden_result, hidden_status = mark_group_room_read(
+            self.recipient_user_id,
+            self.room.id,
+            {'last_read_message_id': latest_message.id},
+        )
+
+        self.assertEqual(hidden_status, 200)
+        self.assertEqual(hidden_result['updated_messages'], 0)
+        self.assertEqual(hidden_result['hidden_receipts'], 2)
+        first_message.refresh_from_db()
+        latest_message.refresh_from_db()
+        first_receipt.refresh_from_db()
+        latest_receipt.refresh_from_db()
+        self.assertEqual(first_message.status, GroupMessage.STATUS_SENT)
+        self.assertEqual(latest_message.status, GroupMessage.STATUS_SENT)
+        self.assertTrue(first_receipt.hidden_from_sender)
+        self.assertTrue(latest_receipt.hidden_from_sender)
+        self.assertIsNotNone(first_receipt.read_at)
+        self.assertIsNotNone(latest_receipt.read_at)
+
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [],
+                        'visible_user_ids': [self.sender_user_id],
+                    },
+                },
+            },
+            200,
+        )
+
+        released_result, released_status = mark_group_room_read(
+            self.recipient_user_id,
+            self.room.id,
+            {'last_read_message_id': latest_message.id},
+        )
+
+        self.assertEqual(released_status, 200)
+        self.assertEqual(released_result['updated_messages'], 2)
+        self.assertEqual(released_result['hidden_receipts'], 0)
+        self.assertEqual(
+            released_result['message_statuses'],
+            [
+                {'message_id': first_message.id, 'status': GroupMessage.STATUS_READ},
+                {'message_id': latest_message.id, 'status': GroupMessage.STATUS_READ},
+            ],
+        )
+        first_message.refresh_from_db()
+        latest_message.refresh_from_db()
+        first_receipt.refresh_from_db()
+        latest_receipt.refresh_from_db()
+        self.assertEqual(first_message.status, GroupMessage.STATUS_READ)
+        self.assertEqual(latest_message.status, GroupMessage.STATUS_READ)
+        self.assertFalse(first_receipt.hidden_from_sender)
+        self.assertFalse(latest_receipt.hidden_from_sender)

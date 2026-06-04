@@ -17,6 +17,7 @@ from cloudinary.utils import (
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 import httpx
 
@@ -1589,12 +1590,11 @@ def mark_group_room_delivered(user_id, room_id, payload):
         GroupMessageReceipt.objects.filter(
             room_id=room_id,
             user_id=user_id,
-            delivered_at__isnull=True,
-            hidden_from_sender=False,
             message__created_at__gte=visible_since,
             message__created_at__lte=delivered_until,
             message__deleted_at__isnull=True,
         )
+        .filter(Q(delivered_at__isnull=True) | Q(hidden_from_sender=True))
         .exclude(message__sender_user_id=user_id)
         .values('id', 'message_id', 'message__sender_user_id')
     )
@@ -1632,6 +1632,7 @@ def mark_group_room_delivered(user_id, room_id, payload):
     if visible_receipt_ids:
         GroupMessageReceipt.objects.filter(id__in=visible_receipt_ids).update(
             delivered_at=now,
+            hidden_from_sender=False,
             updated_at=now,
         )
         updated_receipts = len(visible_receipt_ids)
@@ -1716,12 +1717,11 @@ def mark_group_room_read(user_id, room_id, payload):
         GroupMessageReceipt.objects.filter(
             room_id=room_id,
             user_id=user_id,
-            read_at__isnull=True,
-            hidden_from_sender=False,
             message__created_at__gte=visible_since,
             message__created_at__lte=final_read_at,
             message__deleted_at__isnull=True,
         )
+        .filter(Q(read_at__isnull=True) | Q(hidden_from_sender=True))
         .exclude(message__sender_user_id=user_id)
         .values('id', 'message_id', 'message__sender_user_id')
     )
@@ -1766,6 +1766,7 @@ def mark_group_room_read(user_id, room_id, payload):
             GroupMessageReceipt.objects.filter(id__in=visible_receipt_ids).update(
                 delivered_at=now,
                 read_at=now,
+                hidden_from_sender=False,
                 updated_at=now,
             )
 

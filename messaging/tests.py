@@ -2382,6 +2382,89 @@ class MessagingCacheTests(TestCase):
         message.refresh_from_db()
         self.assertEqual(message.status, Message.STATUS_READ)
 
+    @patch('messaging.services.resolve_parent_receipt_visibility')
+    def test_hidden_direct_receipts_release_after_ghosting_is_removed(
+        self,
+        resolve_parent_receipt_visibility,
+    ):
+        room = self.create_direct_room()
+        first_message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Hidden while ghosted.',
+        )
+        latest_message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Latest hidden while ghosted.',
+        )
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [self.sender_user_id],
+                        'visible_user_ids': [],
+                    },
+                },
+            },
+            200,
+        )
+
+        hidden_result, hidden_status = mark_room_read(
+            self.recipient_user_id,
+            room.id,
+            {'last_read_message_id': latest_message.id},
+        )
+
+        self.assertEqual(hidden_status, 200)
+        self.assertEqual(hidden_result['updated_messages'], 0)
+        self.assertEqual(hidden_result['hidden_receipts'], 2)
+        first_message.refresh_from_db()
+        latest_message.refresh_from_db()
+        self.assertEqual(first_message.status, Message.STATUS_SENT)
+        self.assertEqual(latest_message.status, Message.STATUS_SENT)
+        self.assertTrue(first_message.receipt_hidden_from_sender)
+        self.assertTrue(latest_message.receipt_hidden_from_sender)
+
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [],
+                        'visible_user_ids': [self.sender_user_id],
+                    },
+                },
+            },
+            200,
+        )
+
+        released_result, released_status = mark_room_read(
+            self.recipient_user_id,
+            room.id,
+            {'last_read_message_id': latest_message.id},
+        )
+
+        self.assertEqual(released_status, 200)
+        self.assertEqual(released_result['updated_messages'], 2)
+        self.assertEqual(released_result['hidden_receipts'], 0)
+        self.assertEqual(
+            released_result['message_statuses'],
+            [
+                {'message_id': first_message.id, 'status': Message.STATUS_READ},
+                {'message_id': latest_message.id, 'status': Message.STATUS_READ},
+            ],
+        )
+        first_message.refresh_from_db()
+        latest_message.refresh_from_db()
+        self.assertEqual(first_message.status, Message.STATUS_READ)
+        self.assertEqual(latest_message.status, Message.STATUS_READ)
+        self.assertFalse(first_message.receipt_hidden_from_sender)
+        self.assertFalse(latest_message.receipt_hidden_from_sender)
+
     def test_delivery_blocked_is_rejected_for_group_room_messages(self):
         room = Room.objects.create(
             room_type=Room.TYPE_GROUP,
