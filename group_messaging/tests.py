@@ -8,9 +8,15 @@ from django.utils import timezone
 
 from messaging.models import Room, RoomParticipant
 
-from .models import GroupActionLog, GroupMembership, GroupMessage, GroupMessageReceipt
+from .models import (
+    GroupActionLog,
+    GroupMembership,
+    GroupMessage,
+    GroupMessageReceipt,
+    GroupProfile,
+)
 from .serializers import serialize_group_room
-from .services import list_group_messages, mark_group_room_read
+from .services import delete_group, list_group_messages, mark_group_room_read, send_group_message
 from .views import broadcast_group_participant_event
 
 
@@ -165,6 +171,123 @@ class GroupMembershipVisibilityTests(TestCase):
         self.assertEqual(
             [log['action'] for log in recipient_payload['room']['latest_logs']],
             [GroupActionLog.ACTION_MEMBER_ADDED],
+        )
+
+
+@override_settings(**TEST_CACHE_SETTINGS)
+class GroupSoftDeleteTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.room = Room.objects.create(
+            room_type=Room.TYPE_GROUP,
+            title='Preserved delete room',
+            created_by_user_id=1,
+        )
+        self.admin = RoomParticipant.objects.create(
+            room=self.room,
+            user_id=1,
+            account_number='7000000001',
+            display_name='Admin',
+            role=RoomParticipant.ROLE_ADMIN,
+        )
+        self.member = RoomParticipant.objects.create(
+            room=self.room,
+            user_id=2,
+            account_number='7000000002',
+            display_name='Member',
+        )
+        GroupMembership.objects.create(
+            room=self.room,
+            user_id=1,
+            role=GroupMembership.ROLE_ADMIN,
+            is_active=True,
+        )
+        GroupMembership.objects.create(
+            room=self.room,
+            user_id=2,
+            role=GroupMembership.ROLE_MEMBER,
+            is_active=True,
+        )
+        GroupProfile.objects.create(
+            room=self.room,
+            title='Preserved delete room',
+            created_by_user_id=1,
+        )
+        self.message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=2,
+            text='Keep this message',
+        )
+        GroupMessageReceipt.objects.create(
+            message=self.message,
+            room=self.room,
+            user_id=1,
+        )
+        self.admin_sender = {
+            'user_id': 1,
+            'account_number': '7000000001',
+        }
+        self.member_sender = {
+            'user_id': 2,
+            'account_number': '7000000002',
+        }
+
+    @patch('group_messaging.services.broadcast_room_event')
+    @patch('group_messaging.services.broadcast_user_event')
+    def test_admin_delete_preserves_room_messages_and_logs(
+        self,
+        broadcast_user_event,
+        broadcast_room_event,
+    ):
+        result, status = delete_group(self.admin_sender, self.room.id)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result['status'], 'deleted')
+        self.assertTrue(result['room']['is_deleted'])
+        self.assertFalse(result.get('removed_room_id'))
+        self.assertTrue(Room.objects.filter(id=self.room.id).exists())
+        self.assertTrue(GroupMessage.objects.filter(id=self.message.id).exists())
+        self.assertTrue(
+            GroupActionLog.objects.filter(
+                room_id=self.room.id,
+                action=GroupActionLog.ACTION_GROUP_DELETED,
+            ).exists()
+        )
+        profile = GroupProfile.objects.get(room_id=self.room.id)
+        self.assertIsNotNone(profile.deleted_at)
+        self.assertEqual(profile.deleted_by_user_id, 1)
+        serialized_room = serialize_group_room(self.room, current_user_id=2)
+        self.assertTrue(serialized_room['is_deleted'])
+        self.assertEqual(serialized_room['last_message']['text'], 'Keep this message')
+        self.assertEqual(
+            serialized_room['latest_logs'][-1]['action'],
+            GroupActionLog.ACTION_GROUP_DELETED,
+        )
+        self.assertEqual(broadcast_room_event.call_args.args[1], GroupActionLog.ACTION_GROUP_DELETED)
+        recipient_payload = next(
+            call.args[2]
+            for call in broadcast_user_event.call_args_list
+            if int(call.args[0]) == 2
+        )
+        self.assertTrue(recipient_payload['room']['is_deleted'])
+
+    def test_deleted_group_rejects_new_messages(self):
+        delete_group(self.admin_sender, self.room.id)
+
+        result, status = send_group_message(
+            self.member_sender,
+            self.room.id,
+            {
+                'text': 'Should not send',
+                'client_message_id': 'after-delete',
+            },
+        )
+
+        self.assertEqual(status, 403)
+        self.assertIn('deleted', result['message'])
+        self.assertEqual(
+            GroupMessage.objects.filter(room_id=self.room.id).count(),
+            1,
         )
 
 

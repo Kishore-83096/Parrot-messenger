@@ -297,7 +297,7 @@ def get_group_context(room_id, user_id):
             user_id=user_id,
             is_active=True,
         )
-        .select_related('room')
+        .select_related('room', 'room__group_profile')
         .first()
     )
     if not participant or not participant.room.is_group:
@@ -312,6 +312,33 @@ def get_group_context(room_id, user_id):
         'participant': participant,
         'membership': membership,
     }
+
+
+def get_group_profile(room):
+    try:
+        return room.group_profile
+    except GroupProfile.DoesNotExist:
+        return None
+
+
+def is_group_deleted(room):
+    profile = get_group_profile(room)
+    return bool(profile and profile.deleted_at)
+
+
+def deleted_group_error(room, current_user_id=None):
+    return {
+        'status': 'error',
+        'message': 'This group has been deleted. Messaging is closed.',
+        'room': serialize_group_room(room, current_user_id=current_user_id),
+    }, 403
+
+
+def require_group_open(context, current_user_id=None):
+    if is_group_deleted(context['room']):
+        return deleted_group_error(context['room'], current_user_id=current_user_id)
+
+    return None, None
 
 
 def require_group_member(user_id, room_id):
@@ -509,6 +536,9 @@ def update_group(sender, room_id, payload):
     context, error, status = require_group_manager(sender['user_id'], room_id)
     if error:
         return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
+    if error:
+        return error, status
 
     title = normalized_payload.get('title')
     if not title:
@@ -554,6 +584,9 @@ def update_group(sender, room_id, payload):
 
 def upload_group_avatar(sender, room_id, uploaded_file):
     context, error, status = require_group_manager(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
     if error:
         return error, status
 
@@ -637,6 +670,9 @@ def add_group_members(sender, room_id, payload):
         return validation_error(errors)
 
     context, error, status = require_group_manager(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
     if error:
         return error, status
 
@@ -752,6 +788,9 @@ def remove_group_member(sender, room_id, target_user_id):
     context, error, status = require_group_manager(sender['user_id'], room_id)
     if error:
         return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
+    if error:
+        return error, status
 
     room = context['room']
     actor_role = context['membership'].role
@@ -792,6 +831,9 @@ def remove_group_member(sender, room_id, target_user_id):
 
 def set_group_sub_admin(sender, room_id, target_user_id, enabled):
     context, error, status = require_group_manager(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
     if error:
         return error, status
 
@@ -844,6 +886,9 @@ def transfer_group_admin(sender, room_id, target_user_id):
     context, error, status = require_group_admin(sender['user_id'], room_id)
     if error:
         return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
+    if error:
+        return error, status
 
     room = context['room']
     if int(target_user_id) == int(sender['user_id']):
@@ -881,6 +926,9 @@ def transfer_group_admin(sender, room_id, target_user_id):
 
 def leave_group(sender, room_id):
     context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
     if error:
         return error, status
 
@@ -924,34 +972,48 @@ def delete_group(sender, room_id):
         return error, status
 
     room = context['room']
-    participants = get_room_participants_for_broadcast(room)
+    if is_group_deleted(room):
+        return {
+            'status': 'deleted',
+            'room_id': room.id,
+            'room': serialize_group_room(room, current_user_id=sender['user_id']),
+            'deleted': True,
+            'log': None,
+        }, 200
+
     with transaction.atomic():
+        profile = get_group_profile(room)
+        if not profile:
+            profile = GroupProfile.objects.create(
+                room=room,
+                title=room.title,
+                created_by_user_id=room.created_by_user_id or sender['user_id'],
+            )
+
+        deleted_at = timezone.now()
+        profile.deleted_at = deleted_at
+        profile.deleted_by_user_id = sender['user_id']
+        profile.save(update_fields=['deleted_at', 'deleted_by_user_id', 'updated_at'])
+        room.updated_at = deleted_at
+        room.save(update_fields=['updated_at'])
         log = GroupActionLog.objects.create(
             room=room,
             actor_user_id=sender['user_id'],
             action=GroupActionLog.ACTION_GROUP_DELETED,
             metadata=actor_metadata(sender, context['participant']),
         )
-        serialized_log = serialize_group_log(log)
-        room_id_value = room.id
-        room.delete()
 
-    invalidate_room_caches(room_id_value)
-    payload = {
-        'room_id': room_id_value,
-        'room': None,
-        'log': serialized_log,
-        'deleted': True,
-        'removed_room_id': room_id_value,
-    }
-    broadcast_room_event(room_id_value, GroupActionLog.ACTION_GROUP_DELETED, payload)
-    for participant in participants:
-        broadcast_user_event(participant['user_id'], GroupActionLog.ACTION_GROUP_DELETED, payload)
+    serialized_room = serialize_group_room(room, current_user_id=sender['user_id'])
+    serialized_log = serialize_group_log(log)
+    invalidate_room_caches(room.id)
+    broadcast_group_update(room, serialized_room, serialized_log)
 
     return {
         'status': 'deleted',
-        'room_id': room_id_value,
-        'removed_room_id': room_id_value,
+        'room_id': room.id,
+        'room': serialized_room,
+        'deleted': True,
+        'deleted_at': serialized_room.get('deleted_at'),
         'log': serialized_log,
     }, 200
 
@@ -1405,6 +1467,9 @@ def send_group_message(sender, room_id, payload):
         return validation_error(errors)
 
     context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
     if error:
         return error, status
 
@@ -1873,6 +1938,9 @@ def react_to_group_message(user_id, room_id, message_id, payload):
     context, error, status = require_group_member(user_id, room_id)
     if error:
         return error, status
+    error, status = require_group_open(context, current_user_id=user_id)
+    if error:
+        return error, status
 
     visible_since = context['participant'].joined_at
     message = (
@@ -1944,6 +2012,9 @@ def react_to_group_message(user_id, room_id, message_id, payload):
 
 def create_group_encrypted_file_upload_intents(sender, room_id, payload):
     context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
     if error:
         return error, status
 
@@ -2035,6 +2106,9 @@ def create_group_encrypted_file_upload_intents(sender, room_id, payload):
 
 def complete_group_encrypted_file_upload_intent(sender, room_id, upload_intent_id, payload):
     context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
     if error:
         return error, status
 

@@ -45,6 +45,8 @@ class GroupProfile(models.Model):
     avatar_cloudinary_public_id = models.CharField(max_length=512, blank=True)
     avatar_cloudinary_asset_id = models.CharField(max_length=255, blank=True)
     created_by_user_id = models.PositiveBigIntegerField()
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    deleted_by_user_id = models.PositiveBigIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
