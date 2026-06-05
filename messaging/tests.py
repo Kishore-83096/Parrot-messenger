@@ -33,7 +33,7 @@ from .models import (
     UserDeviceKey,
     UserE2EEKeyBackup,
 )
-from .cache import invalidate_room_messages_cache
+from .cache import get_cached_messaging_authorization, invalidate_room_messages_cache
 from .e2ee.devices.service import build_action_message
 from .realtime import broadcast_room_event, broadcast_user_event
 from .services import (
@@ -51,6 +51,7 @@ TEST_JWT_SETTINGS = {
     'MESSAGING_JWT_SECRET': 'test-messenger-secret-at-least-32-bytes',
     'MESSAGING_JWT_ISSUER': 'parrot-parent',
     'MESSAGING_JWT_AUDIENCE': 'parrot-messenger',
+    'INTERNAL_SERVICE_TOKEN': 'test-internal-service-token',
     'CLOUDINARY_URL': 'cloudinary://test-key:test-secret@test-cloud',
     'CLOUDINARY_MAIN_FOLDER': 'MAIN',
     'CACHES': {
@@ -1314,6 +1315,9 @@ class MessageSendAuthorizationTests(TestCase):
     sender_account_number = '7000000001'
     recipient_account_number = '7000000002'
 
+    def setUp(self):
+        cache.clear()
+
     def auth_header(self, user_id=None, account_number=None):
         now = timezone.now()
         token = jwt.encode(
@@ -1373,6 +1377,18 @@ class MessageSendAuthorizationTests(TestCase):
             data=json.dumps(payload),
             content_type='application/json',
             HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+    def post_authorization_cache(self, payload, token=None):
+        headers = {}
+        if token is not None:
+            headers['HTTP_X_INTERNAL_SERVICE_TOKEN'] = token
+
+        return self.client.post(
+            '/messages/internal/authorization-cache/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            **headers,
         )
 
     def post_upload_intents(self, payload):
@@ -1468,6 +1484,80 @@ class MessageSendAuthorizationTests(TestCase):
                 'status_code': 200,
             },
         }, 200
+
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_recipient_device_lookup_caches_parent_authorization_for_send(
+        self,
+        authorize_parent_messaging,
+    ):
+        authorize_parent_messaging.return_value = self.parent_allowed()
+
+        devices_response = self.client.get(
+            f'/crypto/recipients/{self.recipient_account_number}/devices/',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+        send_response = self.post_send_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Uses cached authorization.',
+            }
+        )
+
+        self.assertEqual(devices_response.status_code, 200)
+        self.assertEqual(send_response.status_code, 201)
+        authorize_parent_messaging.assert_called_once()
+        self.assertIsNotNone(
+            get_cached_messaging_authorization(
+                self.sender_user_id,
+                self.recipient_account_number,
+            )
+        )
+
+    @patch('messaging.views.broadcast_participant_event')
+    @patch('messaging.views.broadcast_room_event')
+    @patch('messaging.views.authorize_parent_messaging')
+    def test_internal_authorization_cache_update_drives_blocked_delivery(
+        self,
+        authorize_parent_messaging,
+        broadcast_room_event,
+        broadcast_participant_event,
+    ):
+        parent_response = self.parent_allowed(delivery_blocked=True)[0]['parent']['response']
+        cache_response = self.post_authorization_cache(
+            {
+                'authorizations': [
+                    {
+                        'sender_user_id': self.sender_user_id,
+                        'recipient_account_number': self.recipient_account_number,
+                        'status_code': 200,
+                        'response': parent_response,
+                    },
+                ],
+            },
+            token=settings.INTERNAL_SERVICE_TOKEN,
+        )
+
+        response = self.post_send_message(
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Blocked from cache.',
+            }
+        )
+
+        self.assertEqual(cache_response.status_code, 200)
+        self.assertEqual(cache_response.json()['updated'], 1)
+        self.assertEqual(response.status_code, 201)
+        authorize_parent_messaging.assert_not_called()
+
+        message = Message.objects.get()
+        self.assertTrue(message.delivery_blocked)
+        broadcast_room_event.assert_not_called()
+        broadcast_participant_event.assert_called_once()
+
+    def test_internal_authorization_cache_requires_internal_token(self):
+        response = self.post_authorization_cache({'authorizations': []})
+
+        self.assertEqual(response.status_code, 401)
 
     @patch('messaging.views.broadcast_participant_event')
     @patch('messaging.views.broadcast_room_event')

@@ -16,6 +16,10 @@ def get_room_messages_cache_timeout():
     return getattr(settings, 'MESSAGING_ROOM_MESSAGES_CACHE_TTL_SECONDS', 900)
 
 
+def get_messaging_authorization_cache_timeout():
+    return getattr(settings, 'MESSAGING_AUTHORIZATION_CACHE_TTL_SECONDS', 3600)
+
+
 def get_cache_version(version_key):
     version = cache.get(version_key)
     if version is None:
@@ -42,6 +46,22 @@ def room_list_version_key(user_id):
 
 def room_messages_version_key(room_id):
     return f'{CACHE_NAMESPACE}:room:{room_id}:messages:version'
+
+
+def messaging_authorization_cache_key(sender_user_id, recipient_account_number):
+    try:
+        sender_user_id = int(sender_user_id)
+    except (TypeError, ValueError):
+        return ''
+
+    recipient_account_number = str(recipient_account_number or '').strip()
+    if sender_user_id <= 0 or not recipient_account_number:
+        return ''
+
+    return (
+        f'{CACHE_NAMESPACE}:authorization:sender:{sender_user_id}:'
+        f'recipient:{recipient_account_number}'
+    )
 
 
 def room_list_cache_key(user_id):
@@ -82,6 +102,63 @@ def set_cached_room_messages(user_id, room_id, limit, before_message_id, result,
         result,
         timeout=get_room_messages_cache_timeout(),
     )
+
+
+def get_cached_messaging_authorization(sender_user_id, recipient_account_number):
+    cache_key = messaging_authorization_cache_key(sender_user_id, recipient_account_number)
+    if not cache_key:
+        return None
+
+    cached_authorization = cache.get(cache_key)
+    if not isinstance(cached_authorization, dict):
+        return None
+
+    authorization_result = cached_authorization.get('authorization_result')
+    response_status = cached_authorization.get('response_status')
+    if not isinstance(authorization_result, dict) or response_status is None:
+        return None
+
+    try:
+        response_status = int(response_status)
+    except (TypeError, ValueError):
+        return None
+
+    return authorization_result, response_status
+
+
+def set_cached_messaging_authorization(
+    sender_user_id,
+    recipient_account_number,
+    authorization_result,
+    response_status,
+):
+    cache_key = messaging_authorization_cache_key(sender_user_id, recipient_account_number)
+    if not cache_key or not isinstance(authorization_result, dict):
+        return False
+
+    try:
+        response_status = int(response_status)
+    except (TypeError, ValueError):
+        return False
+
+    cache.set(
+        cache_key,
+        {
+            'authorization_result': authorization_result,
+            'response_status': response_status,
+        },
+        timeout=get_messaging_authorization_cache_timeout(),
+    )
+    return True
+
+
+def delete_cached_messaging_authorization(sender_user_id, recipient_account_number):
+    cache_key = messaging_authorization_cache_key(sender_user_id, recipient_account_number)
+    if not cache_key:
+        return False
+
+    cache.delete(cache_key)
+    return True
 
 
 def get_active_room_user_ids(room_id):

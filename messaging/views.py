@@ -8,6 +8,11 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from .auth import validate_messaging_token
+from .cache import (
+    delete_cached_messaging_authorization,
+    get_cached_messaging_authorization,
+    set_cached_messaging_authorization,
+)
 from .e2ee.backups import get_user_key_backup, save_user_key_backup
 from .e2ee.devices import (
     list_accessible_user_device_keys,
@@ -377,12 +382,49 @@ def get_authenticated_sender(request):
     )
 
 
-def authorize_sender_for_recipient(sender, recipient_account_number):
-    parent_payload = {
-        'sender_user_id': sender['user_id'],
-        'recipient_account_number': recipient_account_number,
+def should_cache_messaging_authorization(authorization_result, response_status):
+    if response_status >= 500:
+        return False
+
+    parent_response = authorization_result.get('parent', {}).get('response')
+
+    return isinstance(parent_response, dict) and 'allowed' in parent_response
+
+
+def build_cached_parent_authorization_result(parent_response, response_status):
+    return {
+        'ok': response_status < 400,
+        'parent': {
+            'name': 'cached',
+            'ok': response_status < 400,
+            'status_code': response_status,
+            'cached': True,
+            'response': parent_response,
+        },
     }
-    authorization_result, response_status = authorize_parent_messaging(parent_payload)
+
+
+def authorize_sender_for_recipient(sender, recipient_account_number):
+    cached_authorization = get_cached_messaging_authorization(
+        sender['user_id'],
+        recipient_account_number,
+    )
+    if cached_authorization:
+        authorization_result, response_status = cached_authorization
+    else:
+        parent_payload = {
+            'sender_user_id': sender['user_id'],
+            'recipient_account_number': recipient_account_number,
+        }
+        authorization_result, response_status = authorize_parent_messaging(parent_payload)
+        if should_cache_messaging_authorization(authorization_result, response_status):
+            set_cached_messaging_authorization(
+                sender['user_id'],
+                recipient_account_number,
+                authorization_result,
+                response_status,
+            )
+
     parent_response = authorization_result.get('parent', {}).get('response')
 
     if isinstance(parent_response, dict) and parent_response.get('allowed') is True:
@@ -812,6 +854,91 @@ def crypto_key_backup(request):
             'result': result,
         },
         status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def update_message_authorization_cache(request):
+    if not is_internal_service_request(request):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Unauthorized internal service request.',
+            },
+            status=401,
+        )
+
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    authorizations = payload.get('authorizations')
+    if not isinstance(authorizations, list):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'errors': {
+                    'authorizations': ['Authorizations must be a list.'],
+                },
+            },
+            status=400,
+        )
+
+    updated = 0
+    invalidated = 0
+    skipped = 0
+
+    for authorization in authorizations:
+        if not isinstance(authorization, dict):
+            skipped += 1
+            continue
+
+        sender_user_id = authorization.get('sender_user_id')
+        recipient_account_number = authorization.get('recipient_account_number')
+
+        if authorization.get('invalidate') is True:
+            if delete_cached_messaging_authorization(sender_user_id, recipient_account_number):
+                invalidated += 1
+            else:
+                skipped += 1
+            continue
+
+        parent_response = authorization.get('response')
+        if not isinstance(parent_response, dict):
+            skipped += 1
+            continue
+
+        try:
+            response_status = int(authorization.get('status_code') or 200)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+
+        authorization_result = build_cached_parent_authorization_result(
+            parent_response,
+            response_status,
+        )
+        if set_cached_messaging_authorization(
+            sender_user_id,
+            recipient_account_number,
+            authorization_result,
+            response_status,
+        ):
+            updated += 1
+        else:
+            skipped += 1
+
+    return JsonResponse(
+        {
+            'status': 'updated',
+            'service': 'messenger',
+            'updated': updated,
+            'invalidated': invalidated,
+            'skipped': skipped,
+        }
     )
 
 
