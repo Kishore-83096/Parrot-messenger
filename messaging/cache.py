@@ -17,7 +17,11 @@ def get_room_messages_cache_timeout():
 
 
 def get_messaging_authorization_cache_timeout():
-    return getattr(settings, 'MESSAGING_AUTHORIZATION_CACHE_TTL_SECONDS', 3600)
+    return getattr(settings, 'MESSAGING_AUTHORIZATION_CACHE_TTL_SECONDS', 600)
+
+
+def get_receipt_visibility_cache_timeout():
+    return getattr(settings, 'MESSAGING_RECEIPT_VISIBILITY_CACHE_TTL_SECONDS', 600)
 
 
 def get_cache_version(version_key):
@@ -61,6 +65,22 @@ def messaging_authorization_cache_key(sender_user_id, recipient_account_number):
     return (
         f'{CACHE_NAMESPACE}:authorization:sender:{sender_user_id}:'
         f'recipient:{recipient_account_number}'
+    )
+
+
+def receipt_visibility_cache_key(owner_user_id, candidate_user_id):
+    try:
+        owner_user_id = int(owner_user_id)
+        candidate_user_id = int(candidate_user_id)
+    except (TypeError, ValueError):
+        return ''
+
+    if owner_user_id <= 0 or candidate_user_id <= 0 or owner_user_id == candidate_user_id:
+        return ''
+
+    return (
+        f'{CACHE_NAMESPACE}:receipt-visibility:owner:{owner_user_id}:'
+        f'candidate:{candidate_user_id}'
     )
 
 
@@ -154,6 +174,40 @@ def set_cached_messaging_authorization(
 
 def delete_cached_messaging_authorization(sender_user_id, recipient_account_number):
     cache_key = messaging_authorization_cache_key(sender_user_id, recipient_account_number)
+    if not cache_key:
+        return False
+
+    cache.delete(cache_key)
+    return True
+
+
+def get_cached_receipt_visibility(owner_user_id, candidate_user_id):
+    cache_key = receipt_visibility_cache_key(owner_user_id, candidate_user_id)
+    if not cache_key:
+        return None
+
+    cached_visibility = cache.get(cache_key)
+    if not isinstance(cached_visibility, dict) or 'hidden' not in cached_visibility:
+        return None
+
+    return bool(cached_visibility.get('hidden'))
+
+
+def set_cached_receipt_visibility(owner_user_id, candidate_user_id, hidden):
+    cache_key = receipt_visibility_cache_key(owner_user_id, candidate_user_id)
+    if not cache_key:
+        return False
+
+    cache.set(
+        cache_key,
+        {'hidden': bool(hidden)},
+        timeout=get_receipt_visibility_cache_timeout(),
+    )
+    return True
+
+
+def delete_cached_receipt_visibility(owner_user_id, candidate_user_id):
+    cache_key = receipt_visibility_cache_key(owner_user_id, candidate_user_id)
     if not cache_key:
         return False
 

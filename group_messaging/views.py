@@ -22,6 +22,7 @@ from .services import (
     mark_group_room_delivered,
     mark_group_room_read,
     normalize_group_message_list_params,
+    prewarm_group_receipt_visibility,
     react_to_group_message,
     remove_group_member,
     set_group_sub_admin,
@@ -476,6 +477,29 @@ def group_room_messages(request, room_id):
         limit=limit,
         before_message_id=before_message_id,
         around_message_id=around_message_id,
+    )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'group_messaging',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def group_receipt_visibility_prewarm(request, room_id):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = prewarm_group_receipt_visibility(
+        sender['user_id'],
+        room_id,
     )
 
     return JsonResponse(

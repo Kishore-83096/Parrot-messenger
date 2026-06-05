@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from .services import list_group_messages, mark_group_room_read
 
 
 TEST_CACHE_SETTINGS = {
+    'INTERNAL_SERVICE_TOKEN': 'test-internal-service-token',
     'CACHES': {
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
@@ -243,6 +245,22 @@ class GroupGhostReceiptTests(TestCase):
             },
             200,
         )
+        self.client.post(
+            '/receipts/internal/visibility-cache/',
+            data=json.dumps(
+                {
+                    'policies': [
+                        {
+                            'owner_user_id': self.recipient_user_id,
+                            'candidate_user_id': self.sender_user_id,
+                            'hidden': False,
+                        },
+                    ],
+                }
+            ),
+            content_type='application/json',
+            HTTP_X_INTERNAL_SERVICE_TOKEN='test-internal-service-token',
+        )
 
         released_result, released_status = mark_group_room_read(
             self.recipient_user_id,
@@ -268,3 +286,126 @@ class GroupGhostReceiptTests(TestCase):
         self.assertEqual(latest_message.status, GroupMessage.STATUS_READ)
         self.assertFalse(first_receipt.hidden_from_sender)
         self.assertFalse(latest_receipt.hidden_from_sender)
+
+    @patch('group_messaging.services.resolve_parent_receipt_visibility')
+    def test_group_receipt_visibility_uses_cached_ghost_policy(
+        self,
+        resolve_parent_receipt_visibility,
+    ):
+        first_message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            text='First cached hidden group receipt.',
+        )
+        first_receipt = GroupMessageReceipt.objects.create(
+            message=first_message,
+            room=self.room,
+            user_id=self.recipient_user_id,
+        )
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [self.sender_user_id],
+                        'visible_user_ids': [],
+                    },
+                },
+            },
+            200,
+        )
+
+        first_result, first_status = mark_group_room_read(
+            self.recipient_user_id,
+            self.room.id,
+            {'last_read_message_id': first_message.id},
+        )
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(first_result['hidden_receipts'], 1)
+        resolve_parent_receipt_visibility.assert_called_once()
+
+        second_message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            text='Second cached hidden group receipt.',
+        )
+        second_receipt = GroupMessageReceipt.objects.create(
+            message=second_message,
+            room=self.room,
+            user_id=self.recipient_user_id,
+        )
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [],
+                        'visible_user_ids': [self.sender_user_id],
+                    },
+                },
+            },
+            200,
+        )
+
+        second_result, second_status = mark_group_room_read(
+            self.recipient_user_id,
+            self.room.id,
+            {'last_read_message_id': second_message.id},
+        )
+
+        self.assertEqual(second_status, 200)
+        self.assertEqual(second_result['updated_messages'], 0)
+        self.assertEqual(second_result['hidden_receipts'], 2)
+        resolve_parent_receipt_visibility.assert_called_once()
+        first_receipt.refresh_from_db()
+        second_receipt.refresh_from_db()
+        self.assertTrue(first_receipt.hidden_from_sender)
+        self.assertTrue(second_receipt.hidden_from_sender)
+
+    @patch('group_messaging.services.resolve_parent_receipt_visibility')
+    def test_internal_receipt_visibility_cache_update_hides_group_receipts(
+        self,
+        resolve_parent_receipt_visibility,
+    ):
+        message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            text='Hidden from internal cache.',
+        )
+        receipt = GroupMessageReceipt.objects.create(
+            message=message,
+            room=self.room,
+            user_id=self.recipient_user_id,
+        )
+
+        cache_response = self.client.post(
+            '/receipts/internal/visibility-cache/',
+            data=json.dumps(
+                {
+                    'policies': [
+                        {
+                            'owner_user_id': self.recipient_user_id,
+                            'candidate_user_id': self.sender_user_id,
+                            'hidden': True,
+                        },
+                    ],
+                }
+            ),
+            content_type='application/json',
+            HTTP_X_INTERNAL_SERVICE_TOKEN='test-internal-service-token',
+        )
+        read_result, read_status = mark_group_room_read(
+            self.recipient_user_id,
+            self.room.id,
+            {'last_read_message_id': message.id},
+        )
+
+        self.assertEqual(cache_response.status_code, 200)
+        self.assertEqual(cache_response.json()['updated'], 1)
+        self.assertEqual(read_status, 200)
+        self.assertEqual(read_result['updated_messages'], 0)
+        self.assertEqual(read_result['hidden_receipts'], 1)
+        resolve_parent_receipt_visibility.assert_not_called()
+        receipt.refresh_from_db()
+        self.assertTrue(receipt.hidden_from_sender)

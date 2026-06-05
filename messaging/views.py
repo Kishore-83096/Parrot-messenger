@@ -10,8 +10,10 @@ from django.views.decorators.http import require_GET, require_POST
 from .auth import validate_messaging_token
 from .cache import (
     delete_cached_messaging_authorization,
+    delete_cached_receipt_visibility,
     get_cached_messaging_authorization,
     set_cached_messaging_authorization,
+    set_cached_receipt_visibility,
 )
 from .e2ee.backups import get_user_key_backup, save_user_key_backup
 from .e2ee.devices import (
@@ -926,6 +928,79 @@ def update_message_authorization_cache(request):
             recipient_account_number,
             authorization_result,
             response_status,
+        ):
+            updated += 1
+        else:
+            skipped += 1
+
+    return JsonResponse(
+        {
+            'status': 'updated',
+            'service': 'messenger',
+            'updated': updated,
+            'invalidated': invalidated,
+            'skipped': skipped,
+        }
+    )
+
+
+@csrf_exempt
+@require_POST
+def update_receipt_visibility_cache(request):
+    if not is_internal_service_request(request):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Unauthorized internal service request.',
+            },
+            status=401,
+        )
+
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    policies = payload.get('policies')
+    if not isinstance(policies, list):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'errors': {
+                    'policies': ['Policies must be a list.'],
+                },
+            },
+            status=400,
+        )
+
+    updated = 0
+    invalidated = 0
+    skipped = 0
+
+    for policy in policies:
+        if not isinstance(policy, dict):
+            skipped += 1
+            continue
+
+        owner_user_id = policy.get('owner_user_id')
+        candidate_user_id = policy.get('candidate_user_id')
+
+        if policy.get('invalidate') is True:
+            if delete_cached_receipt_visibility(owner_user_id, candidate_user_id):
+                invalidated += 1
+            else:
+                skipped += 1
+            continue
+
+        if 'hidden' not in policy:
+            skipped += 1
+            continue
+
+        if set_cached_receipt_visibility(
+            owner_user_id,
+            candidate_user_id,
+            bool(policy.get('hidden')),
         ):
             updated += 1
         else:

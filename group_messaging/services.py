@@ -22,8 +22,10 @@ from django.utils import timezone
 import httpx
 
 from messaging.cache import (
+    get_cached_receipt_visibility,
     get_cached_room_messages,
     invalidate_room_caches,
+    set_cached_receipt_visibility,
     set_cached_room_messages,
 )
 from messaging.models import Room, RoomParticipant, UserDeviceKey
@@ -1264,10 +1266,25 @@ def resolve_hidden_group_receipt_sender_ids(owner_user_id, sender_user_ids):
     if not candidate_user_ids:
         return set(), None, None
 
+    hidden_user_ids = set()
+    missing_candidate_user_ids = []
+    for candidate_user_id in candidate_user_ids:
+        cached_visibility = get_cached_receipt_visibility(
+            owner_user_id,
+            candidate_user_id,
+        )
+        if cached_visibility is None:
+            missing_candidate_user_ids.append(candidate_user_id)
+        elif cached_visibility:
+            hidden_user_ids.add(candidate_user_id)
+
+    if not missing_candidate_user_ids:
+        return hidden_user_ids, None, None
+
     policy_result, policy_status = resolve_parent_receipt_visibility(
         {
             'owner_user_id': int(owner_user_id),
-            'candidate_user_ids': candidate_user_ids,
+            'candidate_user_ids': missing_candidate_user_ids,
         }
     )
     parent_policy = policy_result.get('parent', {}).get('response')
@@ -1286,10 +1303,50 @@ def resolve_hidden_group_receipt_sender_ids(owner_user_id, sender_user_ids):
             'policy': policy_result,
         }, policy_status if policy_status >= 400 else 403
 
-    return {
+    hidden_parent_user_ids = {
         int(user_id)
         for user_id in parent_policy.get('hidden_user_ids') or []
-    }, None, None
+    }
+    for candidate_user_id in missing_candidate_user_ids:
+        is_hidden = candidate_user_id in hidden_parent_user_ids
+        set_cached_receipt_visibility(
+            owner_user_id,
+            candidate_user_id,
+            is_hidden,
+        )
+        if is_hidden:
+            hidden_user_ids.add(candidate_user_id)
+
+    return hidden_user_ids, None, None
+
+
+def prewarm_group_receipt_visibility(user_id, room_id):
+    context, error, status = require_group_member(user_id, room_id)
+    if error:
+        return error, status
+
+    candidate_user_ids = list(
+        RoomParticipant.objects.filter(
+            room_id=context['room'].id,
+            is_active=True,
+        )
+        .exclude(user_id=user_id)
+        .values_list('user_id', flat=True)
+    )
+    hidden_sender_ids, policy_error, policy_status = resolve_hidden_group_receipt_sender_ids(
+        user_id,
+        candidate_user_ids,
+    )
+    if policy_error:
+        return policy_error, policy_status
+
+    return {
+        'status': 'prewarmed',
+        'room_id': context['room'].id,
+        'user_id': user_id,
+        'candidate_users': len(candidate_user_ids),
+        'hidden_users': len(hidden_sender_ids),
+    }, 200
 
 
 def sync_group_message_status(message):
