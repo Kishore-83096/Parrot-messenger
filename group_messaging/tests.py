@@ -11,6 +11,7 @@ from messaging.models import Room, RoomParticipant
 from .models import GroupActionLog, GroupMembership, GroupMessage, GroupMessageReceipt
 from .serializers import serialize_group_room
 from .services import list_group_messages, mark_group_room_read
+from .views import broadcast_group_participant_event
 
 
 TEST_CACHE_SETTINGS = {
@@ -133,6 +134,36 @@ class GroupMembershipVisibilityTests(TestCase):
         self.assertEqual(room['unread_count'], 1)
         self.assertEqual(
             [log['action'] for log in room['latest_logs']],
+            [GroupActionLog.ACTION_MEMBER_ADDED],
+        )
+
+    @patch('group_messaging.views.broadcast_user_event')
+    def test_group_message_inbox_payload_uses_recipient_timeline_boundary(
+        self,
+        broadcast_user_event,
+    ):
+        sender_room = serialize_group_room(self.room, current_user_id=1)
+
+        broadcast_group_participant_event(
+            sender_room,
+            'group.message.sent',
+            {
+                'room': sender_room,
+                'message': {
+                    'room_id': self.room.id,
+                    'sender_user_id': 1,
+                },
+            },
+        )
+
+        recipient_payload = next(
+            call.args[2]
+            for call in broadcast_user_event.call_args_list
+            if int(call.args[0]) == 2
+        )
+
+        self.assertEqual(
+            [log['action'] for log in recipient_payload['room']['latest_logs']],
             [GroupActionLog.ACTION_MEMBER_ADDED],
         )
 

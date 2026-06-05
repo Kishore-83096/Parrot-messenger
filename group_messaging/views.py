@@ -4,9 +4,11 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
+from messaging.models import Room
 from messaging.realtime import broadcast_room_event, broadcast_user_event
 from messaging.views import get_authenticated_sender, parse_json_body
 
+from .serializers import serialize_group_room
 from .services import (
     add_group_members,
     complete_group_encrypted_file_upload_intent,
@@ -42,6 +44,14 @@ def broadcast_group_participant_event(room_payload, event_type, payload, exclude
         for user_id in (exclude_user_ids or [])
         if user_id
     }
+    room = None
+    payload_room = payload.get('room') if isinstance(payload, dict) else None
+    if isinstance(payload_room, dict):
+        room_id = payload_room.get('id') or (
+            room_payload.get('id') if isinstance(room_payload, dict) else None
+        )
+        if room_id:
+            room = Room.objects.filter(pk=room_id, room_type=Room.TYPE_GROUP).first()
 
     for participant in participants or []:
         user_id = participant.get('user_id')
@@ -52,7 +62,14 @@ def broadcast_group_participant_event(room_payload, event_type, payload, exclude
         ):
             continue
 
-        broadcast_user_event(user_id, event_type, payload)
+        participant_payload = payload
+        if room is not None:
+            participant_payload = {
+                **payload,
+                'room': serialize_group_room(room, current_user_id=user_id),
+            }
+
+        broadcast_user_event(user_id, event_type, participant_payload)
         sent_user_ids.add(int(user_id))
 
 
@@ -440,7 +457,14 @@ def group_send_message(request, room_id):
             'message': result['message'],
             'sender': sender,
         }
-        broadcast_room_event(result['message']['room_id'], 'group.message.sent', event_payload)
+        broadcast_room_event(
+            result['message']['room_id'],
+            'group.message.sent',
+            {
+                'message': result['message'],
+                'sender': sender,
+            },
+        )
         broadcast_group_participant_event(result['room'], 'group.message.sent', event_payload)
 
     return JsonResponse(
