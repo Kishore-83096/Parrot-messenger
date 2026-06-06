@@ -1,8 +1,8 @@
 # Parrot Messenger Service
 
-The Messenger service is the Django backend for rooms, messages, message reactions, encrypted attachments, encrypted media upload intents, E2EE device keys, recovery-key backups, presence, and WebSocket events.
+The Messenger service is the Django backend for direct rooms, group rooms, stories, messages, message replies, reactions, edit/delete state, encrypted attachments, encrypted media upload intents, E2EE device keys, recovery-key backups, presence, receipts, and WebSocket events.
 
-Messenger does not own user accounts. It trusts short-lived Messenger JWTs issued by the Parent service and calls Parent's internal authorization API before allowing sends.
+Messenger does not own user accounts. It trusts short-lived Messenger JWTs issued by the Parent service and calls Parent's internal policy APIs before allowing sends, resolving group members, showing presence/receipts, or exposing story audiences.
 
 ## Tech Stack
 
@@ -93,6 +93,19 @@ Messenger/
 |   |-- models.py
 |   |-- admin.py
 |   `-- tests.py
+|-- group_messaging/
+|   |-- urls.py                    # group room, member, message, upload routes
+|   |-- views.py
+|   |-- services.py                # group roles/messages/receipts/uploads
+|   |-- serializers.py
+|   `-- models.py
+|-- stories/
+|   |-- urls.py                    # story feed, upload, reaction/reply routes
+|   |-- views.py
+|   |-- services.py                # encrypted story lifecycle and cleanup
+|   |-- policy.py                  # Parent story visibility checks
+|   |-- models.py
+|   `-- management/commands/cleanup_stories.py
 |-- messenger_service/
 |   |-- asgi.py                    # HTTP + WebSocket ASGI app
 |   |-- settings.py
@@ -167,8 +180,8 @@ Query parameters:
 | Parameter | Purpose |
 |---|---|
 | `limit` | message count, default from service logic |
-| `before_id` | pagination before a message id |
-| `after_id` | pagination after a message id |
+| `before_message_id` | pagination before a message id |
+| `around_message_id` | load a page centered around a message id |
 
 ### `POST /rooms/<room_id>/delivered/`
 
@@ -236,6 +249,80 @@ When E2EE attachments are uploaded directly to Cloudinary, Messenger requires th
 
 Encrypted voice notes and encrypted audio/video attachments use the same send contract. React stores voice-note and media presentation metadata inside the frontend-encrypted message payload, so Messenger does not need to read waveform data, playable duration, captions, or media type hints to deliver the message.
 
+### `POST /messages/<message_id>/edit/`
+
+Edits a direct message sent by the authenticated user.
+
+Request:
+
+```json
+{
+  "text": "{\"type\":\"e2ee.message\",...}"
+}
+```
+
+Rules:
+
+- only the original sender can edit
+- only direct-room messages can use this endpoint
+- the message must not already be deleted
+- the edit window is open only until `created_at + 15 minutes`
+- Messenger re-checks Parent authorization before accepting the edited payload
+- the edited message is reset to `sent`; delivery/read state is recalculated after the edit
+- the response includes `edited_at` and `action_expires_at` in the serialized message
+
+Success response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "status": "edited",
+    "message": {"id": 123, "edited_at": "2026-06-06T10:00:00+00:00"}
+  }
+}
+```
+
+Expired edit response:
+
+```json
+{
+  "status": "timeout",
+  "action": "edit",
+  "message": "Messages can only be edited within 15 minutes.",
+  "can_edit": false,
+  "can_delete": false
+}
+```
+
+After success, Messenger broadcasts `message.edited` to the room and participant inbox sockets.
+
+### `POST /messages/<message_id>/delete/`
+
+Deletes a direct message for both sides.
+
+Rules:
+
+- only the original sender can delete
+- the delete window is open only until `created_at + 15 minutes`
+- Messenger creates a deleted-message tombstone by clearing text/story context and setting `deleted_at`
+- reactions and attachment rows are removed
+- related encrypted Cloudinary resources are deleted on a best-effort basis
+
+Success response:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "status": "deleted",
+    "message": {"id": 123, "deleted_at": "2026-06-06T10:00:00+00:00"}
+  }
+}
+```
+
+After success, Messenger broadcasts `message.deleted` to the room and participant inbox sockets.
+
 ### `POST /messages/<message_id>/reaction/`
 
 Adds, changes, or removes the authenticated user's reaction for a message in a room they participate in.
@@ -287,6 +374,97 @@ Success response:
 ```
 
 After a successful change, Messenger broadcasts `message.reaction_updated` to the room and inbox participants so React can update open conversations and room cache data in real time.
+
+## Group Messaging API
+
+Group routes are mounted under `/groups/` and use the same Messenger JWT as direct messaging. A group room is still a `Room`, but it has group profile, membership, message, receipt, reaction, upload-intent, and action-log records.
+
+### Group Roles
+
+| Role | Permissions |
+|---|---|
+| `admin` | update group, manage members, promote/remove sub-admins, transfer admin, delete group, send messages |
+| `sub_admin` | update group, add/remove normal members, send messages |
+| `member` | send messages, react, read, leave group |
+
+Group members must be saved contacts resolved by Parent. The creator is added automatically and cannot be included in `member_account_numbers`.
+
+### Group Room Routes
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/groups/` | `POST` | create a group with `title` and `member_account_numbers` |
+| `/groups/<room_id>/` | `GET` | fetch group room detail |
+| `/groups/<room_id>/` | `PATCH` | update group name; admin or sub-admin |
+| `/groups/<room_id>/` | `DELETE` | delete group; admin only |
+| `/groups/<room_id>/avatar/` | `POST` | upload/replace group picture; image up to 5 MB |
+| `/groups/<room_id>/members/` | `POST` | add saved contacts as members; admin or sub-admin |
+| `/groups/<room_id>/members/<user_id>/` | `DELETE` | remove a member |
+| `/groups/<room_id>/members/<user_id>/sub-admin/` | `POST` | promote member to sub-admin; admin only |
+| `/groups/<room_id>/members/<user_id>/sub-admin/` | `DELETE` | remove sub-admin role; admin only |
+| `/groups/<room_id>/admin-transfer/` | `POST` | transfer admin to another active member |
+| `/groups/<room_id>/leave/` | `POST` | leave group; admin must transfer admin first |
+
+Group action logs are emitted for create, update, avatar update, member add/remove/leave, sub-admin changes, admin transfer, and group delete.
+
+### Group Message Routes
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/groups/<room_id>/messages/` | `GET` | fetch paginated group messages |
+| `/groups/<room_id>/messages/send/` | `POST` | send encrypted group text/reply/media |
+| `/groups/<room_id>/messages/<message_id>/edit/` | `POST` | edit own group message within 15 minutes |
+| `/groups/<room_id>/messages/<message_id>/delete/` | `POST` | delete own group message for everyone within 15 minutes |
+| `/groups/<room_id>/messages/<message_id>/reaction/` | `POST` | add/change/remove group message reaction |
+| `/groups/<room_id>/messages/delivered/` | `POST` | mark group messages delivered for the current member |
+| `/groups/<room_id>/messages/read/` | `POST` | mark group messages read for the current member |
+| `/groups/<room_id>/receipts/visibility/prewarm/` | `POST` | warm Parent receipt visibility policy for group members |
+
+Group edit/delete rules match direct messages: sender-only, 15-minute window, not already deleted, and serialized messages expose `edited_at`, `deleted_at`, and `action_expires_at`. Edits reset group message status to `sent` and clear per-member delivered/read timestamps. Deletes clear text, remove reactions, reset receipts, keep a tombstone, and try to delete encrypted Cloudinary resources tied to completed upload intents.
+
+### Group E2EE Upload Routes
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/groups/<room_id>/crypto/devices/` | `GET` | list active recipient devices for every active group member |
+| `/groups/<room_id>/crypto/files/upload-intents/` | `POST` | create signed Cloudinary upload intents for encrypted group attachments |
+| `/groups/<room_id>/crypto/files/upload-intents/<upload_intent_id>/complete/` | `POST` | verify Cloudinary response and mark an intent complete |
+
+Group upload intents are bound to room, sender, `client_message_id`, attachment id/index, encrypted byte size, and Cloudinary public id. A group message may reference up to 10 completed encrypted upload intents.
+
+## Stories API
+
+Story routes are mounted under `/stories/`. Stories are encrypted in React, stored by Messenger, and filtered through Parent audience/visibility policy.
+
+### Story Routes
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/stories/` | `POST` | create a text or media story |
+| `/stories/feed/` | `GET` | list visible active stories from contacts |
+| `/stories/mine/` | `GET` | list the authenticated user's active stories and view counts |
+| `/stories/settings/` | `GET` | read default story expiry/audience settings |
+| `/stories/settings/` | `PUT` | update default story expiry/audience settings |
+| `/stories/upload-intents/` | `POST` | create a signed Cloudinary upload intent for encrypted story media |
+| `/stories/upload-intents/<upload_intent_id>/complete/` | `POST` | verify Cloudinary story media upload response |
+| `/stories/<story_id>/` | `DELETE` | delete own story |
+| `/stories/<story_id>/view/` | `POST` | mark a visible story viewed |
+| `/stories/<story_id>/viewers/` | `GET` | list viewers for own story |
+| `/stories/<story_id>/reaction/` | `POST` | react to a contact story and create a direct story-context message |
+| `/stories/<story_id>/reply/` | `POST` | reply to a contact story and create a direct story-context message |
+| `/stories/internal/cleanup-expired/` | `POST` | internal cleanup for expired story media |
+
+Story rules:
+
+- story types are `media` or `text`
+- expiry is 6, 12, or 24 hours
+- visibility is `all_contacts` or `specific_contacts`
+- media stories support one encrypted image or video upload intent
+- text stories store encrypted text/theme payload only
+- view records can be hidden from the owner when Parent ghost policy says the viewer ghosted the owner
+- story reactions use the same five reaction keys as messages
+
+The cleanup endpoint and `cleanup_stories` management command mark expired stories and remove expired story Cloudinary media according to the Django settings `STORIES_EXPIRED_MEDIA_RETENTION_DAYS` and `STORIES_EXPIRED_MEDIA_CLEANUP_LIMIT`, falling back to service defaults when those settings are not configured.
 
 ### `POST /crypto/devices/`
 
@@ -579,9 +757,30 @@ Receives account-wide events:
 - `presence.online`
 - `presence.offline`
 - `message.sent`
+- `message.edited`
+- `message.deleted`
 - `message.delivered`
 - `message.read`
 - `message.reaction_updated`
+- `group.created`
+- `group.updated`
+- `group.avatar_updated`
+- `group.member_added`
+- `group.member_removed`
+- `group.member_left`
+- `group.sub_admin_added`
+- `group.sub_admin_removed`
+- `group.admin_transferred`
+- `group.deleted`
+- `group.message.sent`
+- `group.message.edited`
+- `group.message.deleted`
+- `group.message.delivered`
+- `group.message.read`
+- `group.message.reaction_updated`
+- `story.created`
+- `story.deleted`
+- `story.viewed`
 - `device.revoked`
 - `device.default_changed`
 - `recovery.key_updated`
@@ -596,7 +795,7 @@ Client may send:
 
 Receives room-scoped events and typing state.
 
-Room participants receive `message.reaction_updated` whenever a participant adds, changes, or removes a reaction.
+Room participants receive direct and group message events including `message.reaction_updated`, `message.edited`, `message.deleted`, `group.message.reaction_updated`, `group.message.edited`, and `group.message.deleted` when those events apply to the open room.
 
 Client may send:
 
@@ -626,6 +825,12 @@ Run all tests:
 venv\Scripts\python.exe manage.py test
 ```
 
+Run group or story tests:
+
+```powershell
+venv\Scripts\python.exe manage.py test group_messaging stories
+```
+
 Check migrations:
 
 ```powershell
@@ -638,3 +843,4 @@ venv\Scripts\python.exe manage.py makemigrations --check --dry-run
 - Keep `MESSAGING_JWT_SECRET` and `INTERNAL_SERVICE_TOKEN` out of source control.
 - Run migrations before deploying code that changes models.
 - Messenger stores encrypted payloads and public keys, not the user's recovery key or message private keys.
+- Keep Cloudinary cleanup observable in production logs; message and story deletes are best-effort for remote media removal and should not fail the user-visible tombstone operation just because Cloudinary cleanup has a transient error.

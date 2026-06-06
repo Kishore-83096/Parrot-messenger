@@ -68,6 +68,7 @@ GROUP_E2EE_MESSAGE_VERSION = 1
 MAX_GROUP_MESSAGE_TEXT_LENGTH = 5000
 MAX_GROUP_ENCRYPTED_MESSAGE_TEXT_LENGTH = 500000
 MAX_GROUP_ATTACHMENTS_PER_MESSAGE = 10
+MESSAGE_EDIT_DELETE_WINDOW = timedelta(minutes=15)
 MAX_GROUP_ENCRYPTED_FILE_SIZE_BYTES = 26 * 1024 * 1024
 MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST = 10
 DEFAULT_GROUP_UPLOAD_INTENT_TTL_SECONDS = 600
@@ -1176,6 +1177,37 @@ def normalize_group_message_payload(payload):
     }, None
 
 
+def normalize_group_message_edit_payload(payload):
+    if not isinstance(payload, dict):
+        return None, {'body': ['Request body must be a JSON object.']}
+
+    errors = {}
+    text = payload.get('text', '')
+    if text is None:
+        text = ''
+    if not isinstance(text, str):
+        errors['text'] = ['Message text must be a string.']
+        text = ''
+    else:
+        max_text_length = (
+            MAX_GROUP_ENCRYPTED_MESSAGE_TEXT_LENGTH
+            if is_group_encrypted_message_text(text)
+            else MAX_GROUP_MESSAGE_TEXT_LENGTH
+        )
+        if len(text) > max_text_length:
+            errors['text'] = [f'Message text cannot exceed {max_text_length} characters.']
+
+    if not text.strip():
+        errors['text'] = ['Message text is required.']
+
+    if errors:
+        return None, errors
+
+    return {
+        'text': text.strip(),
+    }, None
+
+
 def normalize_group_message_list_params(params):
     errors = {}
     limit = params.get('limit', 20)
@@ -1525,6 +1557,251 @@ def send_group_message(sender, room_id, payload):
     }, 201
 
 
+def destroy_group_cloudinary_resource(public_id, resource_type='raw'):
+    if not public_id:
+        return False
+
+    cloudinary_url = getattr(settings, 'CLOUDINARY_URL', '')
+    if cloudinary_url:
+        cloudinary_config(cloudinary_url=cloudinary_url, secure=True)
+
+    try:
+        cloudinary_uploader.destroy(public_id, resource_type=resource_type or 'raw')
+    except CloudinaryError:
+        return False
+
+    return True
+
+
+def get_group_message_cloudinary_resources(message):
+    if not message.client_message_id:
+        return []
+
+    upload_intents = GroupMessageEncryptedUploadIntent.objects.filter(
+        room_id=message.room_id,
+        sender_user_id=message.sender_user_id,
+        client_message_id=message.client_message_id,
+    ).only('cloudinary_public_id', 'cloudinary_resource_type')
+
+    return [
+        {
+            'public_id': upload_intent.cloudinary_public_id,
+            'resource_type': upload_intent.cloudinary_resource_type or 'raw',
+        }
+        for upload_intent in upload_intents
+        if upload_intent.cloudinary_public_id
+    ]
+
+
+def cleanup_group_message_cloudinary_resources(resources):
+    for resource in resources or []:
+        destroy_group_cloudinary_resource(
+            resource.get('public_id'),
+            resource.get('resource_type') or 'raw',
+        )
+
+
+def get_group_message_action_expires_at(message):
+    return message.created_at + MESSAGE_EDIT_DELETE_WINDOW
+
+
+def is_group_message_action_window_open(message, now=None):
+    now = now or timezone.now()
+
+    return now < get_group_message_action_expires_at(message)
+
+
+def build_group_message_action_timeout_result(message, action, now=None):
+    now = now or timezone.now()
+    action_label = 'edited' if action == 'edit' else 'deleted for everyone'
+
+    return {
+        'status': 'timeout',
+        'action': action,
+        'message': f'Messages can only be {action_label} within 15 minutes.',
+        'room_id': message.room_id,
+        'message_id': message.id,
+        'created_at': message.created_at.isoformat(),
+        'action_expires_at': get_group_message_action_expires_at(message).isoformat(),
+        'server_time': now.isoformat(),
+        'can_edit': False,
+        'can_delete': False,
+    }, 403
+
+
+def get_sender_group_message_for_action(sender_user_id, room_id, message_id, include_deleted=False):
+    messages = GroupMessage.objects.filter(
+        id=message_id,
+        room_id=room_id,
+        sender_user_id=sender_user_id,
+    )
+    if not include_deleted:
+        messages = messages.filter(deleted_at__isnull=True)
+
+    return (
+        messages
+        .select_related('room', 'reply_to')
+        .prefetch_related('receipts', 'reactions')
+        .first()
+    )
+
+
+def edit_group_message(sender, room_id, message_id, payload):
+    normalized_payload, errors = normalize_group_message_edit_payload(payload)
+    if errors:
+        return validation_error(errors)
+
+    context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
+    if error:
+        return error, status
+
+    message = get_sender_group_message_for_action(sender['user_id'], context['room'].id, message_id)
+    if not message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    now = timezone.now()
+    if not is_group_message_action_window_open(message, now=now):
+        return build_group_message_action_timeout_result(message, 'edit', now=now)
+
+    try:
+        with transaction.atomic():
+            locked_message = (
+                GroupMessage.objects.select_for_update()
+                .select_related('room')
+                .get(
+                    id=message.id,
+                    room_id=context['room'].id,
+                    sender_user_id=sender['user_id'],
+                    deleted_at__isnull=True,
+                )
+            )
+            now = timezone.now()
+            if not is_group_message_action_window_open(locked_message, now=now):
+                return build_group_message_action_timeout_result(locked_message, 'edit', now=now)
+
+            locked_message.text = normalized_payload['text']
+            locked_message.status = GroupMessage.STATUS_SENT
+            locked_message.edited_at = now
+            locked_message.save(update_fields=['text', 'status', 'edited_at', 'updated_at'])
+            GroupMessageReceipt.objects.filter(message_id=locked_message.id).update(
+                delivered_at=None,
+                read_at=None,
+                hidden_from_sender=False,
+                updated_at=now,
+            )
+            locked_message.room.updated_at = now
+            locked_message.room.save(update_fields=['updated_at'])
+    except GroupMessage.DoesNotExist:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+    except ValidationError as error:
+        return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
+
+    message = (
+        GroupMessage.objects
+        .select_related('room', 'reply_to')
+        .prefetch_related('receipts', 'reactions')
+        .get(id=message.id)
+    )
+    attach_group_participant_identities([message], context['room'].id)
+    invalidate_room_caches(context['room'].id)
+
+    return {
+        'status': 'edited',
+        'room': serialize_group_room(context['room'], current_user_id=sender['user_id']),
+        'message': serialize_group_message(message, sender['user_id']),
+    }, 200
+
+
+def delete_group_message_for_everyone(sender, room_id, message_id):
+    cloudinary_resources = []
+    context, error, status = require_group_member(sender['user_id'], room_id)
+    if error:
+        return error, status
+    error, status = require_group_open(context, current_user_id=sender['user_id'])
+    if error:
+        return error, status
+
+    message = get_sender_group_message_for_action(
+        sender['user_id'],
+        context['room'].id,
+        message_id,
+        include_deleted=True,
+    )
+    if not message or message.deleted_at:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    now = timezone.now()
+    if not is_group_message_action_window_open(message, now=now):
+        return build_group_message_action_timeout_result(message, 'delete', now=now)
+
+    try:
+        with transaction.atomic():
+            locked_message = (
+                GroupMessage.objects.select_for_update()
+                .select_related('room')
+                .get(
+                    id=message.id,
+                    room_id=context['room'].id,
+                    sender_user_id=sender['user_id'],
+                    deleted_at__isnull=True,
+                )
+            )
+            now = timezone.now()
+            if not is_group_message_action_window_open(locked_message, now=now):
+                return build_group_message_action_timeout_result(locked_message, 'delete', now=now)
+
+            cloudinary_resources = get_group_message_cloudinary_resources(locked_message)
+            GroupMessageReaction.objects.filter(message_id=locked_message.id).delete()
+            locked_message.text = ''
+            locked_message.status = GroupMessage.STATUS_SENT
+            locked_message.deleted_at = now
+            locked_message.save(update_fields=['text', 'status', 'deleted_at', 'updated_at'])
+            GroupMessageReceipt.objects.filter(message_id=locked_message.id).update(
+                delivered_at=None,
+                read_at=None,
+                hidden_from_sender=False,
+                updated_at=now,
+            )
+            locked_message.room.updated_at = now
+            locked_message.room.save(update_fields=['updated_at'])
+    except GroupMessage.DoesNotExist:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+    except ValidationError as error:
+        return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
+
+    cleanup_group_message_cloudinary_resources(cloudinary_resources)
+
+    message = (
+        GroupMessage.objects
+        .select_related('room', 'reply_to')
+        .prefetch_related('receipts', 'reactions')
+        .get(id=message.id)
+    )
+    attach_group_participant_identities([message], context['room'].id)
+    invalidate_room_caches(context['room'].id)
+
+    return {
+        'status': 'deleted',
+        'room': serialize_group_room(context['room'], current_user_id=sender['user_id']),
+        'message': serialize_group_message(message, sender['user_id']),
+    }, 200
+
+
 def list_group_messages(user_id, room_id, limit=20, before_message_id=None, around_message_id=None):
     context, error, status = require_group_member(user_id, room_id)
     if error:
@@ -1541,7 +1818,7 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
         return cached_result, 200
 
     messages = (
-        GroupMessage.objects.filter(room_id=room_id, deleted_at__isnull=True)
+        GroupMessage.objects.filter(room_id=room_id)
         .select_related('reply_to')
         .prefetch_related('receipts', 'reactions')
     )

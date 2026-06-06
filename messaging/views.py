@@ -43,6 +43,9 @@ from .signals import (
 from .services import (
     cleanup_uploaded_attachments,
     create_direct_message,
+    delete_direct_message_for_everyone,
+    edit_direct_message,
+    get_direct_message_action_recipient_account_number,
     get_existing_direct_room_authorization,
     has_existing_sender_client_message,
     list_room_messages,
@@ -1140,6 +1143,127 @@ def send_message(request):
             'result': build_public_message_result(message_result),
         },
         status=message_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def edit_message(request, message_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    recipient_account_number = get_direct_message_action_recipient_account_number(
+        sender,
+        message_id,
+    )
+    if not recipient_account_number:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'sender': sender,
+                'result': {
+                    'status': 'error',
+                    'message': 'Message not found.',
+                },
+            },
+            status=404,
+        )
+
+    parent_authorization, authorization_result, authorization_status = authorize_sender_for_message(
+        sender,
+        recipient_account_number,
+    )
+    if parent_authorization is None:
+        return JsonResponse(
+            {
+                'status': get_authorization_status(authorization_result, authorization_status),
+                'service': 'messenger',
+                'sender': sender,
+                'authorization': sanitize_authorization_result(authorization_result),
+            },
+            status=authorization_status,
+        )
+
+    result, response_status = edit_direct_message(
+        sender,
+        message_id,
+        payload,
+        parent_authorization,
+    )
+
+    delivery_blocked = bool(result.get('_delivery_blocked'))
+    if response_status < 300 and result.get('status') == 'edited':
+        event_payload = {
+            'room': result['room'],
+            'message': result['message'],
+            'sender': sender,
+        }
+        if not delivery_blocked:
+            broadcast_room_event(
+                result['message']['room_id'],
+                'message.edited',
+                event_payload,
+            )
+            event_participants = result['room']['participants']
+        else:
+            event_participants = get_sender_participants(result['room'], sender)
+
+        broadcast_participant_event(
+            event_participants,
+            'message.edited',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': build_public_message_result(result),
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def delete_message(request, message_id):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = delete_direct_message_for_everyone(sender, message_id)
+    if response_status < 300 and result.get('status') == 'deleted':
+        event_payload = {
+            'room': result['room'],
+            'message': result['message'],
+            'sender': sender,
+        }
+        broadcast_room_event(
+            result['message']['room_id'],
+            'message.deleted',
+            event_payload,
+        )
+        broadcast_participant_event(
+            result['room']['participants'],
+            'message.deleted',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
     )
 
 

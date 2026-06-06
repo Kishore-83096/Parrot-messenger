@@ -16,6 +16,8 @@ from .services import (
     create_group_encrypted_file_upload_intents,
     consume_completed_group_encrypted_upload_intents,
     delete_group,
+    delete_group_message_for_everyone,
+    edit_group_message,
     get_group_room,
     has_existing_group_client_message,
     leave_group,
@@ -466,6 +468,92 @@ def group_send_message(request, room_id):
             },
         )
         broadcast_group_participant_event(result['room'], 'group.message.sent', event_payload)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'group_messaging',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def group_edit_message(request, room_id, message_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = edit_group_message(sender, room_id, message_id, payload)
+    if response_status < 300 and result.get('status') == 'edited':
+        event_payload = {
+            'room': result['room'],
+            'message': result['message'],
+            'sender': sender,
+        }
+        broadcast_room_event(
+            result['message']['room_id'],
+            'group.message.edited',
+            {
+                'message': result['message'],
+                'sender': sender,
+            },
+        )
+        broadcast_group_participant_event(
+            result['room'],
+            'group.message.edited',
+            event_payload,
+        )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'group_messaging',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def group_delete_message(request, room_id, message_id):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = delete_group_message_for_everyone(
+        sender,
+        room_id,
+        message_id,
+    )
+    if response_status < 300 and result.get('status') == 'deleted':
+        event_payload = {
+            'room': result['room'],
+            'message': result['message'],
+            'sender': sender,
+        }
+        broadcast_room_event(
+            result['message']['room_id'],
+            'group.message.deleted',
+            {
+                'message': result['message'],
+                'sender': sender,
+            },
+        )
+        broadcast_group_participant_event(
+            result['room'],
+            'group.message.deleted',
+            event_payload,
+        )
 
     return JsonResponse(
         {

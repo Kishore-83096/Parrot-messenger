@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from messaging.models import RoomParticipant
 
 from .models import (
@@ -7,6 +9,8 @@ from .models import (
     GroupMessageReaction,
     GroupProfile,
 )
+
+MESSAGE_EDIT_DELETE_WINDOW = timedelta(minutes=15)
 
 
 def get_group_role_map(room_id):
@@ -169,7 +173,7 @@ def get_group_room_extension(room, current_user_id=None, latest_log_limit=8):
         else None
     )
     logs = GroupActionLog.objects.filter(room_id=room.id)
-    latest_messages = GroupMessage.objects.filter(room_id=room.id, deleted_at__isnull=True)
+    latest_messages = GroupMessage.objects.filter(room_id=room.id)
     if visible_since:
         logs = logs.filter(created_at__gte=visible_since)
         latest_messages = latest_messages.filter(created_at__gte=visible_since)
@@ -272,15 +276,20 @@ def serialize_group_message(message, current_user_id=None):
     if not message:
         return None
 
+    is_deleted = bool(message.deleted_at)
     participant_identity_by_user_id = get_group_message_participant_identity_map(message)
     sender_identity = get_group_participant_identity(
         participant_identity_by_user_id,
         message.sender_user_id,
     )
-    reaction_data = serialize_group_message_reactions(
-        message,
-        current_user_id,
-        participant_identity_by_user_id=participant_identity_by_user_id,
+    reaction_data = (
+        {'reactions': [], 'my_reaction': None}
+        if is_deleted
+        else serialize_group_message_reactions(
+            message,
+            current_user_id,
+            participant_identity_by_user_id=participant_identity_by_user_id,
+        )
     )
     return {
         'id': message.id,
@@ -291,21 +300,30 @@ def serialize_group_message(message, current_user_id=None):
         'sender_account_number': sender_identity['account_number'],
         'sender_display_name': sender_identity['display_name'],
         'recipient_user_id': None,
-        'reply_to_message_id': message.reply_to_id,
-        'reply_to': serialize_group_reply_preview(
-            message.reply_to,
-            current_user_id,
-            participant_identity_by_user_id=participant_identity_by_user_id,
-        ) if message.reply_to_id else None,
-        'text': message.text,
+        'reply_to_message_id': None if is_deleted else message.reply_to_id,
+        'reply_to': (
+            serialize_group_reply_preview(
+                message.reply_to,
+                current_user_id,
+                participant_identity_by_user_id=participant_identity_by_user_id,
+            )
+            if message.reply_to_id and not is_deleted
+            else None
+        ),
+        'text': '' if is_deleted else message.text,
         'client_message_id': message.client_message_id,
         'status': get_group_message_status_for_viewer(message, current_user_id),
         'created_at': message.created_at.isoformat(),
         'updated_at': message.updated_at.isoformat(),
+        'edited_at': message.edited_at.isoformat() if message.edited_at else None,
+        'deleted_at': message.deleted_at.isoformat() if message.deleted_at else None,
+        'is_deleted': is_deleted,
+        'deleted_by_user_id': message.sender_user_id if is_deleted else None,
+        'action_expires_at': (message.created_at + MESSAGE_EDIT_DELETE_WINDOW).isoformat(),
         'attachments': [],
         'reactions': reaction_data['reactions'],
         'my_reaction': reaction_data['my_reaction'],
-        'receipts': serialize_group_message_receipts(
+        'receipts': [] if is_deleted else serialize_group_message_receipts(
             message,
             current_user_id,
             participant_identity_by_user_id=participant_identity_by_user_id,

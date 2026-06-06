@@ -244,6 +244,9 @@ class Message(models.Model):
             if self.sent_while_blocked:
                 raise ValidationError({'sent_while_blocked': 'Blocked-send markers are only supported for direct rooms.'})
 
+        if self.deleted_at:
+            return
+
         if self.pk and not self.text.strip() and not self.attachments.exists():
             raise ValidationError({'text': 'Message must include text or at least one attachment.'})
 

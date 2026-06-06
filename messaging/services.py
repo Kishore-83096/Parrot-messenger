@@ -1,6 +1,7 @@
 import mimetypes
 import re
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 from cloudinary import config as cloudinary_config
@@ -22,13 +23,21 @@ from .e2ee.payloads import (
     MAX_ENCRYPTED_MESSAGE_TEXT_LENGTH,
     is_encrypted_message_text,
 )
-from .models import Message, MessageAttachment, MessageReaction, Room, RoomParticipant
+from .models import (
+    Message,
+    MessageAttachment,
+    MessageEncryptedUploadIntent,
+    MessageReaction,
+    Room,
+    RoomParticipant,
+)
 from .signals import resolve_parent_receipt_visibility
 
 
 ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
 MAX_MESSAGE_TEXT_LENGTH = 5000
 MAX_ATTACHMENTS_PER_MESSAGE = 10
+MESSAGE_EDIT_DELETE_WINDOW = timedelta(minutes=15)
 MAIN_CLOUDINARY_FOLDER = 'MAIN'
 IMAGE_EXTENSIONS = {'.avif', '.gif', '.heic', '.jpeg', '.jpg', '.png', '.webp'}
 PDF_EXTENSIONS = {'.pdf'}
@@ -135,6 +144,37 @@ def normalize_send_payload(payload):
         'reply_to_message_id': reply_to_message_id,
         'attachments': attachments,
         'story_context': story_context,
+    }, None
+
+
+def normalize_message_edit_payload(payload):
+    if not isinstance(payload, dict):
+        return None, {'body': ['Request body must be a JSON object.']}
+
+    errors = {}
+    text = payload.get('text', '')
+    if text is None:
+        text = ''
+    if not isinstance(text, str):
+        errors['text'] = ['Message text must be a string.']
+        text = ''
+    else:
+        max_text_length = (
+            MAX_ENCRYPTED_MESSAGE_TEXT_LENGTH
+            if is_encrypted_message_text(text)
+            else MAX_MESSAGE_TEXT_LENGTH
+        )
+        if len(text) > max_text_length:
+            errors['text'] = [f'Message text cannot exceed {max_text_length} characters.']
+
+    if not text.strip():
+        errors['text'] = ['Message text is required.']
+
+    if errors:
+        return None, errors
+
+    return {
+        'text': text.strip(),
     }, None
 
 
@@ -384,13 +424,82 @@ def cleanup_uploaded_attachments(attachments):
     for attachment in attachments or []:
         public_id = attachment.get('cloudinary_public_id')
         resource_type = attachment.get('cloudinary_resource_type') or 'raw'
-        if not public_id:
+        destroy_cloudinary_resource(public_id, resource_type)
+
+
+def destroy_cloudinary_resource(public_id, resource_type='raw'):
+    if not public_id:
+        return False
+
+    cloudinary_url = getattr(settings, 'CLOUDINARY_URL', '')
+    if cloudinary_url:
+        cloudinary_config(cloudinary_url=cloudinary_url, secure=True)
+
+    try:
+        cloudinary_uploader.destroy(public_id, resource_type=resource_type or 'raw')
+    except CloudinaryError:
+        return False
+
+    return True
+
+
+def get_attachment_cloudinary_resource_type(attachment):
+    if attachment.cloudinary_resource_type:
+        return attachment.cloudinary_resource_type
+
+    if attachment.file_type == MessageAttachment.TYPE_IMAGE:
+        return 'image'
+
+    if attachment.file_type in {MessageAttachment.TYPE_VIDEO, MessageAttachment.TYPE_AUDIO}:
+        return 'video'
+
+    return 'raw'
+
+
+def get_direct_message_cloudinary_resources(message):
+    resources = []
+
+    attachments = list(
+        MessageAttachment.objects.filter(message_id=message.id)
+        .only('id', 'cloudinary_public_id', 'cloudinary_resource_type', 'file_type')
+    )
+    for attachment in attachments:
+        if not attachment.cloudinary_public_id:
             continue
 
-        try:
-            cloudinary_uploader.destroy(public_id, resource_type=resource_type)
-        except CloudinaryError:
-            pass
+        resources.append(
+            {
+                'public_id': attachment.cloudinary_public_id,
+                'resource_type': get_attachment_cloudinary_resource_type(attachment),
+            }
+        )
+
+    if message.client_message_id:
+        upload_intents = MessageEncryptedUploadIntent.objects.filter(
+            sender_user_id=message.sender_user_id,
+            recipient_user_id=message.recipient_user_id,
+            client_message_id=message.client_message_id,
+        ).only('cloudinary_public_id', 'cloudinary_resource_type')
+        for upload_intent in upload_intents:
+            if not upload_intent.cloudinary_public_id:
+                continue
+
+            resources.append(
+                {
+                    'public_id': upload_intent.cloudinary_public_id,
+                    'resource_type': upload_intent.cloudinary_resource_type or 'raw',
+                }
+            )
+
+    return resources
+
+
+def cleanup_direct_message_cloudinary_resources(resources):
+    for resource in resources or []:
+        destroy_cloudinary_resource(
+            resource.get('public_id'),
+            resource.get('resource_type') or 'raw',
+        )
 
 
 def normalize_string(value):
@@ -521,6 +630,40 @@ def has_existing_sender_client_message(sender_user_id, client_message_id):
     ).exists()
 
 
+def get_direct_message_action_recipient_account_number(sender, message_id):
+    message = (
+        Message.objects.filter(
+            id=message_id,
+            sender_user_id=sender['user_id'],
+            room__room_type=Room.TYPE_DIRECT,
+        )
+        .select_related('room')
+        .first()
+    )
+    if not message:
+        return ''
+
+    sender_participant = RoomParticipant.objects.filter(
+        room_id=message.room_id,
+        user_id=sender['user_id'],
+        is_active=True,
+    ).first()
+    if not sender_participant:
+        return ''
+
+    recipient_participant = (
+        RoomParticipant.objects.filter(
+            room_id=message.room_id,
+            user_id=message.recipient_user_id,
+            is_active=True,
+        )
+        .exclude(user_id=sender['user_id'])
+        .first()
+    )
+
+    return recipient_participant.account_number if recipient_participant else ''
+
+
 def create_direct_message(sender, parent_authorization, payload):
     normalized_payload, errors = normalize_send_payload(payload)
     if errors:
@@ -594,6 +737,211 @@ def get_reply_target(room, reply_to_message_id, user_id):
 def create_message_attachments(message, attachments):
     for attachment in attachments:
         MessageAttachment.objects.create(message=message, **attachment)
+
+
+def get_message_action_expires_at(message):
+    return message.created_at + MESSAGE_EDIT_DELETE_WINDOW
+
+
+def is_message_action_window_open(message, now=None):
+    now = now or timezone.now()
+
+    return now < get_message_action_expires_at(message)
+
+
+def build_message_action_timeout_result(message, action, now=None):
+    now = now or timezone.now()
+    action_label = 'edited' if action == 'edit' else 'deleted for everyone'
+
+    return {
+        'status': 'timeout',
+        'action': action,
+        'message': f'Messages can only be {action_label} within 15 minutes.',
+        'room_id': message.room_id,
+        'message_id': message.id,
+        'created_at': message.created_at.isoformat(),
+        'action_expires_at': get_message_action_expires_at(message).isoformat(),
+        'server_time': now.isoformat(),
+        'can_edit': False,
+        'can_delete': False,
+    }, 403
+
+
+def get_sender_direct_message_for_action(sender_user_id, message_id, include_deleted=False):
+    messages = Message.objects.filter(
+        id=message_id,
+        sender_user_id=sender_user_id,
+        room__room_type=Room.TYPE_DIRECT,
+        room__participants__user_id=sender_user_id,
+        room__participants__is_active=True,
+    )
+    if not include_deleted:
+        messages = messages.filter(deleted_at__isnull=True)
+
+    return (
+        messages
+        .select_related('room', 'reply_to')
+        .prefetch_related('attachments', 'reactions')
+        .distinct()
+        .first()
+    )
+
+
+def edit_direct_message(sender, message_id, payload, parent_authorization):
+    normalized_payload, errors = normalize_message_edit_payload(payload)
+    if errors:
+        return validation_error(errors)
+
+    message = get_sender_direct_message_for_action(sender['user_id'], message_id)
+    if not message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    now = timezone.now()
+    if not is_message_action_window_open(message, now=now):
+        return build_message_action_timeout_result(message, 'edit', now=now)
+
+    delivery_blocked = bool(parent_authorization.get('delivery_blocked')) if parent_authorization else False
+
+    try:
+        with transaction.atomic():
+            locked_message = (
+                Message.objects.select_for_update()
+                .select_related('room')
+                .get(
+                    id=message.id,
+                    sender_user_id=sender['user_id'],
+                    deleted_at__isnull=True,
+                )
+            )
+            now = timezone.now()
+            if not is_message_action_window_open(locked_message, now=now):
+                return build_message_action_timeout_result(locked_message, 'edit', now=now)
+
+            locked_message.text = normalized_payload['text']
+            locked_message.status = Message.STATUS_SENT
+            locked_message.delivery_blocked = delivery_blocked
+            locked_message.sent_while_blocked = delivery_blocked
+            locked_message.receipt_hidden_from_sender = False
+            locked_message.edited_at = now
+            locked_message.save(
+                update_fields=[
+                    'text',
+                    'status',
+                    'delivery_blocked',
+                    'sent_while_blocked',
+                    'receipt_hidden_from_sender',
+                    'edited_at',
+                    'updated_at',
+                ]
+            )
+            locked_message.room.updated_at = now
+            locked_message.room.save(update_fields=['updated_at'])
+    except Message.DoesNotExist:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+    except ValidationError as error:
+        return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
+
+    message = (
+        Message.objects
+        .select_related('room', 'reply_to')
+        .prefetch_related('attachments', 'reactions')
+        .get(id=message.id)
+    )
+    invalidate_room_caches(message.room_id)
+
+    return {
+        'status': 'edited',
+        'room': serialize_room(message.room, current_user_id=sender['user_id']),
+        'message': serialize_message(message, sender['user_id']),
+        '_delivery_blocked': message.delivery_blocked,
+    }, 200
+
+
+def delete_direct_message_for_everyone(sender, message_id):
+    cloudinary_resources = []
+    message = get_sender_direct_message_for_action(
+        sender['user_id'],
+        message_id,
+        include_deleted=True,
+    )
+    if not message or message.deleted_at:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    now = timezone.now()
+    if not is_message_action_window_open(message, now=now):
+        return build_message_action_timeout_result(message, 'delete', now=now)
+
+    try:
+        with transaction.atomic():
+            locked_message = (
+                Message.objects.select_for_update()
+                .select_related('room')
+                .get(
+                    id=message.id,
+                    sender_user_id=sender['user_id'],
+                    deleted_at__isnull=True,
+                )
+            )
+            now = timezone.now()
+            if not is_message_action_window_open(locked_message, now=now):
+                return build_message_action_timeout_result(locked_message, 'delete', now=now)
+
+            cloudinary_resources = get_direct_message_cloudinary_resources(locked_message)
+            MessageReaction.objects.filter(message_id=locked_message.id).delete()
+            MessageAttachment.objects.filter(message_id=locked_message.id).delete()
+            locked_message.text = ''
+            locked_message.story_context = {}
+            locked_message.status = Message.STATUS_SENT
+            locked_message.delivery_blocked = False
+            locked_message.sent_while_blocked = False
+            locked_message.receipt_hidden_from_sender = False
+            locked_message.deleted_at = now
+            locked_message.save(
+                update_fields=[
+                    'text',
+                    'story_context',
+                    'status',
+                    'delivery_blocked',
+                    'sent_while_blocked',
+                    'receipt_hidden_from_sender',
+                    'deleted_at',
+                    'updated_at',
+                ]
+            )
+            locked_message.room.updated_at = now
+            locked_message.room.save(update_fields=['updated_at'])
+    except Message.DoesNotExist:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+    except ValidationError as error:
+        return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
+
+    cleanup_direct_message_cloudinary_resources(cloudinary_resources)
+
+    message = (
+        Message.objects
+        .select_related('room', 'reply_to')
+        .prefetch_related('attachments', 'reactions')
+        .get(id=message.id)
+    )
+    invalidate_room_caches(message.room_id)
+
+    return {
+        'status': 'deleted',
+        'room': serialize_room(message.room, current_user_id=sender['user_id']),
+        'message': serialize_message(message, sender['user_id']),
+    }, 200
 
 
 def release_room_blocked_messages(user_id, room_id):
@@ -742,7 +1090,7 @@ def list_room_messages(user_id, room_id, limit=20, before_message_id=None, aroun
         }, 404
 
     messages = (
-        get_visible_messages_queryset(user_id, room_id=room_id)
+        get_visible_messages_queryset(user_id, room_id=room_id, include_deleted=True)
         .select_related('reply_to')
         .prefetch_related('attachments', 'reactions')
     )
@@ -1287,8 +1635,10 @@ def normalize_delivered_payload(payload):
     }, None
 
 
-def get_visible_messages_queryset(user_id, room_id=None):
-    messages = Message.objects.filter(deleted_at__isnull=True)
+def get_visible_messages_queryset(user_id, room_id=None, include_deleted=False):
+    messages = Message.objects.all()
+    if not include_deleted:
+        messages = messages.filter(deleted_at__isnull=True)
     if room_id is not None:
         messages = messages.filter(room_id=room_id)
 
@@ -1309,7 +1659,7 @@ def serialize_room_summary(room, current_user_id):
             pass
 
     latest_message = (
-        get_visible_messages_queryset(current_user_id, room_id=room.id)
+        get_visible_messages_queryset(current_user_id, room_id=room.id, include_deleted=True)
         .prefetch_related('attachments', 'reactions')
         .order_by('-created_at', '-id')
         .first()
@@ -1376,25 +1726,39 @@ def serialize_participant(participant):
 
 
 def serialize_message(message, current_user_id=None):
-    reaction_data = serialize_message_reactions(message, current_user_id)
+    is_deleted = bool(message.deleted_at)
+    reaction_data = (
+        {'reactions': [], 'my_reaction': None}
+        if is_deleted
+        else serialize_message_reactions(message, current_user_id)
+    )
     data = {
         'id': message.id,
         'room_id': message.room_id,
         'sender_user_id': message.sender_user_id,
         'recipient_user_id': message.recipient_user_id,
-        'reply_to_message_id': message.reply_to_id,
-        'reply_to': serialize_reply_preview(message.reply_to, current_user_id) if message.reply_to_id else None,
-        'text': message.text,
+        'reply_to_message_id': None if is_deleted else message.reply_to_id,
+        'reply_to': (
+            serialize_reply_preview(message.reply_to, current_user_id)
+            if message.reply_to_id and not is_deleted
+            else None
+        ),
+        'text': '' if is_deleted else message.text,
         'client_message_id': message.client_message_id,
-        'story_context': message.story_context or {},
+        'story_context': {} if is_deleted else message.story_context or {},
         'status': get_message_status_for_viewer(message, current_user_id),
         'sent_while_blocked': is_sent_while_blocked_visible(message, current_user_id),
         'created_at': message.created_at.isoformat(),
         'updated_at': message.updated_at.isoformat(),
+        'edited_at': message.edited_at.isoformat() if message.edited_at else None,
+        'deleted_at': message.deleted_at.isoformat() if message.deleted_at else None,
+        'is_deleted': is_deleted,
+        'deleted_by_user_id': message.sender_user_id if is_deleted else None,
+        'action_expires_at': get_message_action_expires_at(message).isoformat(),
         'attachments': [
             serialize_attachment(attachment)
             for attachment in message.attachments.all().order_by('sort_order', 'id')
-        ],
+        ] if not is_deleted else [],
         'reactions': reaction_data['reactions'],
         'my_reaction': reaction_data['my_reaction'],
     }

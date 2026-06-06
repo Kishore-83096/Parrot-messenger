@@ -5,7 +5,9 @@ from .views import (
     complete_crypto_file_upload_intent,
     create_crypto_file_upload_intents,
     crypto_key_backup,
+    delete_message,
     deliver_room,
+    edit_message,
     health_check,
     hide_presence_from_user,
     list_rooms,
@@ -51,5 +53,7 @@ urlpatterns = [
     path('crypto/recipients/<str:recipient_account_number>/devices/', recipient_crypto_devices, name='crypto-recipient-devices'),
     path('messages/authorize/', authorize_message, name='message-authorization'),
     path('messages/send/', send_message, name='message-send'),
+    path('messages/<int:message_id>/edit/', edit_message, name='message-edit'),
+    path('messages/<int:message_id>/delete/', delete_message, name='message-delete'),
     path('messages/<int:message_id>/reaction/', message_reaction, name='message-reaction'),
 ]
