@@ -602,6 +602,7 @@ def delete_story(sender, story_id):
             'message': 'Only the story owner can delete this story.',
         }, 403
 
+    story_media = list(story.media.all())
     now = timezone.now()
     Story.objects.filter(id=story.id).update(
         status=Story.STATUS_DELETED,
@@ -611,6 +612,7 @@ def delete_story(sender, story_id):
     story.status = Story.STATUS_DELETED
     story.deleted_at = now
     story.updated_at = now
+    media_cleanup = cleanup_story_media_items(story_media)
 
     return {
         'status': 'ok',
@@ -619,6 +621,8 @@ def delete_story(sender, story_id):
         'owner_account_number': story.owner_account_number,
         'deleted': True,
         'deleted_at': now.isoformat(),
+        'media_cleaned': media_cleanup['media_cleaned'],
+        'cloudinary_errors': media_cleanup['cloudinary_errors'],
         'audience_user_ids': [
             audience.viewer_user_id
             for audience in story.audience.all()
@@ -1541,13 +1545,10 @@ def cleanup_expired_story_upload_intents(limit=25):
 
 def expire_story_upload_intent(intent, cleanup_cloudinary=True):
     if cleanup_cloudinary and intent.cloudinary_public_id:
-        try:
-            cloudinary_uploader.destroy(
-                intent.cloudinary_public_id,
-                resource_type=intent.cloudinary_resource_type or 'raw',
-            )
-        except CloudinaryError:
-            pass
+        destroy_story_cloudinary_resource(
+            intent.cloudinary_public_id,
+            intent.cloudinary_resource_type or 'raw',
+        )
 
     intent.status = StoryUploadIntent.STATUS_EXPIRED
     intent.save(update_fields=['status', 'updated_at'])
@@ -1603,6 +1604,74 @@ def get_expired_story_queryset(now):
     )
 
 
+def destroy_story_cloudinary_resource(public_id, resource_type='raw'):
+    if not public_id:
+        return None
+
+    _cloudinary_settings, errors = get_cloudinary_upload_settings()
+    if errors:
+        return {
+            'cloudinary_public_id': public_id,
+            'message': errors.get('cloudinary', ['Cloudinary is not configured.'])[0],
+        }
+
+    try:
+        result = cloudinary_uploader.destroy(
+            public_id,
+            resource_type=resource_type or 'raw',
+        )
+    except CloudinaryError as error:
+        return {
+            'cloudinary_public_id': public_id,
+            'message': str(error),
+        }
+
+    if isinstance(result, dict) and result.get('result') in {'ok', 'not found'}:
+        return None
+
+    return {
+        'cloudinary_public_id': public_id,
+        'message': f'Cloudinary returned {result!r}.',
+    }
+
+
+def cleanup_story_media_items(media_items):
+    cleaned_media_ids = []
+    cloudinary_errors = []
+
+    for media in media_items or []:
+        if media.cloudinary_public_id:
+            destroy_error = destroy_story_cloudinary_resource(
+                media.cloudinary_public_id,
+                media.cloudinary_resource_type or 'raw',
+            )
+            if destroy_error:
+                cloudinary_errors.append(
+                    {
+                        'media_id': media.id,
+                        **destroy_error,
+                    }
+                )
+                continue
+
+        cleaned_media_ids.append(media.id)
+
+    if cleaned_media_ids:
+        StoryMedia.objects.filter(id__in=cleaned_media_ids).update(
+            encrypted_file_url='',
+            thumbnail_url='',
+            cloudinary_public_id='',
+            cloudinary_asset_id='',
+            cloudinary_resource_type='',
+            cloudinary_folder='',
+        )
+
+    return {
+        'media_cleaned': len(cleaned_media_ids),
+        'cloudinary_errors': cloudinary_errors,
+    }
+
+
 def cleanup_expired_story_media(retention_days=None, limit=None, dry_run=False, now=None):
     now = now or timezone.now()
     retention_days = get_expired_story_media_retention_days(retention_days)
@@ -1630,41 +1699,12 @@ def cleanup_expired_story_media(retention_days=None, limit=None, dry_run=False, 
             'cloudinary_errors': [],
         }
 
-    cleaned_media_ids = []
-    cloudinary_errors = []
-    for media in media_items:
-        if media.cloudinary_public_id:
-            try:
-                cloudinary_uploader.destroy(
-                    media.cloudinary_public_id,
-                    resource_type=media.cloudinary_resource_type or 'raw',
-                )
-            except CloudinaryError as error:
-                cloudinary_errors.append(
-                    {
-                        'media_id': media.id,
-                        'cloudinary_public_id': media.cloudinary_public_id,
-                        'message': str(error),
-                    }
-                )
-                continue
-
-        cleaned_media_ids.append(media.id)
-
-    if cleaned_media_ids:
-        StoryMedia.objects.filter(id__in=cleaned_media_ids).update(
-            encrypted_file_url='',
-            thumbnail_url='',
-            cloudinary_public_id='',
-            cloudinary_asset_id='',
-            cloudinary_resource_type='',
-            cloudinary_folder='',
-        )
+    cleanup_result = cleanup_story_media_items(media_items)
 
     return {
         'media_candidates': len(media_items),
-        'media_cleaned': len(cleaned_media_ids),
-        'cloudinary_errors': cloudinary_errors,
+        'media_cleaned': cleanup_result['media_cleaned'],
+        'cloudinary_errors': cleanup_result['cloudinary_errors'],
     }
 
 

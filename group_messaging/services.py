@@ -1197,6 +1197,9 @@ def normalize_group_message_edit_payload(payload):
         if len(text) > max_text_length:
             errors['text'] = [f'Message text cannot exceed {max_text_length} characters.']
 
+    upload_intent_ids = payload.get('encrypted_upload_intent_ids')
+    has_replacement_uploads = isinstance(upload_intent_ids, list) and len(upload_intent_ids) > 0
+
     if not text.strip():
         errors['text'] = ['Message text is required.']
 
@@ -1205,6 +1208,7 @@ def normalize_group_message_edit_payload(payload):
 
     return {
         'text': text.strip(),
+        'has_replacement_uploads': has_replacement_uploads,
     }, None
 
 
@@ -1573,15 +1577,19 @@ def destroy_group_cloudinary_resource(public_id, resource_type='raw'):
     return True
 
 
-def get_group_message_cloudinary_resources(message):
+def get_group_message_cloudinary_resources(message, exclude_upload_intent_ids=None):
     if not message.client_message_id:
         return []
 
+    excluded_intent_ids = {
+        str(upload_intent_id)
+        for upload_intent_id in (exclude_upload_intent_ids or [])
+    }
     upload_intents = GroupMessageEncryptedUploadIntent.objects.filter(
         room_id=message.room_id,
         sender_user_id=message.sender_user_id,
         client_message_id=message.client_message_id,
-    ).only('cloudinary_public_id', 'cloudinary_resource_type')
+    ).only('id', 'cloudinary_public_id', 'cloudinary_resource_type')
 
     return [
         {
@@ -1589,7 +1597,7 @@ def get_group_message_cloudinary_resources(message):
             'resource_type': upload_intent.cloudinary_resource_type or 'raw',
         }
         for upload_intent in upload_intents
-        if upload_intent.cloudinary_public_id
+        if upload_intent.cloudinary_public_id and str(upload_intent.id) not in excluded_intent_ids
     ]
 
 
@@ -1646,11 +1654,24 @@ def get_sender_group_message_for_action(sender_user_id, room_id, message_id, inc
     )
 
 
-def edit_group_message(sender, room_id, message_id, payload):
+def get_group_message_action_client_message_id(sender, room_id, message_id):
+    message = get_sender_group_message_for_action(
+        sender['user_id'],
+        room_id,
+        message_id,
+    )
+    return message.client_message_id if message else ''
+
+
+def edit_group_message(sender, room_id, message_id, payload, replacement_upload_intents=None):
     normalized_payload, errors = normalize_group_message_edit_payload(payload)
     if errors:
         return validation_error(errors)
 
+    replacement_upload_intents = list(replacement_upload_intents or [])
+    replacement_upload_intent_ids = [intent.id for intent in replacement_upload_intents]
+    has_replacement_uploads = bool(replacement_upload_intents)
+    cloudinary_resources = []
     context, error, status = require_group_member(sender['user_id'], room_id)
     if error:
         return error, status
@@ -1685,6 +1706,12 @@ def edit_group_message(sender, room_id, message_id, payload):
             if not is_group_message_action_window_open(locked_message, now=now):
                 return build_group_message_action_timeout_result(locked_message, 'edit', now=now)
 
+            if has_replacement_uploads:
+                cloudinary_resources = get_group_message_cloudinary_resources(
+                    locked_message,
+                    exclude_upload_intent_ids=replacement_upload_intent_ids,
+                )
+
             locked_message.text = normalized_payload['text']
             locked_message.status = GroupMessage.STATUS_SENT
             locked_message.edited_at = now
@@ -1704,6 +1731,9 @@ def edit_group_message(sender, room_id, message_id, payload):
         }, 404
     except ValidationError as error:
         return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
+
+    if has_replacement_uploads:
+        cleanup_group_message_cloudinary_resources(cloudinary_resources)
 
     message = (
         GroupMessage.objects

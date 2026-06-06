@@ -12,11 +12,12 @@ from .models import (
     GroupActionLog,
     GroupMembership,
     GroupMessage,
+    GroupMessageEncryptedUploadIntent,
     GroupMessageReceipt,
     GroupProfile,
 )
 from .serializers import serialize_group_room
-from .services import delete_group, list_group_messages, mark_group_room_read, send_group_message
+from .services import delete_group, edit_group_message, list_group_messages, mark_group_room_read, send_group_message
 from .views import broadcast_group_participant_event
 
 
@@ -327,6 +328,78 @@ class GroupGhostReceiptTests(TestCase):
             user_id=self.recipient_user_id,
             role=GroupMembership.ROLE_MEMBER,
             is_active=True,
+        )
+
+    def create_completed_group_upload_intent(
+        self,
+        client_message_id,
+        attachment_client_id,
+        cloudinary_public_id,
+    ):
+        return GroupMessageEncryptedUploadIntent.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            sender_account_number='7000000001',
+            client_message_id=client_message_id,
+            attachment_client_id=attachment_client_id,
+            original_file_name='voice-note.webm',
+            original_mime_type='audio/webm',
+            original_file_size_bytes=20,
+            encrypted_file_size_bytes=36,
+            cloudinary_public_id=cloudinary_public_id,
+            cloudinary_resource_type='raw',
+            cloudinary_folder='MAIN/e2ee/groups/room-1',
+            secure_url=f'https://res.cloudinary.com/test-cloud/raw/upload/v123/{cloudinary_public_id}',
+            status=GroupMessageEncryptedUploadIntent.STATUS_COMPLETED,
+            signature_timestamp=123,
+            expires_at=timezone.now() + timedelta(minutes=5),
+            completed_at=timezone.now(),
+        )
+
+    @patch('group_messaging.services.cloudinary_uploader.destroy')
+    def test_edit_group_message_replacement_cleans_previous_encrypted_upload(self, cloudinary_destroy):
+        cloudinary_destroy.return_value = {'result': 'ok'}
+        message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            text='old encrypted payload',
+            client_message_id='edit-group-voice-note',
+            status=GroupMessage.STATUS_READ,
+        )
+        self.create_completed_group_upload_intent(
+            client_message_id=message.client_message_id,
+            attachment_client_id='old-voice-note',
+            cloudinary_public_id='MAIN/e2ee/groups/room-1/old-voice-note',
+        )
+        replacement_intent = self.create_completed_group_upload_intent(
+            client_message_id=message.client_message_id,
+            attachment_client_id='new-voice-note',
+            cloudinary_public_id='MAIN/e2ee/groups/room-1/new-voice-note',
+        )
+
+        result, status = edit_group_message(
+            {
+                'user_id': self.sender_user_id,
+                'account_number': '7000000001',
+            },
+            self.room.id,
+            message.id,
+            {
+                'text': 'updated encrypted payload',
+                'encrypted_upload_intent_ids': [str(replacement_intent.id)],
+            },
+            replacement_upload_intents=[replacement_intent],
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result['status'], 'edited')
+        message.refresh_from_db()
+        self.assertEqual(message.text, 'updated encrypted payload')
+        self.assertEqual(message.status, GroupMessage.STATUS_SENT)
+        self.assertIsNotNone(message.edited_at)
+        cloudinary_destroy.assert_called_once_with(
+            'MAIN/e2ee/groups/room-1/old-voice-note',
+            resource_type='raw',
         )
 
     @patch('group_messaging.services.resolve_parent_receipt_visibility')

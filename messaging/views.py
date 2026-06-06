@@ -45,6 +45,7 @@ from .services import (
     create_direct_message,
     delete_direct_message_for_everyone,
     edit_direct_message,
+    get_direct_message_action_client_message_id,
     get_direct_message_action_recipient_account_number,
     get_existing_direct_room_authorization,
     has_existing_sender_client_message,
@@ -1190,15 +1191,46 @@ def edit_message(request, message_id):
             status=authorization_status,
         )
 
+    encrypted_upload_intents = []
+    if isinstance(payload, dict) and payload.get('encrypted_upload_intent_ids'):
+        client_message_id = get_direct_message_action_client_message_id(sender, message_id)
+        payload = {
+            **payload,
+            'client_message_id': client_message_id,
+        }
+        encrypted_upload_intents, upload_intent_errors = validate_completed_encrypted_upload_intents(
+            sender,
+            parent_authorization,
+            payload,
+        )
+        if upload_intent_errors:
+            return JsonResponse(
+                {
+                    'status': 'error',
+                    'service': 'messenger',
+                    'sender': sender,
+                    'authorization': sanitize_authorization_result(authorization_result),
+                    'result': {
+                        'status': 'error',
+                        'errors': {
+                            'encrypted_upload_intent_ids': upload_intent_errors,
+                        },
+                    },
+                },
+                status=400,
+            )
+
     result, response_status = edit_direct_message(
         sender,
         message_id,
         payload,
         parent_authorization,
+        replacement_upload_intents=encrypted_upload_intents,
     )
 
     delivery_blocked = bool(result.get('_delivery_blocked'))
     if response_status < 300 and result.get('status') == 'edited':
+        consume_completed_encrypted_upload_intents(encrypted_upload_intents)
         event_payload = {
             'room': result['room'],
             'message': result['message'],

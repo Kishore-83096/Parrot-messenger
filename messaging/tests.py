@@ -38,6 +38,7 @@ from .e2ee.devices.service import build_action_message
 from .realtime import broadcast_room_event, broadcast_user_event
 from .services import (
     create_direct_message,
+    edit_direct_message,
     get_room_unread_count,
     list_room_messages,
     list_user_rooms,
@@ -1448,6 +1449,34 @@ class MessageSendAuthorizationTests(TestCase):
             completed_at=timezone.now(),
         )
 
+    def create_completed_direct_upload_intent(
+        self,
+        client_message_id,
+        attachment_client_id,
+        cloudinary_public_id,
+        mime_type='audio/webm',
+    ):
+        return MessageEncryptedUploadIntent.objects.create(
+            sender_user_id=self.sender_user_id,
+            sender_account_number=self.sender_account_number,
+            recipient_user_id=self.recipient_user_id,
+            recipient_account_number=self.recipient_account_number,
+            client_message_id=client_message_id,
+            attachment_client_id=attachment_client_id,
+            original_file_name='voice-note.webm',
+            original_mime_type=mime_type,
+            original_file_size_bytes=20,
+            encrypted_file_size_bytes=36,
+            cloudinary_public_id=cloudinary_public_id,
+            cloudinary_resource_type='raw',
+            cloudinary_folder=f'MAIN/e2ee/user-{self.sender_user_id}',
+            secure_url=f'https://res.cloudinary.com/test-cloud/raw/upload/v123/{cloudinary_public_id}',
+            status=MessageEncryptedUploadIntent.STATUS_COMPLETED,
+            signature_timestamp=int(time.time()),
+            expires_at=timezone.now() + timedelta(minutes=5),
+            completed_at=timezone.now(),
+        )
+
     def parent_denial(self, reason='contact_not_saved', status=403):
         return {
             'ok': False,
@@ -1484,6 +1513,55 @@ class MessageSendAuthorizationTests(TestCase):
                 'status_code': 200,
             },
         }, 200
+
+    @patch('messaging.services.cloudinary_uploader.destroy')
+    def test_edit_direct_message_replacement_cleans_previous_encrypted_upload(self, cloudinary_destroy):
+        cloudinary_destroy.return_value = {'result': 'ok'}
+        room = self.create_direct_room()
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='old encrypted payload',
+            client_message_id='edit-direct-voice-note',
+            status=Message.STATUS_READ,
+        )
+        self.create_completed_direct_upload_intent(
+            client_message_id=message.client_message_id,
+            attachment_client_id='old-voice-note',
+            cloudinary_public_id='MAIN/e2ee/user-1/old-voice-note',
+        )
+        replacement_intent = self.create_completed_direct_upload_intent(
+            client_message_id=message.client_message_id,
+            attachment_client_id='new-voice-note',
+            cloudinary_public_id='MAIN/e2ee/user-1/new-voice-note',
+        )
+        parent_authorization = self.parent_allowed()[0]['parent']['response']
+
+        result, status = edit_direct_message(
+            {
+                'user_id': self.sender_user_id,
+                'account_number': self.sender_account_number,
+            },
+            message.id,
+            {
+                'text': 'updated encrypted payload',
+                'encrypted_upload_intent_ids': [str(replacement_intent.id)],
+            },
+            parent_authorization,
+            replacement_upload_intents=[replacement_intent],
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result['status'], 'edited')
+        message.refresh_from_db()
+        self.assertEqual(message.text, 'updated encrypted payload')
+        self.assertEqual(message.status, Message.STATUS_SENT)
+        self.assertIsNotNone(message.edited_at)
+        cloudinary_destroy.assert_called_once_with(
+            'MAIN/e2ee/user-1/old-voice-note',
+            resource_type='raw',
+        )
 
     @patch('messaging.views.authorize_parent_messaging')
     def test_recipient_device_lookup_caches_parent_authorization_for_send(

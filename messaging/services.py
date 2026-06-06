@@ -167,6 +167,9 @@ def normalize_message_edit_payload(payload):
         if len(text) > max_text_length:
             errors['text'] = [f'Message text cannot exceed {max_text_length} characters.']
 
+    upload_intent_ids = payload.get('encrypted_upload_intent_ids')
+    has_replacement_uploads = isinstance(upload_intent_ids, list) and len(upload_intent_ids) > 0
+
     if not text.strip():
         errors['text'] = ['Message text is required.']
 
@@ -175,6 +178,7 @@ def normalize_message_edit_payload(payload):
 
     return {
         'text': text.strip(),
+        'has_replacement_uploads': has_replacement_uploads,
     }, None
 
 
@@ -456,8 +460,12 @@ def get_attachment_cloudinary_resource_type(attachment):
     return 'raw'
 
 
-def get_direct_message_cloudinary_resources(message):
+def get_direct_message_cloudinary_resources(message, exclude_upload_intent_ids=None):
     resources = []
+    excluded_intent_ids = {
+        str(upload_intent_id)
+        for upload_intent_id in (exclude_upload_intent_ids or [])
+    }
 
     attachments = list(
         MessageAttachment.objects.filter(message_id=message.id)
@@ -479,8 +487,10 @@ def get_direct_message_cloudinary_resources(message):
             sender_user_id=message.sender_user_id,
             recipient_user_id=message.recipient_user_id,
             client_message_id=message.client_message_id,
-        ).only('cloudinary_public_id', 'cloudinary_resource_type')
+        ).only('id', 'cloudinary_public_id', 'cloudinary_resource_type')
         for upload_intent in upload_intents:
+            if str(upload_intent.id) in excluded_intent_ids:
+                continue
             if not upload_intent.cloudinary_public_id:
                 continue
 
@@ -787,11 +797,29 @@ def get_sender_direct_message_for_action(sender_user_id, message_id, include_del
     )
 
 
-def edit_direct_message(sender, message_id, payload, parent_authorization):
+def get_direct_message_action_client_message_id(sender, message_id):
+    message = get_sender_direct_message_for_action(
+        sender['user_id'],
+        message_id,
+    )
+    return message.client_message_id if message else ''
+
+
+def edit_direct_message(
+    sender,
+    message_id,
+    payload,
+    parent_authorization,
+    replacement_upload_intents=None,
+):
     normalized_payload, errors = normalize_message_edit_payload(payload)
     if errors:
         return validation_error(errors)
 
+    replacement_upload_intents = list(replacement_upload_intents or [])
+    replacement_upload_intent_ids = [intent.id for intent in replacement_upload_intents]
+    has_replacement_uploads = bool(replacement_upload_intents)
+    cloudinary_resources = []
     message = get_sender_direct_message_for_action(sender['user_id'], message_id)
     if not message:
         return {
@@ -820,6 +848,13 @@ def edit_direct_message(sender, message_id, payload, parent_authorization):
             if not is_message_action_window_open(locked_message, now=now):
                 return build_message_action_timeout_result(locked_message, 'edit', now=now)
 
+            if has_replacement_uploads:
+                cloudinary_resources = get_direct_message_cloudinary_resources(
+                    locked_message,
+                    exclude_upload_intent_ids=replacement_upload_intent_ids,
+                )
+                MessageAttachment.objects.filter(message_id=locked_message.id).delete()
+
             locked_message.text = normalized_payload['text']
             locked_message.status = Message.STATUS_SENT
             locked_message.delivery_blocked = delivery_blocked
@@ -846,6 +881,9 @@ def edit_direct_message(sender, message_id, payload, parent_authorization):
         }, 404
     except ValidationError as error:
         return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
+
+    if has_replacement_uploads:
+        cleanup_direct_message_cloudinary_resources(cloudinary_resources)
 
     message = (
         Message.objects

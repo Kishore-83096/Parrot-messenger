@@ -770,15 +770,23 @@ class StoryUploadIntentTests(TestCase):
             stories[0]['media'][0]['encrypted_file_url'],
         )
 
+    @patch('stories.services.cloudinary_uploader.destroy')
     @patch('stories.views.broadcast_user_event')
     def test_delete_story_marks_owner_story_deleted_and_broadcasts(
         self,
         broadcast_user_event,
+        cloudinary_destroy,
     ):
+        cloudinary_destroy.return_value = {'result': 'ok'}
         story = self.create_feed_story(
             owner_user_id=1,
             owner_account_number='7000000001',
             client_story_id='delete-my-story',
+        )
+        media = story.media.first()
+        StoryMedia.objects.filter(id=media.id).update(
+            cloudinary_public_id='MAIN/e2ee/stories/user-1/delete-my-story.txt',
+            cloudinary_resource_type='raw',
         )
         StoryAudience.objects.filter(story=story).delete()
         StoryAudience.objects.create(
@@ -799,6 +807,12 @@ class StoryUploadIntentTests(TestCase):
         story.refresh_from_db()
         self.assertEqual(story.status, Story.STATUS_DELETED)
         self.assertIsNotNone(story.deleted_at)
+        media.refresh_from_db()
+        self.assertEqual(media.encrypted_file_url, '')
+        cloudinary_destroy.assert_called_once_with(
+            'MAIN/e2ee/stories/user-1/delete-my-story.txt',
+            resource_type='raw',
+        )
         broadcast_user_event.assert_called_once()
         user_id, event_type, payload = broadcast_user_event.call_args.args
         self.assertEqual(user_id, 2)
@@ -851,6 +865,7 @@ class StoryUploadIntentTests(TestCase):
         self,
         cloudinary_destroy,
     ):
+        cloudinary_destroy.return_value = {'result': 'ok'}
         story = self.create_feed_story(
             owner_user_id=1,
             owner_account_number='7000000001',
@@ -883,6 +898,7 @@ class StoryUploadIntentTests(TestCase):
         self,
         cloudinary_destroy,
     ):
+        cloudinary_destroy.return_value = {'result': 'ok'}
         story = self.create_feed_story(
             owner_user_id=1,
             owner_account_number='7000000001',

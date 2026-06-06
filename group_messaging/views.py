@@ -18,6 +18,7 @@ from .services import (
     delete_group,
     delete_group_message_for_everyone,
     edit_group_message,
+    get_group_message_action_client_message_id,
     get_group_room,
     has_existing_group_client_message,
     leave_group,
@@ -491,8 +492,47 @@ def group_edit_message(request, room_id, message_id):
     if error_response:
         return error_response
 
-    result, response_status = edit_group_message(sender, room_id, message_id, payload)
+    encrypted_upload_intents = []
+    if isinstance(payload, dict) and payload.get('encrypted_upload_intent_ids'):
+        client_message_id = get_group_message_action_client_message_id(
+            sender,
+            room_id,
+            message_id,
+        )
+        payload = {
+            **payload,
+            'client_message_id': client_message_id,
+        }
+        encrypted_upload_intents, upload_intent_errors = validate_completed_group_encrypted_upload_intents(
+            sender,
+            room_id,
+            payload,
+        )
+        if upload_intent_errors:
+            return JsonResponse(
+                {
+                    'status': 'error',
+                    'service': 'group_messaging',
+                    'sender': sender,
+                    'result': {
+                        'status': 'error',
+                        'errors': {
+                            'encrypted_upload_intent_ids': upload_intent_errors,
+                        },
+                    },
+                },
+                status=400,
+            )
+
+    result, response_status = edit_group_message(
+        sender,
+        room_id,
+        message_id,
+        payload,
+        replacement_upload_intents=encrypted_upload_intents,
+    )
     if response_status < 300 and result.get('status') == 'edited':
+        consume_completed_group_encrypted_upload_intents(encrypted_upload_intents)
         event_payload = {
             'room': result['room'],
             'message': result['message'],
