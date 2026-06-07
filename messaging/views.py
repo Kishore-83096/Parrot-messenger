@@ -375,6 +375,7 @@ def get_authenticated_sender(request):
     if token_result['ok']:
         return {
             'user_id': token_result['sender_user_id'],
+            'username': token_result.get('username'),
             'account_number': token_result.get('account_number'),
         }, None
 
@@ -717,7 +718,7 @@ def upload_crypto_file(request):
         return error_response
 
     uploaded_file = request.FILES.get('file')
-    result, response_status = upload_encrypted_file(uploaded_file)
+    result, response_status = upload_encrypted_file(uploaded_file, sender=sender)
 
     return JsonResponse(
         {
@@ -1047,7 +1048,11 @@ def send_message(request):
             status=authorization_status,
         )
 
-    uploaded_attachments, attachment_errors = upload_message_files(uploaded_files)
+    uploaded_attachments, attachment_errors = upload_message_files(
+        uploaded_files,
+        sender=sender,
+        parent_authorization=parent_authorization,
+    )
     if attachment_errors:
         return JsonResponse(
             {

@@ -15,13 +15,13 @@ from messaging.e2ee.files import (
     DEFAULT_UPLOAD_INTENT_TTL_SECONDS,
     MAX_ENCRYPTED_FILE_SIZE_BYTES,
     get_cloudinary_upload_settings,
-    get_encrypted_upload_folder,
     normalize_non_negative_int,
     normalize_positive_int,
     normalize_string,
     validate_cloudinary_upload_response,
     validation_error,
 )
+from messaging.cloudinary_paths import build_story_cloudinary_folder
 from messaging.services import create_direct_message
 
 from .models import (
@@ -210,7 +210,10 @@ def create_story_media_upload_intents(sender, parent_audience, payload):
         or DEFAULT_UPLOAD_INTENT_TTL_SECONDS
     )
     expires_at = now + timedelta(seconds=max(ttl_seconds, 60))
-    folder = f'{get_encrypted_upload_folder()}/stories/user-{sender["user_id"]}'
+    folder = build_story_cloudinary_folder(
+        sender,
+        owner_account_number=parent_audience.get('owner_account_number'),
+    )
     upload_intents = []
 
     for index, media in enumerate(normalized_payload['media']):

@@ -62,7 +62,7 @@ MESSAGING_JWT_ISSUER=parrot-parent
 MESSAGING_JWT_AUDIENCE=parrot-messenger
 MESSAGING_WS_TOKEN_TTL_SECONDS=300
 CLOUDINARY_URL=cloudinary://key:secret@cloud
-CLOUDINARY_MAIN_FOLDER=MAIN
+CLOUDINARY_MAIN_FOLDER=Parrot
 MESSAGING_MAX_UPLOAD_FILE_SIZE_BYTES=26214400
 ```
 
@@ -72,6 +72,8 @@ Parent and Messenger must share:
 - `MESSAGING_JWT_SECRET`
 - `MESSAGING_JWT_ISSUER`
 - `MESSAGING_JWT_AUDIENCE`
+
+`CLOUDINARY_MAIN_FOLDER` is the root folder for new Messenger uploads. Direct-message upload intents use `Parrot/<sender-username-account>/direct messages/<contact-name-account>/`, group message upload intents use `Parrot/<sender-username-account>/groupmessages/<group-name>/`, and story media uses `Parrot/<sender-username-account>/stories/`.
 
 ## Project Layout
 
@@ -645,7 +647,7 @@ Response:
         "api_key": "<cloudinary api key>",
         "resource_type": "raw",
         "parameters": {
-          "folder": "MAIN/e2ee/user-1",
+          "folder": "Parrot/sender-7000000001/direct messages/Recipient-7000000002",
           "public_id": "server-generated-id.txt",
           "timestamp": 1710000000,
           "overwrite": "false",

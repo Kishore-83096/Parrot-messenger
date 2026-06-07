@@ -62,6 +62,7 @@ def get_authenticated_sender(request):
     if token_result['ok']:
         return {
             'user_id': token_result['sender_user_id'],
+            'username': token_result.get('username'),
             'account_number': token_result.get('account_number'),
         }, None
 

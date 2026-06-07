@@ -19,6 +19,7 @@ from .cache import (
     set_cached_room_messages,
     set_cached_user_rooms,
 )
+from .cloudinary_paths import build_direct_message_cloudinary_folder
 from .e2ee.payloads import (
     MAX_ENCRYPTED_MESSAGE_TEXT_LENGTH,
     is_encrypted_message_text,
@@ -38,7 +39,6 @@ ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
 MAX_MESSAGE_TEXT_LENGTH = 5000
 MAX_ATTACHMENTS_PER_MESSAGE = 10
 MESSAGE_EDIT_DELETE_WINDOW = timedelta(minutes=15)
-MAIN_CLOUDINARY_FOLDER = 'MAIN'
 IMAGE_EXTENSIONS = {'.avif', '.gif', '.heic', '.jpeg', '.jpg', '.png', '.webp'}
 PDF_EXTENSIONS = {'.pdf'}
 VIDEO_EXTENSIONS = {'.avi', '.m4v', '.mov', '.mp4', '.mpeg', '.mpg', '.webm'}
@@ -284,7 +284,7 @@ def normalize_attachments(value):
     return attachments, errors or None
 
 
-def upload_message_files(uploaded_files):
+def upload_message_files(uploaded_files, sender=None, parent_authorization=None):
     uploaded_files = list(uploaded_files or [])
     if not uploaded_files:
         return [], None
@@ -296,12 +296,20 @@ def upload_message_files(uploaded_files):
         return [], ['Cloudinary is not configured for media uploads.']
 
     cloudinary_config(cloudinary_url=settings.CLOUDINARY_URL, secure=True)
+    cloudinary_folder = build_direct_message_cloudinary_folder(
+        sender or {},
+        parent_authorization or {},
+    )
 
     attachments = []
     errors = []
 
     for index, uploaded_file in enumerate(uploaded_files):
-        normalized_file, file_errors = normalize_uploaded_message_file(uploaded_file, index)
+        normalized_file, file_errors = normalize_uploaded_message_file(
+            uploaded_file,
+            index,
+            cloudinary_folder,
+        )
         if file_errors:
             errors.append({index: file_errors})
             continue
@@ -332,7 +340,7 @@ def upload_message_files(uploaded_files):
     return attachments, None
 
 
-def normalize_uploaded_message_file(uploaded_file, index):
+def normalize_uploaded_message_file(uploaded_file, index, cloudinary_folder):
     file_name = Path(uploaded_file.name or f'attachment-{index + 1}').name
     extension = Path(file_name).suffix.lower()
     mime_type = (
@@ -352,14 +360,12 @@ def normalize_uploaded_message_file(uploaded_file, index):
     elif file_size > max_size:
         errors['file_size_bytes'] = f'Attachment cannot exceed {max_size // (1024 * 1024)} MB.'
 
-    file_type, resource_type, folder_suffix = get_upload_file_routing(mime_type, extension)
+    file_type, resource_type = get_upload_file_routing(mime_type, extension)
     if not file_type:
         errors['file_type'] = 'Unsupported attachment file type.'
 
     if errors:
         return None, errors
-
-    root_folder = getattr(settings, 'CLOUDINARY_MAIN_FOLDER', MAIN_CLOUDINARY_FOLDER).strip('/') or MAIN_CLOUDINARY_FOLDER
 
     return {
         'file_name': file_name,
@@ -367,22 +373,22 @@ def normalize_uploaded_message_file(uploaded_file, index):
         'file_size_bytes': file_size,
         'file_type': file_type,
         'cloudinary_resource_type': resource_type,
-        'cloudinary_folder': f'{root_folder}/{folder_suffix}',
+        'cloudinary_folder': cloudinary_folder,
     }, None
 
 
 def get_upload_file_routing(mime_type, extension):
     if mime_type.startswith('image/') or extension in IMAGE_EXTENSIONS:
-        return MessageAttachment.TYPE_IMAGE, 'image', 'pics'
+        return MessageAttachment.TYPE_IMAGE, 'image'
 
     if mime_type == 'application/pdf' or extension in PDF_EXTENSIONS:
-        return MessageAttachment.TYPE_DOCUMENT, 'raw', 'pdfs'
+        return MessageAttachment.TYPE_DOCUMENT, 'raw'
 
     if mime_type.startswith('video/') or extension in VIDEO_EXTENSIONS:
-        return MessageAttachment.TYPE_VIDEO, 'video', 'videos'
+        return MessageAttachment.TYPE_VIDEO, 'video'
 
     if mime_type.startswith('audio/') or extension in AUDIO_EXTENSIONS:
-        return MessageAttachment.TYPE_AUDIO, 'video', 'audio'
+        return MessageAttachment.TYPE_AUDIO, 'video'
 
     if extension in DOCUMENT_EXTENSIONS or mime_type in {
         'application/json',
@@ -397,9 +403,9 @@ def get_upload_file_routing(mime_type, extension):
         'text/markdown',
         'text/plain',
     }:
-        return MessageAttachment.TYPE_DOCUMENT, 'raw', 'docs'
+        return MessageAttachment.TYPE_DOCUMENT, 'raw'
 
-    return None, None, None
+    return None, None
 
 
 def build_uploaded_attachment(upload_result, normalized_file, index):

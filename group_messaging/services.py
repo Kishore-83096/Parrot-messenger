@@ -28,6 +28,11 @@ from messaging.cache import (
     set_cached_receipt_visibility,
     set_cached_room_messages,
 )
+from messaging.cloudinary_paths import (
+    GROUP_MESSAGES_FOLDER,
+    build_group_message_cloudinary_folder,
+    get_cloudinary_root_folder,
+)
 from messaging.models import Room, RoomParticipant, UserDeviceKey
 from messaging.e2ee.devices.service import serialize_device_key
 from messaging.realtime import broadcast_room_event, broadcast_user_event
@@ -72,7 +77,6 @@ MESSAGE_EDIT_DELETE_WINDOW = timedelta(minutes=15)
 MAX_GROUP_ENCRYPTED_FILE_SIZE_BYTES = 26 * 1024 * 1024
 MAX_GROUP_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST = 10
 DEFAULT_GROUP_UPLOAD_INTENT_TTL_SECONDS = 600
-MAIN_CLOUDINARY_FOLDER = 'MAIN'
 GROUP_TIMELINE_LOG_LIMIT = 100
 
 
@@ -2346,7 +2350,11 @@ def create_group_encrypted_file_upload_intents(sender, room_id, payload):
         or DEFAULT_GROUP_UPLOAD_INTENT_TTL_SECONDS
     )
     expires_at = now + timedelta(seconds=max(ttl_seconds, 60))
-    folder = f'{get_group_encrypted_upload_folder()}/room-{context["room"].id}/user-{sender["user_id"]}'
+    folder = build_group_message_cloudinary_folder(
+        sender,
+        context['room'],
+        participant=context['participant'],
+    )
     upload_intents = []
 
     for index, attachment in enumerate(normalized_payload['attachments']):
@@ -2712,11 +2720,7 @@ def serialize_completed_group_upload_intent(intent):
 
 
 def get_group_encrypted_upload_folder():
-    root_folder = (
-        getattr(settings, 'CLOUDINARY_MAIN_FOLDER', MAIN_CLOUDINARY_FOLDER).strip('/')
-        or MAIN_CLOUDINARY_FOLDER
-    )
-    return f'{root_folder}/e2ee/groups'
+    return f'{get_cloudinary_root_folder()}/{GROUP_MESSAGES_FOLDER}'
 
 
 def get_group_cloudinary_upload_settings():

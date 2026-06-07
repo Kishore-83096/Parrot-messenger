@@ -53,6 +53,7 @@ def validate_messaging_token(authorization_header):
     return {
         'ok': True,
         'sender_user_id': sender_user_id,
+        'username': claims.get('username'),
         'account_number': claims.get('account_number'),
         'expires_at': claims.get('exp'),
     }, 200

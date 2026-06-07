@@ -16,10 +16,13 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from ..cloudinary_paths import (
+    build_direct_message_cloudinary_folder,
+    build_sender_cloudinary_folder,
+)
 from ..models import MessageEncryptedUploadIntent
 
 
-MAIN_CLOUDINARY_FOLDER = 'MAIN'
 MAX_ENCRYPTED_FILE_SIZE_BYTES = 26 * 1024 * 1024
 MAX_ENCRYPTED_UPLOAD_INTENTS_PER_REQUEST = 10
 DEFAULT_UPLOAD_INTENT_TTL_SECONDS = 600
@@ -32,7 +35,7 @@ def validation_error(errors):
     }, 400
 
 
-def upload_encrypted_file(uploaded_file):
+def upload_encrypted_file(uploaded_file, sender=None):
     errors = validate_encrypted_file(uploaded_file)
     if errors:
         return validation_error(errors)
@@ -48,7 +51,7 @@ def upload_encrypted_file(uploaded_file):
             uploaded_file.seek(0)
         upload_result = cloudinary_uploader.upload(
             uploaded_file,
-            folder=get_encrypted_upload_folder(),
+            folder=build_sender_cloudinary_folder(sender or {}),
             resource_type='raw',
             use_filename=False,
             unique_filename=True,
@@ -96,7 +99,7 @@ def create_encrypted_file_upload_intents(sender, parent_authorization, payload):
         or DEFAULT_UPLOAD_INTENT_TTL_SECONDS
     )
     expires_at = now + timedelta(seconds=max(ttl_seconds, 60))
-    folder = f'{get_encrypted_upload_folder()}/user-{sender["user_id"]}'
+    folder = build_direct_message_cloudinary_folder(sender, parent_authorization)
     upload_intents = []
 
     for index, attachment in enumerate(normalized_payload['attachments']):
@@ -483,11 +486,7 @@ def validate_encrypted_file(uploaded_file):
 
 
 def get_encrypted_upload_folder():
-    root_folder = (
-        getattr(settings, 'CLOUDINARY_MAIN_FOLDER', MAIN_CLOUDINARY_FOLDER).strip('/')
-        or MAIN_CLOUDINARY_FOLDER
-    )
-    return f'{root_folder}/e2ee'
+    return build_sender_cloudinary_folder({})
 
 
 def get_cloudinary_upload_settings():

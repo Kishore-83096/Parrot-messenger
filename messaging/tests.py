@@ -76,6 +76,7 @@ def test_base64_bytes(byte_value=b'c', length=32):
 class CryptoDeviceKeyTests(TestCase):
     sender_user_id = 1
     recipient_user_id = 2
+    sender_username = 'sender'
     sender_account_number = '7000000001'
     recipient_account_number = '7000000002'
 
@@ -88,6 +89,7 @@ class CryptoDeviceKeyTests(TestCase):
             {
                 'sub': str(user_id or self.sender_user_id),
                 'user_id': user_id or self.sender_user_id,
+                'username': self.sender_username,
                 'account_number': account_number or self.sender_account_number,
                 'iss': settings.MESSAGING_JWT_ISSUER,
                 'aud': settings.MESSAGING_JWT_AUDIENCE,
@@ -1163,7 +1165,7 @@ class CryptoDeviceKeyTests(TestCase):
         )
         self.assertNotIn('file_name', body['result']['file'])
         self.assertEqual(MessageAttachment.objects.count(), 0)
-        self.assertEqual(cloudinary_upload.call_args.kwargs['folder'], 'MAIN/e2ee')
+        self.assertEqual(cloudinary_upload.call_args.kwargs['folder'], 'MAIN/sender-7000000001')
         self.assertEqual(cloudinary_upload.call_args.kwargs['resource_type'], 'raw')
         self.assertIs(cloudinary_upload.call_args.kwargs['use_filename'], False)
 
@@ -1313,6 +1315,7 @@ class CryptoDeviceKeyTests(TestCase):
 class MessageSendAuthorizationTests(TestCase):
     sender_user_id = 1
     recipient_user_id = 2
+    sender_username = 'sender'
     sender_account_number = '7000000001'
     recipient_account_number = '7000000002'
 
@@ -1325,6 +1328,7 @@ class MessageSendAuthorizationTests(TestCase):
             {
                 'sub': str(user_id or self.sender_user_id),
                 'user_id': user_id or self.sender_user_id,
+                'username': self.sender_username,
                 'account_number': account_number or self.sender_account_number,
                 'iss': settings.MESSAGING_JWT_ISSUER,
                 'aud': settings.MESSAGING_JWT_AUDIENCE,
@@ -1497,8 +1501,10 @@ class MessageSendAuthorizationTests(TestCase):
                 'response': {
                     'allowed': True,
                     'sender_user_id': self.sender_user_id,
+                    'sender_username': self.sender_username,
                     'sender_account_number': self.sender_account_number,
                     'recipient_user_id': self.recipient_user_id,
+                    'recipient_username': 'recipient',
                     'recipient_account_number': self.recipient_account_number,
                     'delivery_blocked': delivery_blocked,
                     'block_context': {
@@ -1507,6 +1513,7 @@ class MessageSendAuthorizationTests(TestCase):
                     },
                     'contact': {
                         'alias_name': 'Recipient',
+                        'display_name': 'Recipient',
                         'blocked': sender_blocked_recipient,
                     },
                 },
@@ -1880,12 +1887,13 @@ class MessageSendAuthorizationTests(TestCase):
 
         saved_attachments = list(Message.objects.get().attachments.order_by('sort_order'))
         self.assertEqual(saved_attachments[0].cloudinary_public_id, 'MAIN/pics/main-pic')
-        self.assertEqual(saved_attachments[0].cloudinary_folder, 'MAIN/pics')
+        expected_folder = 'MAIN/sender-7000000001/direct messages/Recipient-7000000002'
+        self.assertEqual(saved_attachments[0].cloudinary_folder, expected_folder)
         self.assertEqual(saved_attachments[1].cloudinary_public_id, 'MAIN/pdfs/main-file')
-        self.assertEqual(saved_attachments[1].cloudinary_folder, 'MAIN/pdfs')
+        self.assertEqual(saved_attachments[1].cloudinary_folder, expected_folder)
 
-        self.assertEqual(cloudinary_upload.call_args_list[0].kwargs['folder'], 'MAIN/pics')
-        self.assertEqual(cloudinary_upload.call_args_list[1].kwargs['folder'], 'MAIN/pdfs')
+        self.assertEqual(cloudinary_upload.call_args_list[0].kwargs['folder'], expected_folder)
+        self.assertEqual(cloudinary_upload.call_args_list[1].kwargs['folder'], expected_folder)
         broadcast_room_event.assert_called_once()
         broadcast_participant_event.assert_called_once()
 
@@ -1944,7 +1952,10 @@ class MessageSendAuthorizationTests(TestCase):
         self.assertEqual(upload_intent['api_key'], 'test-key')
         self.assertNotIn('api_secret', upload_intent)
         self.assertEqual(upload_intent['resource_type'], 'raw')
-        self.assertEqual(upload_intent['parameters']['folder'], f'MAIN/e2ee/user-{self.sender_user_id}')
+        self.assertEqual(
+            upload_intent['parameters']['folder'],
+            'MAIN/sender-7000000001/direct messages/Recipient-7000000002',
+        )
         self.assertEqual(MessageEncryptedUploadIntent.objects.count(), 1)
 
         intent = MessageEncryptedUploadIntent.objects.get()
@@ -1967,9 +1978,10 @@ class MessageSendAuthorizationTests(TestCase):
 
         self.assertEqual(complete_response.status_code, 200)
         self.assertEqual(complete_body['status'], 'ok')
+        encoded_public_id = intent.cloudinary_public_id.replace(' ', '%20')
         self.assertEqual(
             complete_body['result']['file']['encrypted_file_url'],
-            f'https://res.cloudinary.com/test-cloud/raw/upload/v{version}/{intent.cloudinary_public_id}',
+            f'https://res.cloudinary.com/test-cloud/raw/upload/v{version}/{encoded_public_id}',
         )
         intent.refresh_from_db()
         self.assertEqual(intent.status, MessageEncryptedUploadIntent.STATUS_COMPLETED)

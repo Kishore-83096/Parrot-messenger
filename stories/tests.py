@@ -47,6 +47,7 @@ TEST_STORY_SETTINGS = {
 class StoryUploadIntentTests(TestCase):
     sender = {
         'user_id': 1,
+        'username': 'sender',
         'account_number': '7000000001',
     }
     parent_audience = {
@@ -67,6 +68,7 @@ class StoryUploadIntentTests(TestCase):
             {
                 'sub': str(user_id),
                 'user_id': user_id,
+                'username': 'sender',
                 'account_number': account_number,
                 'iss': settings.MESSAGING_JWT_ISSUER,
                 'aud': settings.MESSAGING_JWT_AUDIENCE,
@@ -286,6 +288,10 @@ class StoryUploadIntentTests(TestCase):
         body = response.json()
         self.assertEqual(body['status'], 'ok')
         self.assertEqual(len(body['result']['upload_intents']), 1)
+        self.assertEqual(
+            body['result']['upload_intents'][0]['parameters']['folder'],
+            'MAIN/sender-7000000001/stories',
+        )
         resolve_policy.assert_called_once_with(
             {
                 'owner_user_id': 1,
