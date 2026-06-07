@@ -612,7 +612,7 @@ def upload_group_avatar(sender, room_id, uploaded_file):
     room = context['room']
     profile = GroupProfile.objects.filter(room_id=room.id).first()
     cloudinary_config(cloudinary_url=settings.CLOUDINARY_URL, secure=True)
-    folder = build_group_avatar_cloudinary_folder(room)
+    folder = build_group_avatar_cloudinary_folder(sender, room)
     public_id = f'avatar'
 
     try:

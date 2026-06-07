@@ -100,14 +100,14 @@ def build_group_message_cloudinary_folder(sender, room, participant=None):
     )
 
 
-def build_group_avatar_cloudinary_folder(room):
+def build_group_avatar_cloudinary_folder(sender, room):
     group_segment = normalize_cloudinary_path_segment(
         getattr(room, 'title', ''),
         f'group-{getattr(room, "id", "") or "room"}',
     )
     return '/'.join(
         [
-            get_cloudinary_root_folder(),
+            build_sender_cloudinary_folder(sender),
             'groups',
             group_segment,
             GROUP_AVATARS_FOLDER,
