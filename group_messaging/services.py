@@ -30,6 +30,7 @@ from messaging.cache import (
 )
 from messaging.cloudinary_paths import (
     GROUP_MESSAGES_FOLDER,
+    build_group_avatar_cloudinary_folder,
     build_group_message_cloudinary_folder,
     get_cloudinary_root_folder,
 )
@@ -611,8 +612,8 @@ def upload_group_avatar(sender, room_id, uploaded_file):
     room = context['room']
     profile = GroupProfile.objects.filter(room_id=room.id).first()
     cloudinary_config(cloudinary_url=settings.CLOUDINARY_URL, secure=True)
-    folder = f'{settings.CLOUDINARY_MAIN_FOLDER}/groups/{room.id}'
-    public_id = f'avatar-{uuid4().hex}'
+    folder = build_group_avatar_cloudinary_folder(room)
+    public_id = f'avatar'
 
     try:
         upload_result = cloudinary_uploader.upload(

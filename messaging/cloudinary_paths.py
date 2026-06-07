@@ -6,6 +6,7 @@ from django.conf import settings
 DEFAULT_CLOUDINARY_ROOT_FOLDER = 'Parrot'
 DIRECT_MESSAGES_FOLDER = 'direct messages'
 GROUP_MESSAGES_FOLDER = 'groupmessages'
+GROUP_AVATARS_FOLDER = 'avatar'
 STORIES_FOLDER = 'stories'
 
 
@@ -95,6 +96,21 @@ def build_group_message_cloudinary_folder(sender, room, participant=None):
             build_sender_cloudinary_folder(sender, account_number=account_number),
             GROUP_MESSAGES_FOLDER,
             group_segment,
+        ]
+    )
+
+
+def build_group_avatar_cloudinary_folder(room):
+    group_segment = normalize_cloudinary_path_segment(
+        getattr(room, 'title', ''),
+        f'group-{getattr(room, "id", "") or "room"}',
+    )
+    return '/'.join(
+        [
+            get_cloudinary_root_folder(),
+            'groups',
+            group_segment,
+            GROUP_AVATARS_FOLDER,
         ]
     )
 
