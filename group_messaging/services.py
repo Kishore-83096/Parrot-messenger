@@ -1893,12 +1893,28 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
         for message in ordered_page_messages
     ]
     next_before_message_id = page_messages[-1].id if has_more and page_messages else None
+    has_newer_page = before_message_id is not None
+    log_start, log_end = get_group_timeline_log_window(
+        ordered_page_messages,
+        has_older_page=has_more,
+        has_newer_page=has_newer_page,
+    )
+    timeline_logs = (
+        list_group_timeline_logs(
+            context['room'].id,
+            visible_since=visible_since,
+            starts_at=log_start,
+            ends_at=log_end,
+        )
+        if ordered_page_messages or not has_newer_page
+        else []
+    )
 
     result = {
         'status': 'ok',
         'room': serialize_group_room(context['room'], current_user_id=user_id),
         'messages': serialized_messages,
-        'logs': list_group_timeline_logs(context['room'].id, visible_since=visible_since),
+        'logs': timeline_logs,
         'pagination': {
             'limit': limit,
             'before_message_id': before_message_id,
@@ -1912,10 +1928,33 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
     return result, 200
 
 
-def list_group_timeline_logs(room_id, limit=GROUP_TIMELINE_LOG_LIMIT, visible_since=None):
+def get_group_timeline_log_window(page_messages, has_older_page=False, has_newer_page=False):
+    if not page_messages:
+        return None, None
+
+    oldest_message = page_messages[0]
+    newest_message = page_messages[-1]
+
+    return (
+        oldest_message.created_at if has_older_page else None,
+        newest_message.created_at if has_newer_page else None,
+    )
+
+
+def list_group_timeline_logs(
+    room_id,
+    limit=GROUP_TIMELINE_LOG_LIMIT,
+    visible_since=None,
+    starts_at=None,
+    ends_at=None,
+):
     logs = GroupActionLog.objects.filter(room_id=room_id)
     if visible_since:
         logs = logs.filter(created_at__gte=visible_since)
+    if starts_at:
+        logs = logs.filter(created_at__gte=starts_at)
+    if ends_at:
+        logs = logs.filter(created_at__lte=ends_at)
 
     logs = list(logs.order_by('-created_at', '-id')[:limit])
 
@@ -1958,6 +1997,11 @@ def list_group_messages_around_target(user_id, room, messages, limit, around_mes
         if newest_message
         else False
     )
+    log_start, log_end = get_group_timeline_log_window(
+        page_messages,
+        has_older_page=has_more_older,
+        has_newer_page=has_more_newer,
+    )
 
     return {
         'status': 'ok',
@@ -1966,7 +2010,12 @@ def list_group_messages_around_target(user_id, room, messages, limit, around_mes
             serialize_group_message(message, user_id)
             for message in page_messages
         ],
-        'logs': list_group_timeline_logs(room.id, visible_since=visible_since),
+        'logs': list_group_timeline_logs(
+            room.id,
+            visible_since=visible_since,
+            starts_at=log_start,
+            ends_at=log_end,
+        ),
         'pagination': {
             'limit': limit,
             'before_message_id': None,

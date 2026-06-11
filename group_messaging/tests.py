@@ -176,6 +176,138 @@ class GroupMembershipVisibilityTests(TestCase):
 
 
 @override_settings(**TEST_CACHE_SETTINGS)
+class GroupMessageLogPaginationTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.room = Room.objects.create(
+            room_type=Room.TYPE_GROUP,
+            title='Paged log room',
+            created_by_user_id=1,
+        )
+        self.participant = RoomParticipant.objects.create(
+            room=self.room,
+            user_id=1,
+            account_number='7000000001',
+            display_name='Admin',
+            role=RoomParticipant.ROLE_ADMIN,
+        )
+        GroupMembership.objects.create(
+            room=self.room,
+            user_id=1,
+            role=GroupMembership.ROLE_ADMIN,
+            is_active=True,
+        )
+
+        self.base_time = timezone.now() - timedelta(hours=3)
+        RoomParticipant.objects.filter(pk=self.participant.pk).update(
+            joined_at=self.base_time - timedelta(minutes=5),
+        )
+        self.participant.joined_at = self.base_time - timedelta(minutes=5)
+        self.messages = []
+
+        for number in range(1, 46):
+            message = GroupMessage.objects.create(
+                room=self.room,
+                sender_user_id=1,
+                text=f'Message {number}',
+            )
+            created_at = self.base_time + timedelta(minutes=number)
+            GroupMessage.objects.filter(pk=message.pk).update(created_at=created_at)
+            message.created_at = created_at
+            self.messages.append(message)
+
+        self.start_log = self.create_log(
+            GroupActionLog.ACTION_GROUP_CREATED,
+            self.base_time - timedelta(minutes=1),
+        )
+        self.middle_log = self.create_log(
+            GroupActionLog.ACTION_GROUP_UPDATED,
+            self.base_time + timedelta(minutes=10, seconds=30),
+        )
+        self.recent_log = self.create_log(
+            GroupActionLog.ACTION_AVATAR_UPDATED,
+            self.base_time + timedelta(minutes=46),
+        )
+
+    def create_log(self, action, created_at):
+        log = GroupActionLog.objects.create(
+            room=self.room,
+            actor_user_id=1,
+            action=action,
+            metadata={
+                'actor_display_name': 'Admin',
+                'title': 'Paged log room',
+            },
+        )
+        GroupActionLog.objects.filter(pk=log.pk).update(created_at=created_at)
+        log.created_at = created_at
+        return log
+
+    def test_latest_group_message_page_only_includes_latest_window_logs(self):
+        result, status = list_group_messages(
+            user_id=1,
+            room_id=self.room.id,
+            limit=20,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result['messages'][0]['text'], 'Message 26')
+        self.assertEqual(result['messages'][-1]['text'], 'Message 45')
+        self.assertEqual(
+            [log['action'] for log in result['logs']],
+            [GroupActionLog.ACTION_AVATAR_UPDATED],
+        )
+
+    def test_middle_group_message_page_only_includes_that_page_log_window(self):
+        latest_result, _status = list_group_messages(
+            user_id=1,
+            room_id=self.room.id,
+            limit=20,
+        )
+        middle_result, status = list_group_messages(
+            user_id=1,
+            room_id=self.room.id,
+            limit=20,
+            before_message_id=latest_result['pagination']['next_before_message_id'],
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(middle_result['messages'][0]['text'], 'Message 6')
+        self.assertEqual(middle_result['messages'][-1]['text'], 'Message 25')
+        self.assertEqual(
+            [log['action'] for log in middle_result['logs']],
+            [GroupActionLog.ACTION_GROUP_UPDATED],
+        )
+
+    def test_oldest_group_message_page_includes_starting_logs_once(self):
+        latest_result, _status = list_group_messages(
+            user_id=1,
+            room_id=self.room.id,
+            limit=20,
+        )
+        middle_result, _status = list_group_messages(
+            user_id=1,
+            room_id=self.room.id,
+            limit=20,
+            before_message_id=latest_result['pagination']['next_before_message_id'],
+        )
+        oldest_result, status = list_group_messages(
+            user_id=1,
+            room_id=self.room.id,
+            limit=20,
+            before_message_id=middle_result['pagination']['next_before_message_id'],
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(oldest_result['messages'][0]['text'], 'Message 1')
+        self.assertEqual(oldest_result['messages'][-1]['text'], 'Message 5')
+        self.assertEqual(
+            [log['action'] for log in oldest_result['logs']],
+            [GroupActionLog.ACTION_GROUP_CREATED],
+        )
+
+
+@override_settings(**TEST_CACHE_SETTINGS)
 class GroupSoftDeleteTests(TestCase):
     def setUp(self):
         cache.clear()
