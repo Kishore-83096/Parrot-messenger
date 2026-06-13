@@ -168,7 +168,13 @@ def normalize_message_edit_payload(payload):
             errors['text'] = [f'Message text cannot exceed {max_text_length} characters.']
 
     upload_intent_ids = payload.get('encrypted_upload_intent_ids')
+    retained_upload_intent_ids, retained_errors = normalize_retained_upload_intent_ids(
+        payload.get('retained_encrypted_upload_intent_ids')
+    )
+    if retained_errors:
+        errors['retained_encrypted_upload_intent_ids'] = retained_errors
     has_replacement_uploads = isinstance(upload_intent_ids, list) and len(upload_intent_ids) > 0
+    has_attachment_update = bool(payload.get('attachment_update')) or has_replacement_uploads
 
     if not text.strip():
         errors['text'] = ['Message text is required.']
@@ -178,8 +184,41 @@ def normalize_message_edit_payload(payload):
 
     return {
         'text': text.strip(),
+        'has_attachment_update': has_attachment_update,
         'has_replacement_uploads': has_replacement_uploads,
+        'retained_encrypted_upload_intent_ids': retained_upload_intent_ids,
     }, None
+
+
+def normalize_retained_upload_intent_ids(value):
+    if value in (None, ''):
+        return [], None
+
+    if not isinstance(value, list):
+        return [], ['Retained encrypted upload intent ids must be a list.']
+
+    if len(value) > MAX_ATTACHMENTS_PER_MESSAGE:
+        return [], [f'Cannot retain more than {MAX_ATTACHMENTS_PER_MESSAGE} encrypted files for one message.']
+
+    normalized_ids = []
+    errors = []
+    seen_ids = set()
+
+    for index, item in enumerate(value):
+        try:
+            upload_intent_id = str(uuid.UUID(str(item)))
+        except (TypeError, ValueError):
+            errors.append({index: 'Upload intent id is invalid.'})
+            continue
+
+        if upload_intent_id in seen_ids:
+            errors.append({index: 'Upload intent id is duplicated.'})
+            continue
+
+        seen_ids.add(upload_intent_id)
+        normalized_ids.append(upload_intent_id)
+
+    return normalized_ids, errors or None
 
 
 def normalize_story_context(value):
@@ -825,6 +864,15 @@ def edit_direct_message(
     replacement_upload_intents = list(replacement_upload_intents or [])
     replacement_upload_intent_ids = [intent.id for intent in replacement_upload_intents]
     has_replacement_uploads = bool(replacement_upload_intents)
+    retained_upload_intent_ids = normalized_payload.get(
+        'retained_encrypted_upload_intent_ids',
+        [],
+    )
+    has_attachment_update = normalized_payload.get('has_attachment_update') or has_replacement_uploads
+    excluded_upload_intent_ids = [
+        *replacement_upload_intent_ids,
+        *retained_upload_intent_ids,
+    ]
     cloudinary_resources = []
     message = get_sender_direct_message_for_action(sender['user_id'], message_id)
     if not message:
@@ -854,10 +902,10 @@ def edit_direct_message(
             if not is_message_action_window_open(locked_message, now=now):
                 return build_message_action_timeout_result(locked_message, 'edit', now=now)
 
-            if has_replacement_uploads:
+            if has_attachment_update:
                 cloudinary_resources = get_direct_message_cloudinary_resources(
                     locked_message,
-                    exclude_upload_intent_ids=replacement_upload_intent_ids,
+                    exclude_upload_intent_ids=excluded_upload_intent_ids,
                 )
                 MessageAttachment.objects.filter(message_id=locked_message.id).delete()
 
@@ -888,7 +936,7 @@ def edit_direct_message(
     except ValidationError as error:
         return validation_error(error.message_dict if hasattr(error, 'message_dict') else error.messages)
 
-    if has_replacement_uploads:
+    if has_attachment_update:
         cleanup_direct_message_cloudinary_resources(cloudinary_resources)
 
     message = (
