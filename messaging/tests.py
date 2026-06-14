@@ -2467,6 +2467,113 @@ class PresenceVisibilityWebhookTests(TestCase):
         )
 
 
+@override_settings(**TEST_JWT_SETTINGS)
+class MessageReadBroadcastTests(TestCase):
+    sender_user_id = 1
+    recipient_user_id = 2
+    sender_username = 'sender'
+    sender_account_number = '7000000001'
+    recipient_account_number = '7000000002'
+
+    def setUp(self):
+        cache.clear()
+
+    def auth_header(self, user_id=None, account_number=None):
+        now = timezone.now()
+        token = jwt.encode(
+            {
+                'sub': str(user_id or self.recipient_user_id),
+                'user_id': user_id or self.recipient_user_id,
+                'username': self.sender_username,
+                'account_number': account_number or self.recipient_account_number,
+                'iss': settings.MESSAGING_JWT_ISSUER,
+                'aud': settings.MESSAGING_JWT_AUDIENCE,
+                'iat': now,
+                'exp': now + timedelta(minutes=5),
+            },
+            settings.MESSAGING_JWT_SECRET,
+            algorithm='HS256',
+        )
+
+        return f'Bearer {token}'
+
+    def create_direct_room(self):
+        room = Room.objects.create(
+            room_type=Room.TYPE_DIRECT,
+            created_by_user_id=self.sender_user_id,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.sender_user_id,
+            account_number=self.sender_account_number,
+            is_active=True,
+        )
+        RoomParticipant.objects.create(
+            room=room,
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+            is_active=True,
+        )
+
+        return room
+
+    @patch('messaging.views.broadcast_user_event')
+    @patch('messaging.views.broadcast_participant_event')
+    @patch('messaging.views.broadcast_room_event')
+    @patch('messaging.services.resolve_parent_receipt_visibility')
+    def test_hidden_direct_read_broadcasts_reader_unread_clear(
+        self,
+        resolve_parent_receipt_visibility,
+        broadcast_room_event,
+        broadcast_participant_event,
+        broadcast_user_event,
+    ):
+        room = self.create_direct_room()
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Hidden direct read should still clear unread.',
+            status=Message.STATUS_DELIVERED,
+        )
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [self.sender_user_id],
+                        'visible_user_ids': [],
+                    },
+                },
+            },
+            200,
+        )
+
+        response = self.client.post(
+            f'/rooms/{room.id}/read/',
+            data=json.dumps({'last_read_message_id': message.id}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(),
+        )
+
+        result = response.json()['result']
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(result['updated_messages'], 0)
+        self.assertEqual(result['hidden_receipts'], 1)
+        self.assertEqual(result['unread_count'], 0)
+        broadcast_room_event.assert_not_called()
+        broadcast_participant_event.assert_not_called()
+        broadcast_user_event.assert_called_once()
+        self.assertEqual(broadcast_user_event.call_args.args[0], self.recipient_user_id)
+        self.assertEqual(broadcast_user_event.call_args.args[1], 'message.read')
+        event_payload = broadcast_user_event.call_args.args[2]
+        self.assertEqual(event_payload['user_id'], self.recipient_user_id)
+        self.assertEqual(event_payload['room_id'], room.id)
+        self.assertEqual(event_payload['last_read_message_id'], message.id)
+        self.assertEqual(event_payload['unread_count'], 0)
+        self.assertEqual(event_payload['message_statuses'], [])
+
+
 class MessagingCacheTests(TestCase):
     sender_user_id = 1
     recipient_user_id = 2

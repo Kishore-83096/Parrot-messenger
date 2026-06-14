@@ -725,7 +725,15 @@ def group_read_room(request, room_id):
         room_id,
         payload,
     )
-    if response_status < 300 and result.get('updated_messages', 0) > 0:
+    message_statuses = result.get('message_statuses', [])
+    should_emit_read_event = (
+        response_status < 300
+        and (
+            result.get('updated_messages', 0) > 0
+            or result.get('hidden_receipts', 0) > 0
+        )
+    )
+    if should_emit_read_event:
         event_payload = {
             'room_id': result['room_id'],
             'user_id': result['user_id'],
@@ -734,8 +742,14 @@ def group_read_room(request, room_id):
             'read_marker_moved': result['read_marker_moved'],
             'updated_messages': result['updated_messages'],
             'unread_count': result['unread_count'],
-            'message_statuses': result.get('message_statuses', []),
+            'message_statuses': message_statuses,
         }
+        if message_statuses and not result.get('hidden_sender_user_ids'):
+            broadcast_room_event(
+                room_id,
+                'group.message.read',
+                event_payload,
+            )
         broadcast_group_participant_event(
             result['room'],
             'group.message.read',

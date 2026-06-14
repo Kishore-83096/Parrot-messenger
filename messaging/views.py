@@ -1424,11 +1424,19 @@ def read_room(request, room_id):
         payload=payload,
     )
     read_message_statuses = read_result.get('message_statuses', [])
-    if read_status < 300 and read_message_statuses:
-        last_visible_read_message_id = max(
-            item['message_id']
-            for item in read_message_statuses
-            if item.get('message_id')
+    should_emit_reader_read_event = (
+        read_status < 300
+        and (bool(read_message_statuses) or read_result.get('hidden_receipts', 0) > 0)
+    )
+    if should_emit_reader_read_event:
+        last_visible_read_message_id = (
+            max(
+                item['message_id']
+                for item in read_message_statuses
+                if item.get('message_id')
+            )
+            if read_message_statuses
+            else read_result.get('last_read_message_id')
         )
         event_payload = {
             'room_id': read_result['room_id'],
@@ -1440,16 +1448,23 @@ def read_room(request, room_id):
             'unread_count': read_result['unread_count'],
             'message_statuses': read_message_statuses,
         }
-        broadcast_room_event(
-            room_id,
-            'message.read',
-            event_payload,
-        )
-        broadcast_participant_event(
-            read_result['room']['participants'],
-            'message.read',
-            event_payload,
-        )
+        if read_message_statuses:
+            broadcast_room_event(
+                room_id,
+                'message.read',
+                event_payload,
+            )
+            broadcast_participant_event(
+                read_result['room']['participants'],
+                'message.read',
+                event_payload,
+            )
+        else:
+            broadcast_user_event(
+                read_result['user_id'],
+                'message.read',
+                event_payload,
+            )
 
     return JsonResponse(
         {

@@ -2,6 +2,8 @@ import json
 from datetime import timedelta
 from unittest.mock import patch
 
+import jwt
+from django.conf import settings
 from django.core.cache import cache
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -22,6 +24,9 @@ from .views import broadcast_group_participant_event
 
 
 TEST_CACHE_SETTINGS = {
+    'MESSAGING_JWT_SECRET': 'test-messenger-secret-at-least-32-bytes',
+    'MESSAGING_JWT_ISSUER': 'parrot-parent',
+    'MESSAGING_JWT_AUDIENCE': 'parrot-messenger',
     'INTERNAL_SERVICE_TOKEN': 'test-internal-service-token',
     'CACHES': {
         'default': {
@@ -462,6 +467,25 @@ class GroupGhostReceiptTests(TestCase):
             is_active=True,
         )
 
+    def auth_header(self, user_id, account_number):
+        now = timezone.now()
+        token = jwt.encode(
+            {
+                'sub': str(user_id),
+                'user_id': user_id,
+                'username': f'user-{user_id}',
+                'account_number': account_number,
+                'iss': settings.MESSAGING_JWT_ISSUER,
+                'aud': settings.MESSAGING_JWT_AUDIENCE,
+                'iat': now,
+                'exp': now + timedelta(minutes=5),
+            },
+            settings.MESSAGING_JWT_SECRET,
+            algorithm='HS256',
+        )
+
+        return f'Bearer {token}'
+
     def create_completed_group_upload_intent(
         self,
         client_message_id,
@@ -768,3 +792,67 @@ class GroupGhostReceiptTests(TestCase):
         resolve_parent_receipt_visibility.assert_not_called()
         receipt.refresh_from_db()
         self.assertTrue(receipt.hidden_from_sender)
+
+    @patch('group_messaging.views.broadcast_group_participant_event')
+    @patch('group_messaging.views.broadcast_room_event')
+    @patch('group_messaging.services.resolve_parent_receipt_visibility')
+    def test_hidden_group_read_broadcasts_reader_unread_clear(
+        self,
+        resolve_parent_receipt_visibility,
+        broadcast_room_event,
+        broadcast_group_participant_event,
+    ):
+        message = GroupMessage.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            text='Hidden read should still clear unread.',
+        )
+        GroupMessageReceipt.objects.create(
+            message=message,
+            room=self.room,
+            user_id=self.recipient_user_id,
+        )
+        resolve_parent_receipt_visibility.return_value = (
+            {
+                'parent': {
+                    'response': {
+                        'allowed': True,
+                        'hidden_user_ids': [self.sender_user_id],
+                        'visible_user_ids': [],
+                    },
+                },
+            },
+            200,
+        )
+
+        response = self.client.post(
+            f'/groups/{self.room.id}/messages/read/',
+            data=json.dumps({'last_read_message_id': message.id}),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=self.auth_header(
+                self.recipient_user_id,
+                '7000000002',
+            ),
+        )
+
+        result = response.json()['result']
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(result['updated_messages'], 0)
+        self.assertEqual(result['hidden_receipts'], 1)
+        self.assertEqual(result['unread_count'], 0)
+        broadcast_room_event.assert_not_called()
+        broadcast_group_participant_event.assert_called_once()
+        self.assertEqual(
+            broadcast_group_participant_event.call_args.args[1],
+            'group.message.read',
+        )
+        event_payload = broadcast_group_participant_event.call_args.args[2]
+        self.assertEqual(event_payload['user_id'], self.recipient_user_id)
+        self.assertEqual(event_payload['room_id'], self.room.id)
+        self.assertEqual(event_payload['last_read_message_id'], message.id)
+        self.assertEqual(event_payload['unread_count'], 0)
+        self.assertEqual(event_payload['message_statuses'], [])
+        self.assertEqual(
+            broadcast_group_participant_event.call_args.kwargs['exclude_user_ids'],
+            [self.sender_user_id],
+        )
