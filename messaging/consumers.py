@@ -103,19 +103,29 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
         await self.send_json(event['payload'])
 
     async def broadcast_typing_event(self, event_type):
+        payload = {
+            'type': event_type,
+            'room_id': self.room_id,
+            'user_id': self.user_id,
+            'account_number': self.account_number,
+            'expires_in': self.get_typing_timeout(),
+        }
         await self.channel_layer.group_send(
             self.room_group_name,
             {
                 'type': 'room.event',
-                'payload': {
-                    'type': event_type,
-                    'room_id': self.room_id,
-                    'user_id': self.user_id,
-                    'account_number': self.account_number,
-                    'expires_in': self.get_typing_timeout(),
-                },
+                'payload': payload,
             },
         )
+        recipient_user_ids = await self.get_typing_recipient_user_ids()
+        for recipient_user_id in recipient_user_ids:
+            await self.channel_layer.group_send(
+                get_user_group_name(recipient_user_id),
+                {
+                    'type': 'room.event',
+                    'payload': payload,
+                },
+            )
 
     def get_typing_timeout(self):
         return getattr(settings, 'MESSAGING_TYPING_TTL_SECONDS', 7)
@@ -156,6 +166,17 @@ class RoomConsumer(AsyncJsonWebsocketConsumer):
             for user_id in participant_user_ids
             if cache.get(get_typing_cache_key(self.room_id, user_id)) is not None
         ]
+
+    @database_sync_to_async
+    def get_typing_recipient_user_ids(self):
+        return list(
+            RoomParticipant.objects.filter(
+                room_id=self.room_id,
+                is_active=True,
+            )
+            .exclude(user_id=self.user_id)
+            .values_list('user_id', flat=True)
+        )
 
     @database_sync_to_async
     def set_typing_state(self):

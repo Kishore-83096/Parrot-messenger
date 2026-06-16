@@ -636,6 +636,26 @@ def ensure_room_participant(room, user_id, account_number):
     return participant, created
 
 
+def unhide_direct_room_for_users(room, user_ids):
+    if not room or not room.is_direct:
+        return 0
+
+    normalized_user_ids = [
+        int(user_id)
+        for user_id in dict.fromkeys(user_ids or [])
+        if user_id
+    ]
+    if not normalized_user_ids:
+        return 0
+
+    return RoomParticipant.objects.filter(
+        room=room,
+        user_id__in=normalized_user_ids,
+        is_active=True,
+        room_list_hidden=True,
+    ).update(room_list_hidden=False)
+
+
 def get_existing_direct_room_authorization(sender, recipient_account_number):
     if not isinstance(recipient_account_number, str) or not ACCOUNT_NUMBER_PATTERN.match(recipient_account_number):
         return None
@@ -765,6 +785,10 @@ def create_direct_message(sender, parent_authorization, payload):
                 sent_while_blocked=delivery_blocked,
             )
             create_message_attachments(message, normalized_payload['attachments'])
+            visible_room_user_ids = [sender['user_id']]
+            if not delivery_blocked:
+                visible_room_user_ids.append(recipient_user_id)
+            unhide_direct_room_for_users(room, visible_room_user_ids)
             room.updated_at = timezone.now()
             room.save(update_fields=['updated_at'])
     except Message.DoesNotExist:

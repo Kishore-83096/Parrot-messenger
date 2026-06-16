@@ -2371,6 +2371,53 @@ class WebSocketRealtimeTests(TransactionTestCase):
         self.assertEqual(event['last_delivered_message_id'], 99)
         await communicator.disconnect()
 
+    async def test_room_typing_event_is_broadcast_to_recipient_inbox(self):
+        room = await sync_to_async(self.create_direct_room)()
+        sender_token = self.auth_token()
+        recipient_token = self.auth_token(
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+        )
+        room_communicator = WebsocketCommunicator(
+            application,
+            f'/ws/rooms/{room.id}/?token={sender_token}',
+        )
+        inbox_communicator = WebsocketCommunicator(
+            application,
+            f'/ws/inbox/?token={recipient_token}',
+        )
+
+        room_connected, _ = await room_communicator.connect()
+        inbox_connected, _ = await inbox_communicator.connect()
+        self.assertTrue(room_connected)
+        self.assertTrue(inbox_connected)
+        self.assertEqual(
+            (await room_communicator.receive_json_from(timeout=5))['type'],
+            'connection.accepted',
+        )
+        self.assertEqual(
+            (await room_communicator.receive_json_from(timeout=5))['type'],
+            'typing.snapshot',
+        )
+        self.assertEqual(
+            (await inbox_communicator.receive_json_from(timeout=5))['type'],
+            'connection.accepted',
+        )
+        self.assertEqual(
+            (await inbox_communicator.receive_json_from(timeout=5))['type'],
+            'presence.snapshot',
+        )
+
+        await room_communicator.send_json_to({'type': 'typing.started'})
+
+        event = await inbox_communicator.receive_json_from(timeout=5)
+        self.assertEqual(event['type'], 'typing.started')
+        self.assertEqual(int(event['room_id']), room.id)
+        self.assertEqual(event['user_id'], self.sender_user_id)
+        self.assertEqual(event['account_number'], self.sender_account_number)
+        await room_communicator.disconnect()
+        await inbox_communicator.disconnect()
+
 
 @override_settings(**TEST_JWT_SETTINGS)
 class PresenceVisibilityWebhookTests(TestCase):
@@ -2799,6 +2846,35 @@ class MessagingCacheTests(TestCase):
         visible_sender_rooms, visible_sender_status = list_user_rooms(self.sender_user_id)
         self.assertEqual(visible_sender_status, 200)
         self.assertEqual([room_data['id'] for room_data in visible_sender_rooms['rooms']], [room.id])
+
+    def test_visible_incoming_message_unhides_direct_room_for_recipient(self):
+        room = self.create_direct_room()
+        hidden_result, hidden_status = set_direct_room_list_hidden(
+            self.recipient_user_id,
+            self.sender_user_id,
+            True,
+        )
+        self.assertEqual(hidden_status, 200)
+        self.assertEqual(hidden_result['updated'], 1)
+        hidden_rooms, hidden_rooms_status = list_user_rooms(self.recipient_user_id)
+        self.assertEqual(hidden_rooms_status, 200)
+        self.assertEqual(hidden_rooms['rooms'], [])
+
+        send_result, send_status = create_direct_message(
+            self.sender(),
+            self.parent_authorization(delivery_blocked=False),
+            {
+                'recipient_account_number': self.recipient_account_number,
+                'text': 'Visible after contact delete.',
+            },
+        )
+
+        self.assertEqual(send_status, 201)
+        self.assertEqual(send_result['status'], 'sent')
+        visible_rooms, visible_rooms_status = list_user_rooms(self.recipient_user_id)
+        self.assertEqual(visible_rooms_status, 200)
+        self.assertEqual([room_data['id'] for room_data in visible_rooms['rooms']], [room.id])
+        self.assertEqual(visible_rooms['rooms'][0]['last_message']['text'], 'Visible after contact delete.')
 
     def test_delivery_blocked_message_is_visible_only_to_sender_and_kept_sent(self):
         room = self.create_direct_room()
