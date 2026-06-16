@@ -45,6 +45,7 @@ from .services import (
     mark_room_delivered,
     mark_room_read,
     release_room_blocked_messages,
+    set_direct_room_list_hidden,
 )
 
 
@@ -1396,6 +1397,18 @@ class MessageSendAuthorizationTests(TestCase):
             **headers,
         )
 
+    def post_direct_room_visibility(self, payload, token=None):
+        headers = {}
+        if token is not None:
+            headers['HTTP_X_INTERNAL_SERVICE_TOKEN'] = token
+
+        return self.client.post(
+            '/rooms/internal/direct-visibility/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            **headers,
+        )
+
     def post_upload_intents(self, payload):
         return self.client.post(
             '/crypto/files/upload-intents/',
@@ -1643,6 +1656,56 @@ class MessageSendAuthorizationTests(TestCase):
         response = self.post_authorization_cache({'authorizations': []})
 
         self.assertEqual(response.status_code, 401)
+
+    def test_internal_direct_room_visibility_requires_internal_token(self):
+        response = self.post_direct_room_visibility(
+            {
+                'owner_user_id': self.sender_user_id,
+                'peer_user_id': self.recipient_user_id,
+                'hidden': True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_internal_direct_room_visibility_hides_owner_room_list_only(self):
+        room = self.create_direct_room()
+        Message.objects.create(
+            room=room,
+            sender_user_id=self.recipient_user_id,
+            recipient_user_id=self.sender_user_id,
+            text='Conversation stays stored.',
+        )
+
+        response = self.post_direct_room_visibility(
+            {
+                'owner_user_id': self.sender_user_id,
+                'peer_user_id': self.recipient_user_id,
+                'hidden': True,
+            },
+            token=settings.INTERNAL_SERVICE_TOKEN,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['result']['updated'], 1)
+        self.assertTrue(
+            RoomParticipant.objects.get(
+                room=room,
+                user_id=self.sender_user_id,
+            ).room_list_hidden
+        )
+        sender_rooms, sender_status = list_user_rooms(self.sender_user_id)
+        recipient_rooms, recipient_status = list_user_rooms(self.recipient_user_id)
+        sender_messages, sender_messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+        )
+        self.assertEqual(sender_status, 200)
+        self.assertEqual(recipient_status, 200)
+        self.assertEqual(sender_messages_status, 200)
+        self.assertEqual(sender_rooms['rooms'], [])
+        self.assertEqual([recipient_rooms['rooms'][0]['id']], [room.id])
+        self.assertEqual(sender_messages['messages'][0]['text'], 'Conversation stays stored.')
 
     @patch('messaging.views.broadcast_participant_event')
     @patch('messaging.views.broadcast_room_event')
@@ -2690,6 +2753,52 @@ class MessagingCacheTests(TestCase):
             [message['text'] for message in fresh_messages_result['messages']],
             ['Old message.', 'New message.'],
         )
+
+    def test_direct_room_list_hidden_is_owner_only_and_reversible(self):
+        room = self.create_direct_room()
+        Message.objects.create(
+            room=room,
+            sender_user_id=self.recipient_user_id,
+            recipient_user_id=self.sender_user_id,
+            text='Stored conversation.',
+        )
+
+        initial_sender_rooms, initial_sender_status = list_user_rooms(self.sender_user_id)
+        self.assertEqual(initial_sender_status, 200)
+        self.assertEqual([room_data['id'] for room_data in initial_sender_rooms['rooms']], [room.id])
+
+        hidden_result, hidden_status = set_direct_room_list_hidden(
+            self.sender_user_id,
+            self.recipient_user_id,
+            True,
+        )
+
+        self.assertEqual(hidden_status, 200)
+        self.assertEqual(hidden_result['updated'], 1)
+        hidden_sender_rooms, hidden_sender_status = list_user_rooms(self.sender_user_id)
+        recipient_rooms, recipient_status = list_user_rooms(self.recipient_user_id)
+        sender_messages, sender_messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+        )
+        self.assertEqual(hidden_sender_status, 200)
+        self.assertEqual(recipient_status, 200)
+        self.assertEqual(sender_messages_status, 200)
+        self.assertEqual(hidden_sender_rooms['rooms'], [])
+        self.assertEqual([room_data['id'] for room_data in recipient_rooms['rooms']], [room.id])
+        self.assertEqual(sender_messages['messages'][0]['text'], 'Stored conversation.')
+
+        visible_result, visible_status = set_direct_room_list_hidden(
+            self.sender_user_id,
+            self.recipient_user_id,
+            False,
+        )
+
+        self.assertEqual(visible_status, 200)
+        self.assertEqual(visible_result['updated'], 1)
+        visible_sender_rooms, visible_sender_status = list_user_rooms(self.sender_user_id)
+        self.assertEqual(visible_sender_status, 200)
+        self.assertEqual([room_data['id'] for room_data in visible_sender_rooms['rooms']], [room.id])
 
     def test_delivery_blocked_message_is_visible_only_to_sender_and_kept_sent(self):
         room = self.create_direct_room()

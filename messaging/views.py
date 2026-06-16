@@ -56,6 +56,7 @@ from .services import (
     normalize_message_list_params,
     react_to_message,
     release_room_blocked_messages,
+    set_direct_room_list_hidden,
     upload_message_files,
 )
 
@@ -1019,6 +1020,51 @@ def update_receipt_visibility_cache(request):
             'invalidated': invalidated,
             'skipped': skipped,
         }
+    )
+
+
+@csrf_exempt
+@require_POST
+def update_direct_room_list_visibility(request):
+    if not is_internal_service_request(request):
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'message': 'Unauthorized internal service request.',
+            },
+            status=401,
+        )
+
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    if 'hidden' not in payload:
+        return JsonResponse(
+            {
+                'status': 'error',
+                'service': 'messenger',
+                'errors': {
+                    'hidden': ['Hidden flag is required.'],
+                },
+            },
+            status=400,
+        )
+
+    result, response_status = set_direct_room_list_hidden(
+        payload.get('owner_user_id'),
+        payload.get('peer_user_id'),
+        bool(payload.get('hidden')),
+    )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'result': result,
+        },
+        status=response_status,
     )
 
 

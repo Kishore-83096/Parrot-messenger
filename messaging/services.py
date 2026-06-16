@@ -16,6 +16,7 @@ from .cache import (
     get_cached_room_messages,
     get_cached_user_rooms,
     invalidate_room_caches,
+    invalidate_user_room_list_cache,
     set_cached_room_messages,
     set_cached_user_rooms,
 )
@@ -1109,7 +1110,11 @@ def list_user_rooms(user_id):
         return cached_result, 200
 
     participants = (
-        RoomParticipant.objects.filter(user_id=user_id, is_active=True)
+        RoomParticipant.objects.filter(
+            user_id=user_id,
+            is_active=True,
+            room_list_hidden=False,
+        )
         .select_related('room')
         .prefetch_related('room__participants', 'room__messages')
         .order_by('-room__updated_at', '-room__id')
@@ -1129,6 +1134,63 @@ def list_user_rooms(user_id):
     set_cached_user_rooms(user_id, result)
 
     return result, 200
+
+
+def set_direct_room_list_hidden(owner_user_id, peer_user_id, hidden):
+    try:
+        owner_user_id = int(owner_user_id)
+        peer_user_id = int(peer_user_id)
+    except (TypeError, ValueError):
+        return validation_error(
+            {
+                'owner_user_id': ['Owner user id must be a positive integer.'],
+                'peer_user_id': ['Peer user id must be a positive integer.'],
+            }
+        )
+
+    if owner_user_id <= 0 or peer_user_id <= 0 or owner_user_id == peer_user_id:
+        return validation_error(
+            {
+                'owner_user_id': ['Owner and peer must be different positive users.'],
+                'peer_user_id': ['Owner and peer must be different positive users.'],
+            }
+        )
+
+    participants = RoomParticipant.objects.filter(
+        room__room_type=Room.TYPE_DIRECT,
+        user_id=owner_user_id,
+        is_active=True,
+        room__participants__user_id=peer_user_id,
+        room__participants__is_active=True,
+    )
+    participant_rows = list(participants.values('id', 'room_id').distinct())
+    if not participant_rows:
+        return {
+            'status': 'updated',
+            'owner_user_id': owner_user_id,
+            'peer_user_id': peer_user_id,
+            'hidden': bool(hidden),
+            'updated': 0,
+            'room_ids': [],
+        }, 200
+
+    participant_ids = [participant['id'] for participant in participant_rows]
+    room_ids = sorted({participant['room_id'] for participant in participant_rows})
+    updated = RoomParticipant.objects.filter(id__in=participant_ids).exclude(
+        room_list_hidden=bool(hidden),
+    ).update(room_list_hidden=bool(hidden))
+
+    if updated:
+        invalidate_user_room_list_cache(owner_user_id)
+
+    return {
+        'status': 'updated',
+        'owner_user_id': owner_user_id,
+        'peer_user_id': peer_user_id,
+        'hidden': bool(hidden),
+        'updated': updated,
+        'room_ids': room_ids,
+    }, 200
 
 
 def get_room_unread_count(room_id, user_id):

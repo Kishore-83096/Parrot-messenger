@@ -68,6 +68,7 @@ class RoomParticipant(models.Model):
     joined_at = models.DateTimeField(auto_now_add=True)
     last_read_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    room_list_hidden = models.BooleanField(default=False)
 
     class Meta:
         constraints = [
@@ -75,6 +76,7 @@ class RoomParticipant(models.Model):
         ]
         indexes = [
             models.Index(fields=['user_id', 'is_active']),
+            models.Index(fields=['user_id', 'is_active', 'room_list_hidden']),
             models.Index(fields=['room', 'is_active']),
         ]
         ordering = ['joined_at', 'id']
