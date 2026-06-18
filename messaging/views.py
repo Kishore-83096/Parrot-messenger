@@ -41,6 +41,7 @@ from .signals import (
     resolve_parent_presence_visibility,
 )
 from .services import (
+    apply_direct_receipt_visibility_policy,
     cleanup_uploaded_attachments,
     create_direct_message,
     delete_direct_message_for_everyone,
@@ -412,10 +413,14 @@ def build_cached_parent_authorization_result(parent_response, response_status):
     }
 
 
-def authorize_sender_for_recipient(sender, recipient_account_number):
-    cached_authorization = get_cached_messaging_authorization(
-        sender['user_id'],
-        recipient_account_number,
+def authorize_sender_for_recipient(sender, recipient_account_number, use_cache=True):
+    cached_authorization = (
+        get_cached_messaging_authorization(
+            sender['user_id'],
+            recipient_account_number,
+        )
+        if use_cache
+        else None
     )
     if cached_authorization:
         authorization_result, response_status = cached_authorization
@@ -477,10 +482,11 @@ def build_shared_room_authorization_result(parent_authorization_result, room_aut
     return authorization_result
 
 
-def authorize_sender_for_message(sender, recipient_account_number):
+def authorize_sender_for_message(sender, recipient_account_number, use_cache=True):
     parent_authorization, authorization_result, response_status = authorize_sender_for_recipient(
         sender,
         recipient_account_number,
+        use_cache=use_cache,
     )
     if parent_authorization is not None:
         return parent_authorization, authorization_result, response_status
@@ -746,6 +752,7 @@ def create_crypto_file_upload_intents(request):
     parent_authorization, authorization_result, authorization_status = authorize_sender_for_message(
         sender,
         payload.get('recipient_account_number'),
+        use_cache=False,
     )
     if parent_authorization is None:
         return JsonResponse(
@@ -983,6 +990,8 @@ def update_receipt_visibility_cache(request):
     updated = 0
     invalidated = 0
     skipped = 0
+    applied_messages = 0
+    applied_room_ids = set()
 
     for policy in policies:
         if not isinstance(policy, dict):
@@ -1003,12 +1012,20 @@ def update_receipt_visibility_cache(request):
             skipped += 1
             continue
 
+        hidden = bool(policy.get('hidden'))
         if set_cached_receipt_visibility(
             owner_user_id,
             candidate_user_id,
-            bool(policy.get('hidden')),
+            hidden,
         ):
             updated += 1
+            apply_result = apply_direct_receipt_visibility_policy(
+                owner_user_id,
+                candidate_user_id,
+                hidden,
+            )
+            applied_messages += apply_result['updated_messages']
+            applied_room_ids.update(apply_result['room_ids'])
         else:
             skipped += 1
 
@@ -1019,6 +1036,8 @@ def update_receipt_visibility_cache(request):
             'updated': updated,
             'invalidated': invalidated,
             'skipped': skipped,
+            'applied_messages': applied_messages,
+            'applied_rooms': len(applied_room_ids),
         }
     )
 
@@ -1082,6 +1101,7 @@ def send_message(request):
     parent_authorization, authorization_result, authorization_status = authorize_sender_for_message(
         sender,
         payload.get('recipient_account_number'),
+        use_cache=False,
     )
     if parent_authorization is None:
         return JsonResponse(
@@ -1230,6 +1250,7 @@ def edit_message(request, message_id):
     parent_authorization, authorization_result, authorization_status = authorize_sender_for_message(
         sender,
         recipient_account_number,
+        use_cache=False,
     )
     if parent_authorization is None:
         return JsonResponse(

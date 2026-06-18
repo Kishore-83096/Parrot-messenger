@@ -1397,6 +1397,18 @@ class MessageSendAuthorizationTests(TestCase):
             **headers,
         )
 
+    def post_receipt_visibility_cache(self, payload, token=None):
+        headers = {}
+        if token is not None:
+            headers['HTTP_X_INTERNAL_SERVICE_TOKEN'] = token
+
+        return self.client.post(
+            '/receipts/internal/visibility-cache/',
+            data=json.dumps(payload),
+            content_type='application/json',
+            **headers,
+        )
+
     def post_direct_room_visibility(self, payload, token=None):
         headers = {}
         if token is not None:
@@ -1584,7 +1596,7 @@ class MessageSendAuthorizationTests(TestCase):
         )
 
     @patch('messaging.views.authorize_parent_messaging')
-    def test_recipient_device_lookup_caches_parent_authorization_for_send(
+    def test_recipient_device_lookup_caches_authorization_but_send_refreshes_policy(
         self,
         authorize_parent_messaging,
     ):
@@ -1603,7 +1615,7 @@ class MessageSendAuthorizationTests(TestCase):
 
         self.assertEqual(devices_response.status_code, 200)
         self.assertEqual(send_response.status_code, 201)
-        authorize_parent_messaging.assert_called_once()
+        self.assertEqual(authorize_parent_messaging.call_count, 2)
         self.assertIsNotNone(
             get_cached_messaging_authorization(
                 self.sender_user_id,
@@ -1614,13 +1626,13 @@ class MessageSendAuthorizationTests(TestCase):
     @patch('messaging.views.broadcast_participant_event')
     @patch('messaging.views.broadcast_room_event')
     @patch('messaging.views.authorize_parent_messaging')
-    def test_internal_authorization_cache_update_drives_blocked_delivery(
+    def test_send_refreshes_stale_allowed_authorization_after_block(
         self,
         authorize_parent_messaging,
         broadcast_room_event,
         broadcast_participant_event,
     ):
-        parent_response = self.parent_allowed(delivery_blocked=True)[0]['parent']['response']
+        stale_parent_response = self.parent_allowed(delivery_blocked=False)[0]['parent']['response']
         cache_response = self.post_authorization_cache(
             {
                 'authorizations': [
@@ -1628,29 +1640,110 @@ class MessageSendAuthorizationTests(TestCase):
                         'sender_user_id': self.sender_user_id,
                         'recipient_account_number': self.recipient_account_number,
                         'status_code': 200,
-                        'response': parent_response,
+                        'response': stale_parent_response,
                     },
                 ],
             },
             token=settings.INTERNAL_SERVICE_TOKEN,
         )
+        authorize_parent_messaging.return_value = self.parent_allowed(delivery_blocked=True)
 
         response = self.post_send_message(
             {
                 'recipient_account_number': self.recipient_account_number,
-                'text': 'Blocked from cache.',
+                'text': 'Blocked by fresh policy.',
             }
         )
 
         self.assertEqual(cache_response.status_code, 200)
         self.assertEqual(cache_response.json()['updated'], 1)
         self.assertEqual(response.status_code, 201)
-        authorize_parent_messaging.assert_not_called()
+        authorize_parent_messaging.assert_called_once()
 
         message = Message.objects.get()
         self.assertTrue(message.delivery_blocked)
         broadcast_room_event.assert_not_called()
         broadcast_participant_event.assert_called_once()
+
+    def test_receipt_visibility_cache_update_hides_existing_direct_receipts(self):
+        room = self.create_direct_room()
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Already read before block.',
+            status=Message.STATUS_READ,
+        )
+
+        response = self.post_receipt_visibility_cache(
+            {
+                'policies': [
+                    {
+                        'owner_user_id': self.recipient_user_id,
+                        'candidate_user_id': self.sender_user_id,
+                        'hidden': True,
+                    },
+                ],
+            },
+            token=settings.INTERNAL_SERVICE_TOKEN,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['updated'], 1)
+        self.assertEqual(body['applied_messages'], 1)
+        message.refresh_from_db()
+        self.assertTrue(message.receipt_hidden_from_sender)
+
+        messages_result, messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+        )
+        self.assertEqual(messages_status, 200)
+        self.assertEqual(messages_result['messages'][0]['status'], Message.STATUS_SENT)
+
+    def test_receipt_visibility_cache_update_releases_hidden_read_receipts(self):
+        room = self.create_direct_room()
+        message = Message.objects.create(
+            room=room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Hidden read before unblock.',
+            status=Message.STATUS_SENT,
+            receipt_hidden_from_sender=True,
+        )
+        participant = RoomParticipant.objects.get(
+            room=room,
+            user_id=self.recipient_user_id,
+        )
+        participant.last_read_at = timezone.now() + timedelta(seconds=1)
+        participant.save(update_fields=['last_read_at'])
+
+        response = self.post_receipt_visibility_cache(
+            {
+                'policies': [
+                    {
+                        'owner_user_id': self.recipient_user_id,
+                        'candidate_user_id': self.sender_user_id,
+                        'hidden': False,
+                    },
+                ],
+            },
+            token=settings.INTERNAL_SERVICE_TOKEN,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['applied_messages'], 1)
+        message.refresh_from_db()
+        self.assertEqual(message.status, Message.STATUS_READ)
+        self.assertFalse(message.receipt_hidden_from_sender)
+
+        messages_result, messages_status = list_room_messages(
+            self.sender_user_id,
+            room.id,
+        )
+        self.assertEqual(messages_status, 200)
+        self.assertEqual(messages_result['messages'][0]['status'], Message.STATUS_READ)
 
     def test_internal_authorization_cache_requires_internal_token(self):
         response = self.post_authorization_cache({'authorizations': []})

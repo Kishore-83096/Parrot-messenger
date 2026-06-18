@@ -1510,6 +1510,80 @@ def resolve_hidden_receipt_sender_ids(owner_user_id, sender_user_ids):
     }, None, None
 
 
+def apply_direct_receipt_visibility_policy(owner_user_id, candidate_user_id, hidden):
+    try:
+        owner_user_id = int(owner_user_id)
+        candidate_user_id = int(candidate_user_id)
+    except (TypeError, ValueError):
+        return {
+            'updated_messages': 0,
+            'room_ids': [],
+        }
+
+    if owner_user_id <= 0 or candidate_user_id <= 0 or owner_user_id == candidate_user_id:
+        return {
+            'updated_messages': 0,
+            'room_ids': [],
+        }
+
+    base_messages = Message.objects.filter(
+        room__room_type=Room.TYPE_DIRECT,
+        sender_user_id=candidate_user_id,
+        recipient_user_id=owner_user_id,
+        delivery_blocked=False,
+        deleted_at__isnull=True,
+    )
+    if hidden:
+        target_messages = base_messages.filter(
+            status__in=[Message.STATUS_DELIVERED, Message.STATUS_READ],
+            receipt_hidden_from_sender=False,
+        )
+        room_ids = list(target_messages.values_list('room_id', flat=True).distinct())
+        updated_messages = target_messages.update(
+            receipt_hidden_from_sender=True,
+            updated_at=timezone.now(),
+        )
+    else:
+        target_messages = base_messages.filter(receipt_hidden_from_sender=True)
+        room_ids = list(target_messages.values_list('room_id', flat=True).distinct())
+        read_message_ids = []
+        if room_ids:
+            read_markers = RoomParticipant.objects.filter(
+                room_id__in=room_ids,
+                user_id=owner_user_id,
+                is_active=True,
+                last_read_at__isnull=False,
+            ).values_list('room_id', 'last_read_at')
+            for room_id, last_read_at in read_markers:
+                read_message_ids.extend(
+                    target_messages.filter(
+                        room_id=room_id,
+                        created_at__lte=last_read_at,
+                    ).values_list('id', flat=True)
+                )
+
+        now = timezone.now()
+        updated_messages = 0
+        if read_message_ids:
+            updated_messages += Message.objects.filter(id__in=read_message_ids).update(
+                status=Message.STATUS_READ,
+                receipt_hidden_from_sender=False,
+                updated_at=now,
+            )
+        updated_messages += target_messages.exclude(id__in=read_message_ids).update(
+            receipt_hidden_from_sender=False,
+            updated_at=now,
+        )
+
+    for room_id in room_ids:
+        invalidate_room_caches(room_id)
+
+    return {
+        'updated_messages': updated_messages,
+        'room_ids': room_ids,
+    }
+
+
 def mark_room_delivered(user_id, room_id, payload):
     normalized_payload, errors = normalize_delivered_payload(payload)
     if errors:
