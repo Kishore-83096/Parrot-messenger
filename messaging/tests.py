@@ -29,6 +29,7 @@ from .models import (
     MessageReaction,
     Room,
     RoomParticipant,
+    SavedMessage,
     UserDeviceDefaultCredential,
     UserDeviceKey,
     UserE2EEKeyBackup,
@@ -41,10 +42,12 @@ from .services import (
     edit_direct_message,
     get_room_unread_count,
     list_room_messages,
+    list_saved_messages,
     list_user_rooms,
     mark_room_delivered,
     mark_room_read,
     release_room_blocked_messages,
+    set_direct_message_saved,
     set_direct_room_list_hidden,
 )
 
@@ -71,6 +74,171 @@ def test_public_key(byte_value=b'a'):
 
 def test_base64_bytes(byte_value=b'c', length=32):
     return base64.b64encode(byte_value * length).decode('ascii')
+
+
+class SavedMessageServiceTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.sender_user_id = 1
+        self.recipient_user_id = 2
+        self.sender_account_number = '7000000001'
+        self.recipient_account_number = '7000000002'
+        self.room = Room.objects.create(
+            room_type=Room.TYPE_DIRECT,
+            created_by_user_id=self.sender_user_id,
+        )
+        RoomParticipant.objects.create(
+            room=self.room,
+            user_id=self.sender_user_id,
+            account_number=self.sender_account_number,
+            display_name='Sender',
+            is_active=True,
+        )
+        RoomParticipant.objects.create(
+            room=self.room,
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+            display_name='Recipient',
+            is_active=True,
+        )
+        self.message = Message.objects.create(
+            room=self.room,
+            sender_user_id=self.sender_user_id,
+            recipient_user_id=self.recipient_user_id,
+            text='Saved direct message',
+        )
+        MessageAttachment.objects.create(
+            message=self.message,
+            file_type=MessageAttachment.TYPE_DOCUMENT,
+            file_url='https://example.com/file.pdf',
+            file_name='file.pdf',
+            sort_order=0,
+        )
+        MessageReaction.objects.create(
+            message=self.message,
+            user_id=self.recipient_user_id,
+            reaction=MessageReaction.REACTION_HEART,
+        )
+
+    def test_user_can_save_and_unsave_direct_message(self):
+        result, status = set_direct_message_saved(
+            self.recipient_user_id,
+            self.message.id,
+            {'saved': True},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result['saved'])
+        self.assertTrue(result['message']['saved_by_me'])
+        self.assertEqual(SavedMessage.objects.count(), 1)
+
+        saves_result, saves_status = list_saved_messages(self.recipient_user_id)
+
+        self.assertEqual(saves_status, 200)
+        self.assertEqual(len(saves_result['saves']), 1)
+        saved_item = saves_result['saves'][0]
+        self.assertEqual(saved_item['message_kind'], SavedMessage.KIND_DIRECT)
+        self.assertEqual(saved_item['sender']['account_number'], self.sender_account_number)
+        self.assertEqual(saved_item['message']['attachments'][0]['file_name'], 'file.pdf')
+        self.assertEqual(saved_item['message']['reactions'][0]['reaction'], MessageReaction.REACTION_HEART)
+        self.assertIsNotNone(saved_item['received_at'])
+        self.assertIsNotNone(saved_item['saved_at'])
+
+        result, status = set_direct_message_saved(
+            self.recipient_user_id,
+            self.message.id,
+            {'saved': False},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(result['saved'])
+        self.assertFalse(result['message']['saved_by_me'])
+        self.assertEqual(SavedMessage.objects.count(), 0)
+
+    def test_user_can_save_group_message_with_group_context(self):
+        from group_messaging.models import (
+            GroupMembership,
+            GroupMessage,
+            GroupMessageReaction,
+            GroupMessageReceipt,
+            GroupProfile,
+        )
+        from group_messaging.services import set_group_message_saved
+
+        group_room = Room.objects.create(
+            room_type=Room.TYPE_GROUP,
+            title='Launch group',
+            created_by_user_id=self.sender_user_id,
+        )
+        RoomParticipant.objects.create(
+            room=group_room,
+            user_id=self.sender_user_id,
+            account_number=self.sender_account_number,
+            display_name='Owner',
+            role=RoomParticipant.ROLE_ADMIN,
+            is_active=True,
+        )
+        RoomParticipant.objects.create(
+            room=group_room,
+            user_id=self.recipient_user_id,
+            account_number=self.recipient_account_number,
+            display_name='Member',
+            is_active=True,
+        )
+        GroupMembership.objects.create(
+            room=group_room,
+            user_id=self.sender_user_id,
+            role=GroupMembership.ROLE_ADMIN,
+            is_active=True,
+        )
+        GroupMembership.objects.create(
+            room=group_room,
+            user_id=self.recipient_user_id,
+            role=GroupMembership.ROLE_MEMBER,
+            is_active=True,
+        )
+        GroupProfile.objects.create(
+            room=group_room,
+            title='Launch group',
+            created_by_user_id=self.sender_user_id,
+        )
+        group_message = GroupMessage.objects.create(
+            room=group_room,
+            sender_user_id=self.sender_user_id,
+            text='Saved group message',
+        )
+        GroupMessageReceipt.objects.create(
+            message=group_message,
+            room=group_room,
+            user_id=self.recipient_user_id,
+            delivered_at=timezone.now(),
+        )
+        GroupMessageReaction.objects.create(
+            message=group_message,
+            user_id=self.recipient_user_id,
+            reaction=GroupMessageReaction.REACTION_LAUGH,
+        )
+
+        result, status = set_group_message_saved(
+            self.recipient_user_id,
+            group_room.id,
+            group_message.id,
+            {'saved': True},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(result['saved'])
+        self.assertTrue(result['message']['saved_by_me'])
+
+        saves_result, saves_status = list_saved_messages(self.recipient_user_id)
+
+        self.assertEqual(saves_status, 200)
+        saved_item = saves_result['saves'][0]
+        self.assertEqual(saved_item['message_kind'], SavedMessage.KIND_GROUP)
+        self.assertEqual(saved_item['group']['title'], 'Launch group')
+        self.assertEqual(saved_item['group']['owner']['account_number'], self.sender_account_number)
+        self.assertEqual(saved_item['sender']['display_name'], 'Owner')
+        self.assertEqual(saved_item['message']['reactions'][0]['reaction'], GroupMessageReaction.REACTION_LAUGH)
 
 
 @override_settings(**TEST_JWT_SETTINGS)

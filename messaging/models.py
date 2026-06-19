@@ -347,6 +347,83 @@ class MessageReaction(models.Model):
         return f'{self.reaction} reaction by user {self.user_id} on message {self.message_id}'
 
 
+class SavedMessage(models.Model):
+    KIND_DIRECT = 'direct'
+    KIND_GROUP = 'group'
+    KIND_CHOICES = [
+        (KIND_DIRECT, 'Direct'),
+        (KIND_GROUP, 'Group'),
+    ]
+
+    user_id = models.PositiveBigIntegerField(db_index=True)
+    direct_message = models.ForeignKey(
+        Message,
+        related_name='saved_by',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    group_message = models.ForeignKey(
+        'group_messaging.GroupMessage',
+        related_name='saved_by',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(direct_message__isnull=False, group_message__isnull=True)
+                    | Q(direct_message__isnull=True, group_message__isnull=False)
+                ),
+                name='ck_saved_message_one_target',
+            ),
+            models.UniqueConstraint(
+                fields=['user_id', 'direct_message'],
+                condition=Q(direct_message__isnull=False),
+                name='uq_saved_direct_message_user',
+            ),
+            models.UniqueConstraint(
+                fields=['user_id', 'group_message'],
+                condition=Q(group_message__isnull=False),
+                name='uq_saved_group_message_user',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['user_id', '-created_at'], name='saved_msg_user_created_idx'),
+            models.Index(fields=['direct_message'], name='saved_msg_direct_idx'),
+            models.Index(fields=['group_message'], name='saved_msg_group_idx'),
+        ]
+        ordering = ['-created_at', '-id']
+
+    @property
+    def message_kind(self):
+        return self.KIND_GROUP if self.group_message_id else self.KIND_DIRECT
+
+    def clean(self):
+        super().clean()
+
+        has_direct_message = bool(self.direct_message_id)
+        has_group_message = bool(self.group_message_id)
+        if has_direct_message == has_group_message:
+            raise ValidationError(
+                {
+                    'message': 'Saved message must reference exactly one message.',
+                }
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'user {self.user_id} saved {self.message_kind} message #{self.direct_message_id or self.group_message_id}'
+
+
 class MessageEncryptedUploadIntent(models.Model):
     STATUS_ISSUED = 'issued'
     STATUS_COMPLETED = 'completed'

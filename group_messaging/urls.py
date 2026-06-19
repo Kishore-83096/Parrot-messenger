@@ -19,6 +19,7 @@ from .views import (
     group_receipt_visibility_prewarm,
     group_room_detail,
     group_room_messages,
+    group_save_message,
     group_send_message,
 )
 
@@ -34,6 +35,7 @@ urlpatterns = [
     path('<int:room_id>/messages/send/', group_send_message, name='group-message-send'),
     path('<int:room_id>/messages/<int:message_id>/edit/', group_edit_message, name='group-message-edit'),
     path('<int:room_id>/messages/<int:message_id>/delete/', group_delete_message, name='group-message-delete'),
+    path('<int:room_id>/messages/<int:message_id>/save/', group_save_message, name='group-message-save'),
     path('<int:room_id>/messages/delivered/', group_deliver_room, name='group-message-delivered'),
     path('<int:room_id>/messages/read/', group_read_room, name='group-message-read'),
     path('<int:room_id>/receipts/visibility/prewarm/', group_receipt_visibility_prewarm, name='group-receipt-visibility-prewarm'),

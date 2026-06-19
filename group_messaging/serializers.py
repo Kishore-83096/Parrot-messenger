@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from messaging.models import RoomParticipant
+from messaging.models import RoomParticipant, SavedMessage
 
 from .models import (
     GroupActionLog,
@@ -291,6 +291,10 @@ def serialize_group_message(message, current_user_id=None):
             participant_identity_by_user_id=participant_identity_by_user_id,
         )
     )
+    saved_by_me = get_group_message_saved_by_current_user(
+        message,
+        current_user_id,
+    )
     return {
         'id': message.id,
         'room_id': message.room_id,
@@ -323,12 +327,27 @@ def serialize_group_message(message, current_user_id=None):
         'attachments': [],
         'reactions': reaction_data['reactions'],
         'my_reaction': reaction_data['my_reaction'],
+        'saved_by_me': saved_by_me,
         'receipts': [] if is_deleted else serialize_group_message_receipts(
             message,
             current_user_id,
             participant_identity_by_user_id=participant_identity_by_user_id,
         ),
     }
+
+
+def get_group_message_saved_by_current_user(message, current_user_id=None):
+    if not current_user_id:
+        return False
+
+    saved_flag = getattr(message, '_saved_by_current_user', None)
+    if saved_flag is not None:
+        return bool(saved_flag)
+
+    return SavedMessage.objects.filter(
+        user_id=current_user_id,
+        group_message_id=message.id,
+    ).exists()
 
 
 def serialize_group_reply_preview(message, current_user_id=None, participant_identity_by_user_id=None):

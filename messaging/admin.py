@@ -7,6 +7,7 @@ from .models import (
     MessageReaction,
     Room,
     RoomParticipant,
+    SavedMessage,
     UserDeviceKey,
     UserE2EEKeyBackup,
 )
@@ -120,6 +121,14 @@ class MessageReactionAdmin(admin.ModelAdmin):
     list_display = ('id', 'message', 'user_id', 'reaction', 'created_at', 'updated_at')
     list_filter = ('reaction', 'created_at', 'updated_at')
     search_fields = ('=message__id', '=user_id')
+    readonly_fields = ('created_at', 'updated_at')
+
+
+@admin.register(SavedMessage)
+class SavedMessageAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user_id', 'message_kind', 'direct_message', 'group_message', 'created_at')
+    list_filter = ('created_at', 'updated_at')
+    search_fields = ('=user_id', '=direct_message__id', '=group_message__id')
     readonly_fields = ('created_at', 'updated_at')
 
 

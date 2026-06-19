@@ -32,6 +32,7 @@ from .models import (
     MessageReaction,
     Room,
     RoomParticipant,
+    SavedMessage,
 )
 from .signals import resolve_parent_receipt_visibility
 
@@ -39,6 +40,7 @@ from .signals import resolve_parent_receipt_visibility
 ACCOUNT_NUMBER_PATTERN = re.compile(r'^7\d{9}$')
 MAX_MESSAGE_TEXT_LENGTH = 5000
 MAX_ATTACHMENTS_PER_MESSAGE = 10
+MAX_SAVED_MESSAGES_PAGE_SIZE = 100
 MESSAGE_EDIT_DELETE_WINDOW = timedelta(minutes=15)
 IMAGE_EXTENSIONS = {'.avif', '.gif', '.heic', '.jpeg', '.jpg', '.png', '.webp'}
 PDF_EXTENSIONS = {'.pdf'}
@@ -1245,6 +1247,29 @@ def get_room_unread_count(room_id, user_id):
     return messages.exclude(status=Message.STATUS_READ).count()
 
 
+def attach_direct_saved_flags(messages, user_id):
+    message_ids = [
+        int(message.id)
+        for message in messages
+        if getattr(message, 'id', None)
+    ]
+    if not message_ids or not user_id:
+        for message in messages:
+            message._saved_by_current_user = False
+        return messages
+
+    saved_message_ids = set(
+        SavedMessage.objects.filter(
+            user_id=user_id,
+            direct_message_id__in=message_ids,
+        ).values_list('direct_message_id', flat=True)
+    )
+    for message in messages:
+        message._saved_by_current_user = int(message.id) in saved_message_ids
+
+    return messages
+
+
 def list_room_messages(user_id, room_id, limit=20, before_message_id=None, around_message_id=None):
     cached_result = get_cached_room_messages(
         user_id,
@@ -1298,6 +1323,7 @@ def list_room_messages(user_id, room_id, limit=20, before_message_id=None, aroun
     fetched_messages = list(messages.order_by('-created_at', '-id')[: limit + 1])
     has_more = len(fetched_messages) > limit
     page_messages = fetched_messages[:limit]
+    attach_direct_saved_flags(page_messages, user_id)
     serialized_messages = [
         serialize_message(message, user_id)
         for message in reversed(page_messages)
@@ -1341,6 +1367,7 @@ def list_room_messages_around_target(user_id, room, messages, limit, around_mess
         [*older_messages, target_message, *newer_messages],
         key=lambda message: (message.created_at, message.id),
     )
+    attach_direct_saved_flags(page_messages, user_id)
     oldest_message = page_messages[0] if page_messages else None
     newest_message = page_messages[-1] if page_messages else None
     has_more_older = (
@@ -1372,6 +1399,60 @@ def list_room_messages_around_target(user_id, room, messages, limit, around_mess
             'has_newer': has_more_newer,
             'next_after_message_id': newest_message.id if has_more_newer and newest_message else None,
         },
+    }, 200
+
+
+def normalize_saved_flag(payload, default=True):
+    if isinstance(payload, dict) and 'saved' in payload:
+        return bool(payload.get('saved'))
+
+    return default
+
+
+def set_direct_message_saved(user_id, message_id, payload=None):
+    should_save = normalize_saved_flag(payload, default=True)
+    message = (
+        get_visible_messages_queryset(user_id, include_deleted=False)
+        .select_related('room', 'reply_to')
+        .prefetch_related('attachments', 'reactions', 'room__participants')
+        .filter(id=message_id)
+        .first()
+    )
+    if not message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    saved_message = None
+    if should_save:
+        saved_message, _ = SavedMessage.objects.get_or_create(
+            user_id=user_id,
+            direct_message=message,
+        )
+        status = 'saved'
+    else:
+        SavedMessage.objects.filter(
+            user_id=user_id,
+            direct_message_id=message.id,
+        ).delete()
+        status = 'unsaved'
+
+    invalidate_room_caches(message.room_id)
+    message._saved_by_current_user = should_save
+
+    return {
+        'status': status,
+        'saved': should_save,
+        'message_kind': SavedMessage.KIND_DIRECT,
+        'room_id': message.room_id,
+        'message_id': message.id,
+        'message': serialize_message(message, user_id),
+        'save': (
+            serialize_saved_message(saved_message, user_id)
+            if saved_message
+            else None
+        ),
     }, 200
 
 
@@ -1901,6 +1982,182 @@ def get_visible_messages_queryset(user_id, room_id=None, include_deleted=False):
     )
 
 
+def normalize_saved_message_list_limit(value):
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return MAX_SAVED_MESSAGES_PAGE_SIZE
+
+    if limit <= 0:
+        return MAX_SAVED_MESSAGES_PAGE_SIZE
+
+    return min(limit, MAX_SAVED_MESSAGES_PAGE_SIZE)
+
+
+def list_saved_messages(user_id, limit=MAX_SAVED_MESSAGES_PAGE_SIZE):
+    page_limit = normalize_saved_message_list_limit(limit)
+    saves = list(
+        SavedMessage.objects.filter(user_id=user_id)
+        .select_related(
+            'direct_message',
+            'direct_message__room',
+            'direct_message__reply_to',
+            'group_message',
+            'group_message__room',
+            'group_message__reply_to',
+        )
+        .prefetch_related(
+            'direct_message__attachments',
+            'direct_message__reactions',
+            'direct_message__room__participants',
+            'group_message__reactions',
+            'group_message__receipts',
+            'group_message__room__participants',
+        )
+        .order_by('-created_at', '-id')[:page_limit]
+    )
+
+    for saved_message in saves:
+        if saved_message.direct_message_id and saved_message.direct_message:
+            saved_message.direct_message._saved_by_current_user = True
+        if saved_message.group_message_id and saved_message.group_message:
+            saved_message.group_message._saved_by_current_user = True
+
+    return {
+        'status': 'ok',
+        'saves': [
+            serialize_saved_message(saved_message, user_id)
+            for saved_message in saves
+        ],
+        'pagination': {
+            'limit': page_limit,
+            'count': len(saves),
+            'has_more': len(saves) == page_limit,
+        },
+    }, 200
+
+
+def get_room_participant_identity(room, user_id):
+    numeric_user_id = int(user_id or 0)
+    participant = next(
+        (
+            room_participant
+            for room_participant in room.participants.all()
+            if int(room_participant.user_id) == numeric_user_id
+        ),
+        None,
+    )
+    if not participant:
+        return {
+            'user_id': numeric_user_id or None,
+            'account_number': '',
+            'display_name': f'User {numeric_user_id}' if numeric_user_id else '',
+        }
+
+    return {
+        'user_id': participant.user_id,
+        'account_number': participant.account_number,
+        'display_name': participant.display_name or participant.account_number,
+    }
+
+
+def serialize_saved_message(saved_message, current_user_id):
+    if saved_message.direct_message_id and saved_message.direct_message:
+        return serialize_saved_direct_message(saved_message, current_user_id)
+
+    return serialize_saved_group_message(saved_message, current_user_id)
+
+
+def serialize_saved_direct_message(saved_message, current_user_id):
+    message = saved_message.direct_message
+    room = message.room
+    sender = get_room_participant_identity(room, message.sender_user_id)
+    recipient = get_room_participant_identity(room, message.recipient_user_id)
+    message._saved_by_current_user = True
+
+    return {
+        'id': saved_message.id,
+        'message_kind': SavedMessage.KIND_DIRECT,
+        'saved_at': saved_message.created_at.isoformat(),
+        'message_created_at': message.created_at.isoformat(),
+        'received_at': message.created_at.isoformat(),
+        'direction': (
+            'outgoing'
+            if int(message.sender_user_id or 0) == int(current_user_id or 0)
+            else 'incoming'
+        ),
+        'sender': sender,
+        'recipient': recipient,
+        'room': serialize_room(room, current_user_id=current_user_id),
+        'message': serialize_message(message, current_user_id),
+        'group': None,
+    }
+
+
+def serialize_saved_group_message(saved_message, current_user_id):
+    from group_messaging.serializers import serialize_group_message, serialize_group_room
+
+    message = saved_message.group_message
+    room = message.room
+    message._saved_by_current_user = True
+    room_data = serialize_group_room(room, current_user_id=current_user_id)
+    message_data = serialize_group_message(message, current_user_id)
+    owner = next(
+        (
+            participant
+            for participant in room_data.get('participants', [])
+            if participant.get('group_role') == 'admin' or participant.get('role') == 'admin'
+        ),
+        None,
+    ) or get_room_participant_identity(room, room_data.get('created_by_user_id'))
+    receipt = next(
+        (
+            item
+            for item in message.receipts.all()
+            if int(item.user_id) == int(current_user_id or 0)
+        ),
+        None,
+    )
+    received_at = (
+        receipt.delivered_at
+        if receipt and receipt.delivered_at
+        else receipt.read_at
+        if receipt and receipt.read_at
+        else message.created_at
+    )
+    sender = {
+        'user_id': message.sender_user_id,
+        'account_number': message_data.get('sender_account_number', ''),
+        'display_name': message_data.get('sender_display_name', ''),
+    }
+
+    return {
+        'id': saved_message.id,
+        'message_kind': SavedMessage.KIND_GROUP,
+        'saved_at': saved_message.created_at.isoformat(),
+        'message_created_at': message.created_at.isoformat(),
+        'received_at': received_at.isoformat(),
+        'direction': (
+            'outgoing'
+            if int(message.sender_user_id or 0) == int(current_user_id or 0)
+            else 'incoming'
+        ),
+        'sender': sender,
+        'recipient': None,
+        'room': room_data,
+        'message': message_data,
+        'group': {
+            'id': room.id,
+            'title': room_data.get('title') or room.title or f'Group {room.id}',
+            'avatar_url': room_data.get('avatar_url', ''),
+            'created_by_user_id': room_data.get('created_by_user_id'),
+            'owner': owner,
+            'is_deleted': room_data.get('is_deleted', False),
+            'deleted_at': room_data.get('deleted_at'),
+        },
+    }
+
+
 def serialize_room_summary(room, current_user_id):
     if room.is_group:
         try:
@@ -1984,9 +2241,15 @@ def serialize_message(message, current_user_id=None):
         if is_deleted
         else serialize_message_reactions(message, current_user_id)
     )
+    saved_by_me = get_direct_message_saved_by_current_user(
+        message,
+        current_user_id,
+    )
     data = {
         'id': message.id,
         'room_id': message.room_id,
+        'room_type': 'direct',
+        'is_group_message': False,
         'sender_user_id': message.sender_user_id,
         'recipient_user_id': message.recipient_user_id,
         'reply_to_message_id': None if is_deleted else message.reply_to_id,
@@ -2013,9 +2276,24 @@ def serialize_message(message, current_user_id=None):
         ] if not is_deleted else [],
         'reactions': reaction_data['reactions'],
         'my_reaction': reaction_data['my_reaction'],
+        'saved_by_me': saved_by_me,
     }
 
     return data
+
+
+def get_direct_message_saved_by_current_user(message, current_user_id=None):
+    if not current_user_id:
+        return False
+
+    saved_flag = getattr(message, '_saved_by_current_user', None)
+    if saved_flag is not None:
+        return bool(saved_flag)
+
+    return SavedMessage.objects.filter(
+        user_id=current_user_id,
+        direct_message_id=message.id,
+    ).exists()
 
 
 def get_message_status_for_viewer(message, current_user_id=None):

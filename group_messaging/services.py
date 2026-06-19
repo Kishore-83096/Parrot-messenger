@@ -34,7 +34,7 @@ from messaging.cloudinary_paths import (
     build_group_message_cloudinary_folder,
     get_cloudinary_root_folder,
 )
-from messaging.models import Room, RoomParticipant, UserDeviceKey
+from messaging.models import Room, RoomParticipant, SavedMessage, UserDeviceKey
 from messaging.e2ee.devices.service import serialize_device_key
 from messaging.realtime import broadcast_room_event, broadcast_user_event
 from messaging.signals import (
@@ -1510,6 +1510,93 @@ def refresh_group_message_statuses(messages, emit_message_ids=None):
     return changed_statuses
 
 
+def attach_group_saved_flags(messages, user_id):
+    message_ids = [
+        int(message.id)
+        for message in messages
+        if getattr(message, 'id', None)
+    ]
+    if not message_ids or not user_id:
+        for message in messages:
+            message._saved_by_current_user = False
+        return messages
+
+    saved_message_ids = set(
+        SavedMessage.objects.filter(
+            user_id=user_id,
+            group_message_id__in=message_ids,
+        ).values_list('group_message_id', flat=True)
+    )
+    for message in messages:
+        message._saved_by_current_user = int(message.id) in saved_message_ids
+
+    return messages
+
+
+def normalize_saved_flag(payload, default=True):
+    if isinstance(payload, dict) and 'saved' in payload:
+        return bool(payload.get('saved'))
+
+    return default
+
+
+def set_group_message_saved(user_id, room_id, message_id, payload=None):
+    should_save = normalize_saved_flag(payload, default=True)
+    context, error, status = require_group_member(user_id, room_id)
+    if error:
+        return error, status
+
+    message = (
+        GroupMessage.objects.filter(
+            id=message_id,
+            room_id=context['room'].id,
+            deleted_at__isnull=True,
+        )
+        .select_related('room', 'reply_to')
+        .prefetch_related('receipts', 'reactions', 'room__participants')
+        .first()
+    )
+    if not message:
+        return {
+            'status': 'error',
+            'message': 'Message not found.',
+        }, 404
+
+    saved_message = None
+    if should_save:
+        saved_message, _ = SavedMessage.objects.get_or_create(
+            user_id=user_id,
+            group_message=message,
+        )
+        result_status = 'saved'
+    else:
+        SavedMessage.objects.filter(
+            user_id=user_id,
+            group_message_id=message.id,
+        ).delete()
+        result_status = 'unsaved'
+
+    message._saved_by_current_user = should_save
+    attach_group_participant_identities([message], context['room'].id)
+    invalidate_room_caches(context['room'].id)
+
+    save_payload = None
+    if saved_message:
+        from messaging.services import serialize_saved_message
+
+        save_payload = serialize_saved_message(saved_message, user_id)
+
+    return {
+        'status': result_status,
+        'saved': should_save,
+        'message_kind': SavedMessage.KIND_GROUP,
+        'room_id': context['room'].id,
+        'message_id': message.id,
+        'message': serialize_group_message(message, user_id),
+        'save': save_payload,
+    }, 200
+
+
 def send_group_message(sender, room_id, payload):
     normalized_payload, errors = normalize_group_message_payload(payload)
     if errors:
@@ -1905,6 +1992,7 @@ def list_group_messages(user_id, room_id, limit=20, before_message_id=None, arou
     page_messages = fetched_messages[:limit]
     ordered_page_messages = list(reversed(page_messages))
     attach_group_participant_identities(ordered_page_messages, context['room'].id)
+    attach_group_saved_flags(ordered_page_messages, user_id)
     serialized_messages = [
         serialize_group_message(message, user_id)
         for message in ordered_page_messages
@@ -2002,6 +2090,7 @@ def list_group_messages_around_target(user_id, room, messages, limit, around_mes
         key=lambda message: (message.created_at, message.id),
     )
     attach_group_participant_identities(page_messages, room.id)
+    attach_group_saved_flags(page_messages, user_id)
     oldest_message = page_messages[0] if page_messages else None
     newest_message = page_messages[-1] if page_messages else None
     has_more_older = (

@@ -19,6 +19,8 @@ from .views import (
     release_blocked_messages,
     revoke_crypto_device,
     room_messages,
+    save_message,
+    saved_messages,
     send_message,
     set_default_crypto_device,
     update_message_authorization_cache,
@@ -43,6 +45,7 @@ urlpatterns = [
     path('rooms/<int:room_id>/delivered/', deliver_room, name='room-delivered'),
     path('rooms/<int:room_id>/read/', read_room, name='room-read'),
     path('rooms/<int:room_id>/blocked-messages/release/', release_blocked_messages, name='room-blocked-messages-release'),
+    path('saves/', saved_messages, name='saved-message-list'),
     path('crypto/devices/', register_crypto_device, name='crypto-device-register'),
     path('crypto/devices/<str:device_id>/default/', set_default_crypto_device, name='crypto-device-default'),
     path('crypto/devices/default-password/', update_default_crypto_device_password, name='crypto-device-default-password-update'),
@@ -57,5 +60,6 @@ urlpatterns = [
     path('messages/send/', send_message, name='message-send'),
     path('messages/<int:message_id>/edit/', edit_message, name='message-edit'),
     path('messages/<int:message_id>/delete/', delete_message, name='message-delete'),
+    path('messages/<int:message_id>/save/', save_message, name='message-save'),
     path('messages/<int:message_id>/reaction/', message_reaction, name='message-reaction'),
 ]

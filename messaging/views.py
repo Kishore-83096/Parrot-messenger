@@ -51,12 +51,14 @@ from .services import (
     get_existing_direct_room_authorization,
     has_existing_sender_client_message,
     list_room_messages,
+    list_saved_messages,
     list_user_rooms,
     mark_room_delivered,
     mark_room_read,
     normalize_message_list_params,
     react_to_message,
     release_room_blocked_messages,
+    set_direct_message_saved,
     set_direct_room_list_hidden,
     upload_message_files,
 )
@@ -1423,6 +1425,56 @@ def room_messages(request, room_id):
             'result': messages_result,
         },
         status=messages_status,
+    )
+
+
+@require_GET
+def saved_messages(request):
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = list_saved_messages(
+        user_id=sender['user_id'],
+        limit=request.GET.get('limit'),
+    )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'user': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def save_message(request, message_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = set_direct_message_saved(
+        user_id=sender['user_id'],
+        message_id=message_id,
+        payload=payload,
+    )
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'messenger',
+            'user': sender,
+            'result': result,
+        },
+        status=response_status,
     )
 
 

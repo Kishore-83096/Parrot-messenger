@@ -30,6 +30,7 @@ from .services import (
     prewarm_group_receipt_visibility,
     react_to_group_message,
     remove_group_member,
+    set_group_message_saved,
     set_group_sub_admin,
     send_group_message,
     transfer_group_admin,
@@ -797,6 +798,35 @@ def group_message_reaction(request, room_id, message_id):
         }
         broadcast_room_event(room_id, 'group.message.reaction_updated', event_payload)
         broadcast_group_participant_event(result['room'], 'group.message.reaction_updated', event_payload)
+
+    return JsonResponse(
+        {
+            'status': result.get('status', 'error'),
+            'service': 'group_messaging',
+            'sender': sender,
+            'result': result,
+        },
+        status=response_status,
+    )
+
+
+@csrf_exempt
+@require_POST
+def group_save_message(request, room_id, message_id):
+    payload, error_response = parse_json_body(request)
+    if error_response:
+        return error_response
+
+    sender, error_response = get_authenticated_sender(request)
+    if error_response:
+        return error_response
+
+    result, response_status = set_group_message_saved(
+        user_id=sender['user_id'],
+        room_id=room_id,
+        message_id=message_id,
+        payload=payload,
+    )
 
     return JsonResponse(
         {
